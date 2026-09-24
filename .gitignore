@@ -1,0 +1,13 @@
+# Whitelist approach: ignore everything, then re-include only the app itself.
+# This keeps the local venv/, __pycache__/, .claude/, generated .gcode files,
+# IDE folders, etc. out of the repository without having to list them.
+*
+
+# Repository metadata
+!.gitignore
+!.gitattributes
+!README.md
+
+# The application
+!*.py
+!requirements.txt
