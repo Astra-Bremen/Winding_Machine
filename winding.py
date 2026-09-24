@@ -20,6 +20,7 @@ MAX_X = 5250.0        # carriage's physical X-axis travel limit (mm)
 Y_REFERENCE = 550.0   # eye distance from the tank centerline at Y=0, before subtracting the eye arm (mm)
 Y_TRAVEL = 180.0      # Y-axis travel; commanded Y is clamped to [0, Y_TRAVEL] (mm)
 STEP_SIZE = 5.0       # X distance covered by one traversal G-code move (mm)
+MIN_MOVE_TIME = 0.1   # lowest allowed Max Move Time (s); shorter moves only load the controller
 
 # --- VISUALIZATION-ONLY RENDERING RESOLUTION ---
 # Caps how many degrees of rotation may separate two consecutive strand-path
@@ -69,6 +70,10 @@ class WindingJob:
     eye_width: float = 20.0
     min_spacing: float = 10.0
     max_surface_speed: float = 220.0
+    # Longest time (s) any single G-code move may take; longer ones are split
+    # into equal pieces. Klipper can't interrupt a move it has queued, so this
+    # bounds how long the machine keeps going after a pause (see iter_program).
+    max_move_time: float = 0.5
     end_cap_type: str = "Round"
     tank_length: float = 1000.0
     tank_diameter: float = 200.0
@@ -129,6 +134,12 @@ def _traversal_step_count(length):
 GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
 LAYUP_KEYS = tuple(f.name for f in fields(Layup))
 
+# How files written before a setting existed were actually wound, where that
+# differs from the setting's current default: restoring such a file uses these
+# values, so it regenerates the motion it was made with. (Max Move Time needs
+# no entry: splitting moves never changes the path.)
+LEGACY_VALUES = {"turnaround_zone": 0.0}
+
 
 class SettingsError(ValueError):
     """A setting's input doesn't currently hold a valid number (e.g. an entry
@@ -155,6 +166,12 @@ def geometry_errors(job):
         errors.append("Bandwidth / Tow Width must be greater than 0.")
     if job.max_surface_speed <= 0:
         errors.append("Max Rotation Speed must be greater than 0.")
+    elif job.tank_diameter > 0 and job.max_a_speed < 1.0:
+        # G-code feed rates are whole numbers of at least 1 (per minute), which
+        # would already rotate faster than a limit this low.
+        errors.append("Max Rotation Speed is too low for this tank diameter.")
+    if job.max_move_time < MIN_MOVE_TIME:
+        errors.append(f"Max Move Time must be at least {MIN_MOVE_TIME:g} s.")
     if job.turnaround_zone < 0:
         errors.append("Turnaround Zone can't be negative.")
     elif job.tank_length > 0 and 2 * job.turnaround_zone_steps > _traversal_step_count(job.tank_length):
@@ -606,10 +623,35 @@ def iter_program(job):
     max_a_speed = job.max_a_speed
     n_layups = len(job.layups)
     zone_steps = job.turnaround_zone_steps
+    max_move_time = job.max_move_time
+
+    def moves(x0, y0, a0, x1, y1, a1, layup_index, circuit, dwell):
+        # One straight (X, Y, A) move, split into equal pieces if it would take
+        # longer than Max Move Time. Klipper's pause only stops it from reading
+        # further lines: everything already queued -- about 2 s of motion, plus
+        # whatever remains of a longer move -- still runs, and a queued move is
+        # never cut short. Near-hoop steps and turnaround rotations can take
+        # several seconds each (more at low rotation speeds), so bounding every
+        # move's duration is what bounds the stop. A G1 moves all axes linearly
+        # together, so the pieces trace exactly the same path at the same speed:
+        # no corners for the planner to slow down at, and the pattern, time and
+        # tow are unchanged.
+        _, duration, _ = calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, 0.0)
+        n = max(1, math.ceil(duration / max_move_time - 1e-9))
+        px, py, pa = x0, y0, a0
+        for k in range(1, n + 1):
+            if k == n:
+                qx, qy, qa = x1, y1, a1
+            else:
+                f = k / n
+                qx, qy, qa = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, a0 + (a1 - a0) * f
+            qr = geom.radius(qx)
+            feed, piece_duration, tow = calc_move(px, py, pa, qx, qy, qa, max_a_speed, qr)
+            yield Move(qx, qy, qa, feed, piece_duration, tow, qr, layup_index, circuit, dwell)
+            px, py, pa = qx, qy, qa
 
     x, a = x_start, 0.0
     y = eye_y(x)
-    r = geom.radius(x)
     cycle_number = 0
     pending_head_blend = []  # blend carried from the previous dwell into this traversal's first steps
     for li, layup in enumerate(job.layups):
@@ -637,19 +679,16 @@ def iter_program(job):
                     core_dwell += sum(head_blend)
                     head_blend = []
                 for x_next, a_delta in traversal_steps(x, target_x, STEP_SIZE, plan.pitch, pending_head_blend, tail_blend):
-                    r_next = geom.radius(x_next)
                     y_next = eye_y(x_next)
                     a_next = a + a_delta
-                    feed, duration, tow = calc_move(x, y, a, x_next, y_next, a_next, max_a_speed, r_next)
-                    yield Move(x_next, y_next, a_next, feed, duration, tow, r_next, li, i, False)
-                    x, y, a, r = x_next, y_next, a_next, r_next
+                    yield from moves(x, y, a, x_next, y_next, a_next, li, i, False)
+                    x, y, a = x_next, y_next, a_next
                 pending_head_blend = head_blend
                 # A turnaround zone spreads all of the rotation over the steps,
                 # leaving nothing (but float dust) for a pure-rotation move.
                 if abs(core_dwell) > 1e-6:
                     a_next = a + core_dwell
-                    feed, duration, tow = calc_move(x, y, a, x, y, a_next, max_a_speed, r)
-                    yield Move(x, y, a_next, feed, duration, tow, r, li, i, True)
+                    yield from moves(x, y, a, x, y, a_next, li, i, True)
                     a = a_next
             if (i + 1) % n_strands == 0:
                 cycle_number += 1
@@ -789,6 +828,20 @@ def layups_from_header(settings):
     return None
 
 
+def _rotation_limited_feed(dx, dy, da, max_a_speed):
+    # G-code F is the speed along the whole (X, Y, A) move, so the mandrel
+    # turns at F * |da| / length. The largest whole F that keeps that at or
+    # below Max Rotation Speed is floor(max * length / |da|): rounding down, so
+    # no move -- however it was split or rounded -- ever turns faster than the
+    # limit, and each still runs within a hair of it. A move without rotation
+    # runs at Max Rotation Speed along its length.
+    da = abs(da)
+    if da <= 0:
+        return int(max_a_speed)
+    length = math.sqrt(dx * dx + dy * dy + da * da)
+    return max(1, math.floor(max_a_speed * length / da))
+
+
 def write_gcode(out, job, start_gcode="", end_gcode=""):
     """Writes the complete program for `job` to the text stream `out`. The job
     must pass validate()."""
@@ -804,18 +857,27 @@ def write_gcode(out, job, start_gcode="", end_gcode=""):
         out.write("G92 A0\n")
     if start_gcode: out.write(start_gcode + "\n")
     x, y = start_position(job)
+    # No rotation is planned here, and with F = Max Rotation Speed any rotation
+    # the machine does need (e.g. an A axis not homed to 0) can't be faster.
     out.write(f"G1 X{x:.3f} Y{y:.3f} A{0.0:.3f} F{int(job.max_a_speed)}\n")
+    # The machine executes the coordinates as written (3 decimals), so feed
+    # rates are computed from those -- relative to the previous written
+    # position -- not from the unrounded ones.
+    wx, wy, wa = float(f"{x:.3f}"), float(f"{y:.3f}"), 0.0
     a_offset = 0.0
     for ev in iter_program(job):
         if type(ev) is Move:
-            out.write(f"G1 X{ev.x:.3f} Y{ev.y:.3f} A{(ev.a - a_offset):.3f} F{int(ev.feed)}\n")
+            gx, gy, ga = f"{ev.x:.3f}", f"{ev.y:.3f}", f"{(ev.a - a_offset):.3f}"
+            nx, ny, na = float(gx), float(gy), float(ga)
+            out.write(f"G1 X{gx} Y{gy} A{ga} F{_rotation_limited_feed(nx - wx, ny - wy, na - wa, job.max_a_speed)}\n")
+            wx, wy, wa = nx, ny, na
         elif type(ev) is CycleComplete:
             out.write(f"; CYCLE_COMPLETE:{ev.number}\n")
             # Reset the firmware's A-axis position to 0 without moving, so the
             # accumulated rotation over a long wind never approaches the axis's
             # +/-9999999 limit. Subsequent A values are written relative to this.
             out.write("G92 A0\n")
-            a_offset = ev.a
+            a_offset, wa = ev.a, 0.0
         else:
             out.write(f"; LAYUP_START:{ev.index + 1}\n")
     if end_gcode: out.write(end_gcode + "\n")

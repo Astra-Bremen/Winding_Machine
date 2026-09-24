@@ -60,8 +60,19 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   gap. It uses the largest radius under the full width of the eye, so the eye
   cannot hit the tank at the domes.
 - **Surface-speed control:** the speed limit is a surface speed in mm/s,
-  converted to an A-axis rate for the current diameter. Every G-code feed rate
-  is chosen so that the A axis turns at exactly this rate.
+  converted to an A-axis rate for the current diameter. Every feed rate is
+  computed from the coordinates exactly as written to the file, and rounded
+  down, so no move ever turns the mandrel faster than this limit (each still
+  runs within a fraction of a percent of it).
+- **Responsive pause (Max Move Time):** Klipper can't interrupt a move it has
+  already queued. It keeps about 2 s of motion queued, and each queued move
+  always runs to its end. So after a pause, the machine keeps going for up to
+  about 2 s plus the length of the move in progress. Any move that would take
+  longer than *Max Move Time* (default 0.5 s) is split into equal straight
+  pieces. The path, speed, time and pattern stay exactly the same, and a pause
+  takes effect within about 2.5 s. Near-hoop layups and turnarounds at low
+  rotation speeds benefit most; otherwise their single moves can take several
+  seconds each.
 - **Wind-angle validation:** angles that the tank size and band width cannot
   produce are corrected automatically. At angles that are too steep, each wrap
   would lie on top of the previous one. At angles that are too shallow, the
@@ -100,6 +111,7 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; --- WINDER SETTINGS ---
 ; chuck_offset: 50.0          <- every setting is saved as a comment, so a
 ; ...                             file can be reopened and its settings restored
+; max_move_time: 0.5
 ; turnaround_zone: 80.0
 ; optimize_trajectory: False
 ; layups: 2
@@ -242,8 +254,20 @@ python -m unittest -v test_winding
   `CFRPWinderApp` in `main.py` are inserted into every file.
   `ONE_WIND_COMPLETE_GCODE` is defined but **not yet used** anywhere.
 - **Machine constants:** `MAX_X`, the 550 mm Y reference (`Y_REFERENCE`), the
-  0–180 mm Y range (`Y_TRAVEL`) and the 5 mm traversal step (`STEP_SIZE`) are
-  named constants at the top of `winding.py`.
+  0–180 mm Y range (`Y_TRAVEL`), the 5 mm traversal step (`STEP_SIZE`) and the
+  lowest allowed Max Move Time (`MIN_MOVE_TIME`) are named constants at the top
+  of `winding.py`.
+- **Move splitting and feed rates:** `iter_program()` splits long moves (its
+  inner `moves()` helper), so the preview, estimates and G-code all see the
+  same pieces. `write_gcode()` computes each F from the written coordinates via
+  `_rotation_limited_feed()`. The `MoveSplitting` and `MaxRotationSpeed` tests
+  check both on the written file.
+- **Feed rate and Klipper:** feed rates assume the controller applies F to the
+  combined X/Y/A move length, with A in degrees, as the original generator did.
+  If Klipper's `max_velocity` or `max_accel` are lower than what the file asks
+  for, moves run slower than estimated: the wind takes longer than the
+  app's *Time* estimate, and pieces can outlast Max Move Time. Keep the
+  printer.cfg limits above the rates the app uses.
 - **Layup colors:** the palettes in `theme.py` were checked for contrast
   against the mint tank and between every pair of colors, including for
   red-green color-blind viewers. From the 7th layup on, the colors repeat with

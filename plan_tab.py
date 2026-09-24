@@ -17,6 +17,7 @@ MACHINE_FIELDS = [
     ("Eye Width (mm)", "eye_width"),
     ("Min Spacing (Safety) (mm)", "min_spacing"),
     ("Max Rotation Speed (mm/s)", "max_surface_speed"),
+    ("Max Move Time (s)", "max_move_time"),
 ]
 TANK_FIELDS = [("Tank Length (mm)", "tank_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
 WINDING_FIELDS = [("Bandwidth / Tow Width (mm)", "bandwidth"), ("Turnaround Zone (mm)", "turnaround_zone")]
@@ -117,6 +118,9 @@ class PlanTab:
         # groups comfortably fit on screen without scrolling; see
         # theme.setup_compact_styles for the actual font sizes.
         LBL, ENT, CMB, FRM = "Settings.TLabel", "Settings.TEntry", "Settings.TCombobox", "Settings.TLabelframe"
+        # Section padding (horizontal, vertical) and the gap below each section,
+        # kept tight so the whole panel fits a maximized window without scrolling.
+        FRAME_PAD, FRAME_GAP = (8, 5), (0, 6)
 
         def add_fields(frame, fields, first_row=0, store=None):
             for i, (label_text, key) in enumerate(fields):
@@ -130,8 +134,8 @@ class PlanTab:
             frame.columnconfigure(0, weight=1)
 
         # 1. Machine Settings
-        machine_frame = ttk.LabelFrame(left_panel, text="Machine Settings", padding="8", style=FRM)
-        machine_frame.pack(fill=tk.X, pady=(0, 8))
+        machine_frame = ttk.LabelFrame(left_panel, text="Machine Settings", padding=FRAME_PAD, style=FRM)
+        machine_frame.pack(fill=tk.X, pady=FRAME_GAP)
         add_fields(machine_frame, MACHINE_FIELDS)
         # A plain ttk.Checkbutton, same as "Optimize Trajectory" in Winding
         # Settings -- just the compact Settings font, no color/Toolbutton style.
@@ -140,8 +144,8 @@ class PlanTab:
                         style="Settings.TCheckbutton").grid(row=len(MACHINE_FIELDS), column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # 2. Tank Settings
-        tank_frame = ttk.LabelFrame(left_panel, text="Tank Settings", padding="8", style=FRM)
-        tank_frame.pack(fill=tk.X, pady=(0, 8))
+        tank_frame = ttk.LabelFrame(left_panel, text="Tank Settings", padding=FRAME_PAD, style=FRM)
+        tank_frame.pack(fill=tk.X, pady=FRAME_GAP)
         ttk.Label(tank_frame, text="End-Cap Type", style=LBL).grid(row=0, column=0, sticky="w", pady=1, padx=(0, 10))
         self.cap_type_combo = ttk.Combobox(tank_frame, textvariable=self.app.params["end_cap_type"], values=["Round", "Flat"], state="readonly", width=10, style=CMB)
         self.cap_type_combo.grid(row=0, column=1, sticky="e", pady=1)
@@ -149,8 +153,8 @@ class PlanTab:
         add_fields(tank_frame, TANK_FIELDS, first_row=1, store=self.tank_entries)
 
         # 3. Winding Settings -- shared by every layup of the program.
-        winding_frame = ttk.LabelFrame(left_panel, text="Winding Settings", padding="8", style=FRM)
-        winding_frame.pack(fill=tk.X, pady=(0, 8))
+        winding_frame = ttk.LabelFrame(left_panel, text="Winding Settings", padding=FRAME_PAD, style=FRM)
+        winding_frame.pack(fill=tk.X, pady=FRAME_GAP)
         add_fields(winding_frame, WINDING_FIELDS)
         # Experimental: eases a small piece of each dwell's rotation into the
         # traversal steps flanking it instead of one abrupt stop, so Klipper's
@@ -184,8 +188,8 @@ class PlanTab:
         self._remove_btn.pack(side=tk.LEFT)
         self._add_btn = ttk.Button(nav, text="+", width=2, style=NAV, takefocus=False, command=self._add_layup)
         self._add_btn.pack(side=tk.LEFT, padx=(2, 0))
-        layup_frame = ttk.LabelFrame(left_panel, labelwidget=nav, padding="8", style=FRM)
-        layup_frame.pack(fill=tk.X, pady=(0, 8))
+        layup_frame = ttk.LabelFrame(left_panel, labelwidget=nav, padding=FRAME_PAD, style=FRM)
+        layup_frame.pack(fill=tk.X, pady=FRAME_GAP)
         nav.lift(layup_frame)  # a labelwidget must stack above its frame to be visible
         add_fields(layup_frame, LAYUP_FIELDS, store=self.layup_entries)
         # Angles too close to 0/90 deg aren't physically realizable for the
@@ -198,10 +202,15 @@ class PlanTab:
         self.layup_entries["wind_angle"].bind("<Return>", self._validate_wind_angle)
         self._setup_cycles_field(self.layup_entries["passes"])
 
-        self.generate_btn = ttk.Button(left_panel, text="Generate G-Code", command=self.app.generate, style="primary.TButton")
-        self.generate_btn.pack(pady=(8, 5), fill=tk.X, ipady=4)
-        ttk.Button(left_panel, text="Open G-Code", command=lambda: self.app.view_tab.open_gcode_view(),
-                   style="secondary.Outline.TButton").pack(pady=(0, 15), fill=tk.X, ipady=2)
+        # Side by side, equal widths: the primary action filled, the secondary
+        # one outlined in the same color.
+        actions = ttk.Frame(left_panel)
+        actions.pack(fill=tk.X, pady=(4, 2))
+        actions.columnconfigure((0, 1), weight=1, uniform="actions")
+        self.generate_btn = ttk.Button(actions, text="Generate G-Code", command=self.app.generate, style="primary.TButton")
+        self.generate_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3), ipady=4)
+        ttk.Button(actions, text="Open G-Code", command=lambda: self.app.view_tab.open_gcode_view(),
+                   style="primary.Outline.TButton").grid(row=0, column=1, sticky="ew", padx=(3, 0), ipady=4)
 
         # Visualization Section. Bottom strip first (so it claims its height
         # before the row above expands): the "Show All Layups" toggle plus the

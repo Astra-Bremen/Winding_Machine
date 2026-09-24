@@ -129,6 +129,12 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     # color style app-wide, which restyles other buttons that reference it.
     style.configure("SettingsHeader.TLabel", font=("TkDefaultFont", header_size, "bold"))
     style.configure("Nav.TButton", font=("TkDefaultFont", header_size + 1, "bold"), padding=(2, 0))
+    # The settings panel's action buttons: Generate filled, Open outlined, both
+    # in the theme's primary color. ttkbootstrap only builds a color style once
+    # it's configured (otherwise not until the first theme switch, leaving them
+    # plain grey until then), so build exactly these two up front.
+    style.configure("primary.TButton")
+    style.configure("primary.Outline.TButton")
 
 
 def build_icon(primary_hex, size=64):

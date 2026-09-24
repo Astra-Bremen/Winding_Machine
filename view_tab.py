@@ -249,13 +249,14 @@ class ViewTab:
     def _sync_settings_to_app_params(self):
         # A file written by this app always records the tank geometry; one that
         # does is restored completely: any setting it predates (e.g. the
-        # turnaround zone) takes its default, since the file was wound without
-        # it -- rather than silently keeping whatever is currently entered.
+        # turnaround zone) takes the value the file was actually wound with
+        # (winding.LEGACY_VALUES, else the default) -- rather than silently
+        # keeping whatever is currently entered.
         is_winder_file = all(k in self.view_settings for k in ("tank_length", "tank_diameter", "chuck_offset"))
         defaults = winding.WindingJob()
         for key, var in self.app.params.items():
             if key not in self.view_settings:
-                if is_winder_file: var.set(getattr(defaults, key))
+                if is_winder_file: var.set(winding.LEGACY_VALUES.get(key, getattr(defaults, key)))
                 continue
             raw = self.view_settings[key]
             try:

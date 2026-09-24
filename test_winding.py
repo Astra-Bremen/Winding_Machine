@@ -82,29 +82,31 @@ def excel_layer(angle, pattern, cycles, zone=0.0):
 class GoldenMaster(unittest.TestCase):
     """Pins the exact G-code body (everything after the settings header) so an
     unintended change to the motion shows up. Regenerate these deliberately,
-    and only together with a change that is meant to alter the output. (They
-    were last regenerated when pattern alignment switched to the skip/closing
-    shift method; that kept every move and only changed its angles.)"""
+    and only together with a change that is meant to alter the output. (Last
+    regenerated for Max Move Time -- long moves split into pieces, feed rates
+    computed from the written coordinates -- together with the 80 mm default
+    turnaround zone. MoveSplitting checks the split path matches the unsplit
+    one exactly.)"""
     CASES = {
-        "default": (WindingJob(), 12083, "e24b815801de0318481f53d7832537fd4f2cfed74af42e8be888929015e78b16"),
+        "default": (WindingJob(), 12027, "c1acfaf70ee652ebc961de2a503eba74cd77b69f9e61388e3fa95b0f057babf6"),
         "flat_p1_optimized_nohome": (
             WindingJob(end_cap_type="Flat", optimize_trajectory=True, home_before_wind=False,
                        layups=(Layup(passes=4, pattern_number=1, wind_angle=60.0, turnaround_angle=180.0),)),
-            1619, "ae063326f2efa6d2c0c2c38c55279721457eda0e226e61f7ceb29f7707a258fd"),
+            1614, "668a2386254849efc181cac5b312bba60c9fc8b2ec70cad83fcad26b61cf3e06"),
         "round_p5_steep_optimized": (
             WindingJob(bandwidth=8.0, optimize_trajectory=True,
                        layups=(Layup(passes=2, pattern_number=5, wind_angle=70.0, turnaround_angle=90.0),)),
-            4027, "5e4e3055ec0f089d9b723b3d8df4966249d7c5a149b8a3caeb21cbd64fece696"),
+            4009, "64d9b49c8105e649cf47b983ccd5ba3758cfe11d7351c28356f766729f48443e"),
         "round_small_dwell": (
             WindingJob(tank_length=640.0, tank_diameter=160.0, end_cap_diameter=40.0, eye_width=35.0,
                        min_spacing=6.0, max_surface_speed=150.0,
                        layups=(Layup(passes=3, pattern_number=2, wind_angle=30.0, turnaround_angle=10.0),)),
-            1557, "046b2ac743628ce1d5917727c294830f5131b3eab041686aa59d2813aad0d542"),
+            1548, "a1800981765c617ae90251bb83426157f3d21126b0d910c7e163c69fd0812716"),
         "excel_style_zone": (
             WindingJob(tank_length=1640.0, tank_diameter=250.0, bandwidth=7.0, turnaround_zone=80.0,
                        layups=(Layup(passes=3, pattern_number=5, wind_angle=12.0, turnaround_angle=156.0),
                                Layup(passes=2, pattern_number=7, wind_angle=54.0, turnaround_angle=72.0))),
-            19038, "a4fde294cb2e47fc9e7fb5c43b13fb0d0d2f4a309458af01c213dfefac8acb15"),
+            19039, "23fc31bb578f656b8e77c6756f06059320b09f369c83be8a94966bae7f5ee3cc"),
     }
 
     def test_output_unchanged(self):
@@ -235,6 +237,95 @@ class AutoCycles(unittest.TestCase):
         self.assertEqual(winding.layups_from_header(old), [Layup(passes=12)])
 
 
+def gcode_moves(lines):
+    """(dx, dy, da, feed) of every G1 exactly as the machine runs it, from the
+    written coordinates: A is tracked across the per-cycle "G92 A0" resets."""
+    moves, pos = [], None
+    for ln in lines:
+        if ln.startswith("G92"):
+            if pos: pos = (pos[0], pos[1], 0.0)
+            continue
+        if not ln.startswith("G1"):
+            continue
+        w = {tok[0]: float(tok[1:]) for tok in ln.split()[1:]}
+        new = (w["X"], w["Y"], w["A"])
+        if pos is not None:
+            moves.append((new[0] - pos[0], new[1] - pos[1], new[2] - pos[2], w["F"]))
+        pos = new
+    return moves
+
+
+# Slow rotation and a near-hoop layup: long moves everywhere, before splitting.
+SLOW = WindingJob(max_surface_speed=60.0, turnaround_zone=0.0, layups=(
+    Layup(passes=2, pattern_number=3, wind_angle=45.0, turnaround_angle=270.0),
+    Layup(passes=1, pattern_number=1, wind_angle=89.0, turnaround_angle=90.0)))
+
+
+class MoveSplitting(unittest.TestCase):
+    def test_no_move_takes_longer_than_max_move_time(self):
+        for limit in (0.25, 0.5, 2.0):
+            with self.subTest(limit=limit):
+                job = WindingJob(**{k: getattr(SLOW, k) for k in winding.GLOBAL_KEYS if k != "max_move_time"},
+                                 max_move_time=limit, layups=SLOW.layups)
+                durations = [ev.duration for ev in winding.iter_program(job) if type(ev) is Move]
+                self.assertLessEqual(max(durations), limit + 1e-9)
+                # ...measured on the file as written, too (length / F).
+                for dx, dy, da, f in gcode_moves(gcode(job)):
+                    self.assertLessEqual(math.sqrt(dx * dx + dy * dy + da * da) / f * 60.0, limit * 1.01)
+
+    def test_splitting_keeps_the_exact_path_time_and_rotation(self):
+        # Every piece lies on its original move's straight line, so the machine
+        # traces the same path; total time and final angle are unchanged.
+        whole = WindingJob(**{k: getattr(SLOW, k) for k in winding.GLOBAL_KEYS if k != "max_move_time"},
+                           max_move_time=1e9, layups=SLOW.layups)
+        big = [ev for ev in winding.iter_program(whole) if type(ev) is Move]
+        small = [ev for ev in winding.iter_program(SLOW) if type(ev) is Move]
+        self.assertGreater(len(small), len(big))
+        self.assertAlmostEqual(sum(m.duration for m in small), sum(m.duration for m in big), places=6)
+        start = winding.start_position(SLOW)
+        prev_end, j = (start[0], start[1], 0.0), 0
+        for mv in big:
+            while True:
+                piece = small[j]
+                j += 1
+                # Same fraction of the way along the move in X, Y and A.
+                fracs = [(p - s) / (e - s) for p, s, e in zip((piece.x, piece.y, piece.a), prev_end, (mv.x, mv.y, mv.a))
+                         if abs(e - s) > 1e-9]
+                self.assertLess(max(fracs) - min(fracs), 1e-9)
+                self.assertEqual((piece.layup, piece.circuit, piece.dwell), (mv.layup, mv.circuit, mv.dwell))
+                if abs(piece.a - mv.a) < 1e-9 and abs(piece.x - mv.x) < 1e-9:
+                    break
+            prev_end = (mv.x, mv.y, mv.a)
+        self.assertEqual(j, len(small))
+
+    def test_max_move_time_validation(self):
+        job = WindingJob(max_move_time=0.05)
+        self.assertIn("Max Move Time must be at least 0.1 s.", winding.geometry_errors(job))
+
+
+class MaxRotationSpeed(unittest.TestCase):
+    def test_no_written_move_turns_faster_than_the_limit(self):
+        # For every G1 as the machine will run it: rotation rate = F * |da| / length.
+        # Never above Max Rotation Speed, and rotation moves use (nearly) all of it.
+        for job in (SLOW, MULTI, WindingJob(turnaround_zone=80.0, optimize_trajectory=True),
+                    excel_layer(12, 5, 4, zone=80.0)):
+            with self.subTest(speed=job.max_surface_speed, zone=job.turnaround_zone):
+                limit = job.max_a_speed
+                moves = gcode_moves(gcode(job))
+                rates = [f * abs(da) / math.sqrt(dx * dx + dy * dy + da * da) for dx, dy, da, f in moves if da]
+                self.assertLessEqual(max(rates), limit)
+                self.assertGreater(min(rates), 0.99 * limit)
+
+    def test_initial_positioning_move_is_capped_too(self):
+        # Its F equals the limit, so any rotation it involves can't exceed it.
+        first = next(ln for ln in gcode(SLOW) if ln.startswith("G1"))
+        self.assertLessEqual(float(first.rsplit("F", 1)[1]), SLOW.max_a_speed)
+
+    def test_rotation_limit_too_low_to_write(self):
+        self.assertIn("Max Rotation Speed is too low for this tank diameter.",
+                      winding.geometry_errors(WindingJob(max_surface_speed=0.001)))
+
+
 class TurnaroundZone(unittest.TestCase):
     def test_zone_replaces_the_pure_rotation_dwell(self):
         # With a zone, the only pure-rotation move left is the program's very
@@ -243,8 +334,9 @@ class TurnaroundZone(unittest.TestCase):
         plain = excel_layer(20, 7, 4)
         zoned = excel_layer(20, 7, 4, zone=80.0)
         moves = [ev for ev in winding.iter_program(zoned) if type(ev) is Move]
-        self.assertEqual(sum(mv.dwell for mv in moves), 1)
-        self.assertTrue(moves[-1].dwell)
+        n_dwell = sum(mv.dwell for mv in moves)  # that one move may be split in pieces
+        self.assertGreaterEqual(n_dwell, 1)
+        self.assertTrue(all(mv.dwell for mv in moves[-n_dwell:]))
         plain_final = [ev for ev in winding.iter_program(plain) if type(ev) is Move][-1].a
         self.assertAlmostEqual(moves[-1].a, plain_final, places=6)
 
