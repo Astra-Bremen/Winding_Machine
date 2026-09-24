@@ -54,7 +54,9 @@ class CFRPWinderApp:
         # the single source of truth for them.
         defaults = winding.WindingJob()
         self.params = {key: self._watched(_make_var(getattr(defaults, key))) for key in winding.GLOBAL_KEYS}
-        self.layups = [self._make_layup_vars(dataclasses.asdict(defaults.layups[0]))]
+        # Layups made in the app start with their Number of Cycles on auto (full
+        # coverage); only an explicit entry in the field makes it custom.
+        self.layups = [self._make_layup_vars({**dataclasses.asdict(defaults.layups[0]), "auto_cycles": True})]
         self.active_layup = 0
 
         self._build_menu()
@@ -168,18 +170,19 @@ class CFRPWinderApp:
         defaults = winding.Layup()
         return {key: self._watched(_make_var(getattr(defaults, key), values[key])) for key in winding.LAYUP_KEYS}
 
-    def _copy_layup_vars(self, source):
+    def _copy_layup_vars(self, source, **overrides):
         # Copies the fields' raw contents rather than their parsed values, so a
         # half-typed value is inherited as-is instead of failing the copy.
-        return self._make_layup_vars({key: self.root.getvar(str(var)) for key, var in source.items()})
+        return self._make_layup_vars({**{key: self.root.getvar(str(var)) for key, var in source.items()}, **overrides})
 
     def _layups_changed(self):
         if hasattr(self, "plan_tab"): self.plan_tab.on_layups_changed()
 
     def add_layup(self):
         # A new layup inherits every setting from the last one, so building up a
-        # program usually only means changing the one or two values that differ.
-        self.layups.append(self._copy_layup_vars(self.layups[-1]))
+        # program usually only means changing the one or two values that differ
+        # -- except its Number of Cycles, which always starts on auto.
+        self.layups.append(self._copy_layup_vars(self.layups[-1], auto_cycles=True))
         self.active_layup = len(self.layups) - 1
         self._layups_changed()
 
@@ -220,10 +223,15 @@ class CFRPWinderApp:
             except tk.TclError: raise winding.SettingsError(key) from None
         layups = []
         for index, layup_vars in enumerate(self.layups):
+            auto_cycles = bool(layup_vars["auto_cycles"].get())
             layup_values = {}
             for key, var in layup_vars.items():
                 try: layup_values[key] = var.get()
-                except tk.TclError: raise winding.SettingsError(key, index) from None
+                except tk.TclError:
+                    # An auto-cycle layup's field may be empty (e.g. just cleared
+                    # to return it to auto); the WindingJob computes the value.
+                    if key == "passes" and auto_cycles: layup_values[key] = 1
+                    else: raise winding.SettingsError(key, index) from None
             layups.append(winding.Layup(**layup_values))
         return winding.WindingJob(**values, layups=tuple(layups))
 

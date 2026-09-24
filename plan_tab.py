@@ -19,7 +19,7 @@ MACHINE_FIELDS = [
     ("Max Rotation Speed (mm/s)", "max_surface_speed"),
 ]
 TANK_FIELDS = [("Tank Length (mm)", "tank_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
-WINDING_FIELDS = [("Bandwidth / Tow Width (mm)", "bandwidth")]
+WINDING_FIELDS = [("Bandwidth / Tow Width (mm)", "bandwidth"), ("Turnaround Zone (mm)", "turnaround_zone")]
 LAYUP_FIELDS = [
     ("Number of Cycles", "passes"),
     ("Pattern Number (Strands per Cycle)", "pattern_number"),
@@ -120,12 +120,12 @@ class PlanTab:
 
         def add_fields(frame, fields, first_row=0, store=None):
             for i, (label_text, key) in enumerate(fields):
-                ttk.Label(frame, text=label_text, style=LBL).grid(row=first_row + i, column=0, sticky="w", pady=2, padx=(0, 10))
+                ttk.Label(frame, text=label_text, style=LBL).grid(row=first_row + i, column=0, sticky="w", pady=1, padx=(0, 10))
                 # Layup entries are bound to a variable later (on_layups_changed),
                 # since which layup's variables they edit changes on every switch.
                 var = self.app.params.get(key)
                 entry = ttk.Entry(frame, textvariable=var, width=12, style=ENT) if var is not None else ttk.Entry(frame, width=12, style=ENT)
-                entry.grid(row=first_row + i, column=1, sticky="e", pady=2)
+                entry.grid(row=first_row + i, column=1, sticky="e", pady=1)
                 if store is not None: store[key] = entry
             frame.columnconfigure(0, weight=1)
 
@@ -142,9 +142,9 @@ class PlanTab:
         # 2. Tank Settings
         tank_frame = ttk.LabelFrame(left_panel, text="Tank Settings", padding="8", style=FRM)
         tank_frame.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(tank_frame, text="End-Cap Type", style=LBL).grid(row=0, column=0, sticky="w", pady=2, padx=(0, 10))
+        ttk.Label(tank_frame, text="End-Cap Type", style=LBL).grid(row=0, column=0, sticky="w", pady=1, padx=(0, 10))
         self.cap_type_combo = ttk.Combobox(tank_frame, textvariable=self.app.params["end_cap_type"], values=["Round", "Flat"], state="readonly", width=10, style=CMB)
-        self.cap_type_combo.grid(row=0, column=1, sticky="e", pady=2)
+        self.cap_type_combo.grid(row=0, column=1, sticky="e", pady=1)
         self.app.params["end_cap_type"].trace_add("write", self.on_cap_type_change)
         add_fields(tank_frame, TANK_FIELDS, first_row=1, store=self.tank_entries)
 
@@ -157,10 +157,13 @@ class PlanTab:
         # motion planner doesn't need to slow to a near-halt at the turnaround.
         # A plain ttk.Checkbutton (just a font-size tweak via the Settings style,
         # not a color/Toolbutton style) -- a real checkbox is the most immediately
-        # recognizable widget for a plain on/off setting like this.
-        ttk.Checkbutton(winding_frame, text="Optimize Trajectory (experimental)",
-                        variable=self.app.params["optimize_trajectory"],
-                        style="Settings.TCheckbutton").grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # recognizable widget for a plain on/off setting like this. Greyed out
+        # while a Turnaround Zone is set, which spreads the whole turnaround
+        # rotation out and so supersedes it (see winding.compute_dwell_blend).
+        self._optimize_check = ttk.Checkbutton(winding_frame, text="Optimize Trajectory (experimental)",
+                                               variable=self.app.params["optimize_trajectory"],
+                                               style="Settings.TCheckbutton")
+        self._optimize_check.grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # 4. Layups -- the switchable per-layup settings. The section's title is
         # itself the switcher: [swatch] Layup 2 of 3 [<] [>] [-] [+], where the
@@ -193,6 +196,7 @@ class PlanTab:
         # value worth fighting).
         self.layup_entries["wind_angle"].bind("<FocusOut>", self._validate_wind_angle)
         self.layup_entries["wind_angle"].bind("<Return>", self._validate_wind_angle)
+        self._setup_cycles_field(self.layup_entries["passes"])
 
         self.generate_btn = ttk.Button(left_panel, text="Generate G-Code", command=self.app.generate, style="primary.TButton")
         self.generate_btn.pack(pady=(8, 5), fill=tk.X, ipady=4)
@@ -284,6 +288,7 @@ class PlanTab:
                 value.configure(cursor="hand2")
                 value.bind("<Button-1>", on_click)
             row += 1
+            return value
 
         heading("Program")
         estimate("time", "Time", "00:00:00")
@@ -298,6 +303,9 @@ class PlanTab:
         estimate("layup_tow", "Required Tow", "0.00 m")
         estimate("xspeed", "X-Speed", "0.00 mm/s", on_click=self._cycle_xspeed_unit)
         estimate("coverage", "Cycles for Full Coverage", "-")
+        # How much of the surface the layup's bands cover with its Number of
+        # Cycles; shown in the warning color while gaps would remain.
+        self._coverage_label = estimate("coverage_pct", "Coverage", "-")
         estimate("extra", "Extra Rotation", "-- / --")
 
         # Raw values cached in their base unit so clicking just re-formats them,
@@ -337,6 +345,104 @@ class PlanTab:
         val = self._xspeed_mm_s if unit == "mm/s" else self._xspeed_mm_s / 1000.0
         self.est["xspeed"].set(f"{val:.2f} {unit}")
 
+    # --- Number of Cycles: auto (full coverage) or custom ---
+    # Auto: the app keeps the field at the cycles needed for 100 % coverage (see
+    # winding.WindingJob), shown in grey with an "AUTO" tag inside the field.
+    # Typing a number makes it custom: normal text, no tag, never touched again.
+    # Clearing the field and leaving it (or pressing Enter) puts it back on auto.
+
+    def _setup_cycles_field(self, entry):
+        # Key validation fires only for the user's own typing/pasting -- never
+        # for the app setting the variable -- which is exactly the line between
+        # "custom" and "auto" here. It never rejects anything.
+        entry.configure(validate="key", validatecommand=(entry.register(self._on_cycles_typed), "%P"))
+        entry.bind("<FocusIn>", self._on_cycles_focus_in, add="+")
+        entry.bind("<FocusOut>", self._on_cycles_focus_out, add="+")
+        entry.bind("<Return>", self._on_cycles_focus_out, add="+")
+        self._cycles_tag = tk.Label(entry, text="AUTO", font=("TkDefaultFont", 7, "bold"), bd=0, padx=0, pady=0,
+                                    cursor="xterm")
+        # The tag sits on top of the field, so a click on it has to reach the field.
+        self._cycles_tag.bind("<Button-1>", lambda e: (entry.focus_set(), "break")[1])
+        self._cycles_mode_at_focus = None  # auto flag when the field gained focus
+        self._fill_focused_cycles = False  # one-shot: refill the field even though it has focus
+
+    def _active_cycles_auto(self):
+        return bool(self.app.layups[self.app.active_layup]["auto_cycles"].get())
+
+    def _cycles_field_has_focus(self):
+        try:
+            return self.app.root.focus_get() is self.layup_entries["passes"]
+        except KeyError:  # focus is in a Tk-internal widget (e.g. a combobox popdown)
+            return False
+
+    def _on_cycles_typed(self, new_text):
+        # An emptied field counts as auto straight away (the preview follows at
+        # once); it's refilled with the computed value when the user leaves it.
+        auto = new_text.strip() == ""
+        auto_var = self.app.layups[self.app.active_layup]["auto_cycles"]
+        if bool(auto_var.get()) != auto:
+            auto_var.set(auto)
+            self._update_cycles_field()
+        return True
+
+    def _on_cycles_focus_in(self, event=None):
+        self._cycles_mode_at_focus = self._active_cycles_auto()
+        if self._cycles_mode_at_focus:
+            # Select the computed value, so typing replaces it rather than
+            # appending to it. Deferred until the click has placed the cursor.
+            entry = self.layup_entries["passes"]
+            self.app.root.after_idle(lambda: self._cycles_field_has_focus() and entry.select_range(0, tk.END))
+
+    def _on_cycles_focus_out(self, event=None):
+        auto = self._active_cycles_auto()
+        if auto:
+            self._fill_focused_cycles = True  # also on Enter, where focus stays put
+            if self.redraw_timer:
+                self.app.root.after_cancel(self.redraw_timer)
+            self.draw_visualization()
+        if self._cycles_mode_at_focus is not None and self._cycles_mode_at_focus != auto:
+            n = len(self.app.layups)
+            prefix = f"Layup {self.app.active_layup + 1}: " if n > 1 else ""
+            value = self.layup_entries["passes"].get().strip()
+            if auto:
+                self.app.set_status(f"{prefix}Number of Cycles is back on auto -- {value} cycles for full coverage.")
+            else:
+                self.app.set_status(f"{prefix}Number of Cycles set to {value} and fixed there. "
+                                    "Clear the field to put it back on auto (full coverage).")
+        self._cycles_mode_at_focus = auto if self._cycles_field_has_focus() else None
+
+    def _sync_auto_cycles(self, job):
+        # Writes each auto layup's computed cycle count into its field (for the
+        # layups not on screen too, so switching shows the right number at once).
+        # The field the user is currently editing is left alone until they leave
+        # it, so a cleared field isn't refilled under their cursor.
+        editing = self._cycles_field_has_focus() and not self._fill_focused_cycles
+        self._fill_focused_cycles = False
+        for i, (layup_vars, layup) in enumerate(zip(self.app.layups, job.layups)):
+            if not layup.auto_cycles or (editing and i == self.app.active_layup):
+                continue
+            if winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number) is None:
+                continue  # not computable right now; geometry_errors() explains why
+            var = layup_vars["passes"]
+            try:
+                current = var.get()
+            except tk.TclError:
+                current = None
+            if current != layup.passes:
+                var.set(layup.passes)
+        self._update_cycles_field()
+
+    def _update_cycles_field(self):
+        entry, tag = self.layup_entries["passes"], self._cycles_tag
+        if self._active_cycles_auto():
+            color = self.app.canvas_palette["auto_text"]
+            entry.configure(foreground=color)
+            tag.configure(fg=color, bg=self.app.root.style.colors.inputbg)
+            tag.place(relx=1.0, rely=0.5, x=-7, anchor="e")
+        else:
+            entry.configure(foreground="")  # back to the theme's normal text color
+            tag.place_forget()
+
     # --- Layup switching ---
 
     def on_layups_changed(self):
@@ -353,6 +459,10 @@ class PlanTab:
         self._next_btn.configure(state="normal" if i < n - 1 else "disabled")
         self._remove_btn.configure(state="normal" if n > 1 else "disabled")
         self._draw_layup_swatch()
+        self._update_cycles_field()
+        if self._cycles_field_has_focus():
+            # Switched layups while in the field: it now edits another layup.
+            self._cycles_mode_at_focus = self._active_cycles_auto()
         # Redraw right away rather than debounced: nothing here is slow (a
         # switch that doesn't change any setting redraws from the cached
         # simulation), and an instant response is what makes switching feel snappy.
@@ -375,7 +485,7 @@ class PlanTab:
         self._validate_wind_angle()
         self.app.add_layup()
         n = len(self.app.layups)
-        self.app.set_status(f"Layup {n} added with the settings of Layup {n - 1}.")
+        self.app.set_status(f"Layup {n} added with the settings of Layup {n - 1}; its Number of Cycles is on auto.")
 
     def _remove_layup(self):
         index = self.app.active_layup
@@ -458,11 +568,14 @@ class PlanTab:
                 self.canvas.create_text(c_w / 2, c_h / 2, text=self.describe_settings_error(e),
                                         fill=pal["muted"], font=("TkDefaultFont", 10))
             self._draw_legend()
+            self._update_cycles_field()
             self._update_indicator()
             return
         self._job = job
+        self._sync_auto_cycles(job)
         layup = job.layups[self.app.active_layup]
         self._update_instant_estimates(job, layup)
+        self._optimize_check.state(["disabled"] if job.turnaround_zone > 0 else ["!disabled"])
 
         geometry_errors = winding.geometry_errors(job)
         errors = winding.validate(job)
@@ -598,8 +711,8 @@ class PlanTab:
         self._xspeed_mm_s = job.max_surface_speed / math.tan(math.radians(layup.wind_angle)) if angle_ok else 0.0
         self._update_xspeed_display()
 
-        cycles_needed = winding.compute_cycles_for_full_coverage(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number)
-        self.est["coverage"].set(str(math.ceil(cycles_needed)) if cycles_needed > 0 else "-")
+        cycles_needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number)
+        self.est["coverage"].set(str(cycles_needed) if cycles_needed else "-")
 
         # Extra Rotation (within the layup's first cycle): the pattern-alignment
         # "extra" rotation needed on top of the base turnaround dwell, split
@@ -607,12 +720,20 @@ class PlanTab:
         # share every circuit -- and the chuck-end (starting position)
         # turnaround, which absorbs the rest (see
         # compute_turnaround_balance_offset). Shown for the first circuit.
-        if angle_ok and layup.passes >= 1 and layup.pattern_number >= 1 and job.tank_diameter > 0:
+        if angle_ok and layup.passes >= 1 and layup.pattern_number >= 1 and job.tank_diameter > 0 and job.bandwidth > 0:
             plan = winding.plan_layup(job, layup)
             left_offset = plan.extra_after(0, layup.pattern_number) - plan.right_offset
             self.est["extra"].set(f"{plan.right_offset:.1f}° / {left_offset:.1f}°")
+            coverage = plan.coverage
+            self.est["coverage_pct"].set(f"{coverage * 100:.0f} %")
+            # Rounded display, so compare against what's shown: "100 %" never
+            # turns orange over a sub-percent shortfall.
+            gaps = round(coverage * 100) < 100
+            self._coverage_label.configure(foreground=self.app.canvas_palette["warn_text"] if gaps else "")
         else:
             self.est["extra"].set("-- / --")
+            self.est["coverage_pct"].set("-")
+            self._coverage_label.configure(foreground="")
 
     def _update_sim_estimates(self):
         # Figures that need the full simulation. While a newer calculation is

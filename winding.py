@@ -12,7 +12,7 @@ after the other on the same tank; the tank geometry, machine settings, tow
 width and trajectory optimization are shared by the whole program.
 """
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import NamedTuple
 
 # --- HARDCODED MACHINE LIMITS / GEOMETRY ---
@@ -50,6 +50,10 @@ class Layup:
     pattern_number: int = 3          # strands (circuits) per cycle
     wind_angle: float = 45.0         # degrees from the mandrel axis
     turnaround_angle: float = 270.0  # minimum dwell rotation at each turnaround (deg)
+    # True: `passes` follows the cycles needed for 100 % coverage, recomputed by
+    # the WindingJob whenever anything it depends on changes. False: `passes`
+    # is used exactly as given.
+    auto_cycles: bool = False
 
     def __post_init__(self):
         _coerce_fields(self)
@@ -70,12 +74,27 @@ class WindingJob:
     tank_diameter: float = 200.0
     end_cap_diameter: float = 50.0
     bandwidth: float = 5.0
+    # Length (mm) at each tank end over which the turnaround rotation is spread
+    # while the carriage runs out to the end and back, instead of one pure
+    # rotation at the end. 0 = pure rotation at the end. See compute_dwell_blend.
+    turnaround_zone: float = 80.0
     optimize_trajectory: bool = False
     layups: tuple = field(default=(Layup(),))
 
     def __post_init__(self):
         _coerce_fields(self)
-        object.__setattr__(self, "layups", tuple(self.layups))
+        # Auto-cycle layups get their cycle count resolved here, once, against
+        # this job's own tank and tow -- so every consumer (motion, estimates,
+        # settings header, cache key) sees the same, never-stale number.
+        object.__setattr__(self, "layups", tuple(self._resolve_cycles(layup) for layup in self.layups))
+
+    def _resolve_cycles(self, layup):
+        if not layup.auto_cycles:
+            return layup
+        cycles = full_coverage_cycles(self.tank_diameter, layup.wind_angle, self.bandwidth, layup.pattern_number)
+        # Not computable (e.g. an angle outside 0-90 deg): leave the layup as it
+        # is; geometry_errors() reports the actual problem.
+        return layup if cycles is None or cycles == layup.passes else replace(layup, passes=cycles)
 
     @property
     def dome_length(self):
@@ -93,6 +112,18 @@ class WindingJob:
     @property
     def total_cycles(self):
         return sum(layup.passes for layup in self.layups)
+
+    @property
+    def turnaround_zone_steps(self):
+        # The zone is covered by whole traversal steps, so it rounds up to a
+        # multiple of STEP_SIZE.
+        return max(0, math.ceil(self.turnaround_zone / STEP_SIZE - 1e-9))
+
+
+def _traversal_step_count(length):
+    # Number of moves traversal_steps() makes over `length` (the last may be short).
+    n_full = int(length // STEP_SIZE)
+    return n_full + (1 if length - n_full * STEP_SIZE > 1e-9 else 0)
 
 
 GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
@@ -124,6 +155,12 @@ def geometry_errors(job):
         errors.append("Bandwidth / Tow Width must be greater than 0.")
     if job.max_surface_speed <= 0:
         errors.append("Max Rotation Speed must be greater than 0.")
+    if job.turnaround_zone < 0:
+        errors.append("Turnaround Zone can't be negative.")
+    elif job.tank_length > 0 and 2 * job.turnaround_zone_steps > _traversal_step_count(job.tank_length):
+        # The zones at both ends would overlap, and part of the turnaround
+        # rotation would have nowhere to go.
+        errors.append("Turnaround Zone must be at most half the Tank Length.")
     if not job.layups:
         errors.append("At least one layup is required.")
     for i, layup in enumerate(job.layups):
@@ -212,25 +249,49 @@ def calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_next):
 
 # --- Pattern / turnaround math ---
 
-def compute_dwell_extras(traverse_rotation, dwell, within_target, between_target):
-    # Dwell is a minimum, not a fixed angle: at the turnaround(s) closing out a
-    # circuit, extra rotation (on top of 2x the dwell minimum, since dwell applies
-    # at both turnarounds) is added so the NEXT circuit's starting angle lands
-    # exactly on the target gap, no matter how large the dwell minimum is. Both
-    # values are constants (the starting angle cancels out of the modulo), so
-    # they only need to be computed once per layup, not per circuit.
+def compute_pattern_skip(base, pattern_number, shift):
+    # The pattern "skip" k: every circuit's total rotation is rounded UP to
+    # k * (360 / pattern_number), i.e. onto the nearest pattern slot at or past
+    # the minimum rotation the traverses and dwell minimums need (`base`) --
+    # ANY of the p slots, not just the one adjacent to the circuit's start.
+    # This is the old Excel generator's method ("degrees per cycle" = the next
+    # multiple of the "cycle width" 360/p) and caps the extra rotation added at
+    # the turnarounds at about one slot (360/p) instead of up to a full turn.
+    #
+    # k must be coprime with p: stepping k slots at a time then visits every one
+    # of the p slots once per cycle. With a common factor it would keep
+    # revisiting a subset of them and leave the rest of the tank bare (the Excel
+    # sheet never checked this; it only worked because its pattern numbers were
+    # primes). With a single strand per cycle there are no within-cycle steps,
+    # so every circuit also carries the cycle shift and k may cover less.
+    interval = 360.0 / pattern_number
+    needed = base - (shift if pattern_number == 1 else 0.0)
+    k = max(1, math.ceil(needed / interval - 1e-9))
+    while math.gcd(k, pattern_number) != 1:
+        k += 1
+    return k
+
+
+def compute_dwell_extras(traverse_rotation, dwell, pattern_number, shift):
+    # Dwell is a minimum, not a fixed angle: on top of 2x the dwell minimum (it
+    # applies at both turnarounds), each circuit gets extra rotation so the NEXT
+    # circuit starts exactly on the pattern -- k slots on (see
+    # compute_pattern_skip) within a cycle, plus the cycle shift after a cycle's
+    # last circuit. Both extras use the SAME skip, so they differ only by the
+    # shift (a fraction of one band width), which keeps the turnarounds nearly
+    # identical from circuit to circuit. Returns (extra_within, extra_between, k).
     base = traverse_rotation + 2 * dwell
-    extra_within = (within_target - base) % 360.0
-    extra_between = (between_target - base) % 360.0
-    return extra_within, extra_between
+    k = compute_pattern_skip(base, pattern_number, shift)
+    extra_within = k * (360.0 / pattern_number) - base
+    return extra_within, extra_within + shift, k
 
 
 def compute_turnaround_balance_offset(total_circuits, n_strands, dwell, extra_within, extra_between):
     # The outbound (right) turnaround's dwell must stay a TRUE CONSTANT across
     # every circuit -- not just small on average -- or the return traversal's
     # pattern breaks. Here's why: the forward-traversal start angles already
-    # form a correct arithmetic progression (stepping by 360/n_strands within a
-    # cycle, by the bandwidth shift between cycles); the forward-END angles are
+    # form a correct progression (stepping k pattern slots within a cycle, plus
+    # the cycle shift between cycles); the forward-END angles are
     # that same progression plus one fixed, circuit-independent traversal
     # amount, so they're still in the same correct progression. Adding the SAME
     # constant to every forward-end angle (a fixed right-turnaround dwell)
@@ -247,24 +308,43 @@ def compute_turnaround_balance_offset(total_circuits, n_strands, dwell, extra_wi
     # (extra_i - 0) -- the round-trip total, and therefore the pattern, is
     # completely unaffected by K's value. Choosing K as half the average
     # extra rotation over the whole layup makes the running total spent
-    # on the right and left turnarounds come out exactly equal, instead of
-    # (as before this existed) dumping essentially all of it on the left.
+    # on the right and left turnarounds come out exactly equal.
+    #
+    # Every circuit carries its extra (the layup's last one too, which leaves
+    # the pattern closed for whatever follows), and the extras only differ by
+    # the cycle shift, so K sits within a fraction of a band of every circuit's
+    # half -- the left turnaround matches the right one to within a few degrees
+    # on every circuit, not just on average. (An earlier version aligned each
+    # circuit to the ADJACENT slot, whose extras swung by up to a full turn
+    # between circuits, and gave the layup's last circuit none at all; that
+    # forced K below the dwell minimum, so small dwell settings piled the
+    # difference onto the chuck-side turnaround.)
     if total_circuits <= 0:
         return 0.0
-    n_cycles = max(1, total_circuits // n_strands)
-    n_between = max(0, n_cycles - 1)
-    n_within = max(0, (total_circuits - 1) - n_between)
+    n_between = total_circuits // n_strands  # every cycle's last circuit
+    n_within = total_circuits - n_between
     sum_extra = n_between * extra_between + n_within * extra_within
     k_ideal = sum_extra / (2.0 * total_circuits)
-    # Clamped to [0, dwell] so neither turnaround's dwell (dwell + K, or
-    # dwell + extra_i - K) can ever go negative -- this only bites for an
-    # unusually small dwell setting, in which case the balance achieved is
-    # merely the best available rather than perfectly even.
-    return max(0.0, min(k_ideal, dwell))
+    # Clamped so neither turnaround's dwell (dwell + K, or dwell + extra_i - K)
+    # can ever go negative.
+    min_extra = extra_between if n_within == 0 else min(extra_within, extra_between)
+    return max(0.0, min(k_ideal, dwell + min_extra))
 
 
-def compute_dwell_blend(dwell_amount, optimize, n_steps=3, max_fraction=0.3, max_deg=20.0):
-    # "Optimize Trajectory": at a turnaround, the machine currently goes from
+def compute_dwell_blend(dwell_amount, optimize, zone_steps=0, n_steps=3, max_fraction=0.3, max_deg=20.0):
+    # Turnaround zone (zone_steps > 0): the old Excel generator's turnaround.
+    # There is no pure-rotation move at all: the whole turnaround rotation is
+    # spread evenly over the last `zone_steps` traversal steps running out to
+    # the tank end (half of it) and the first `zone_steps` running back (the
+    # other half), on top of their normal helix rotation. The Excel sheet did
+    # exactly this over the bulkhead -- its two 80 mm "bulkhead height
+    # compensation" moves out and back, each with a quarter of the circuit's
+    # turnaround rotation. The fiber then turns around across the whole zone
+    # instead of wrapping on top of itself as a ring at one X position, which
+    # builds up over hundreds of circuits. Takes precedence over Optimize
+    # Trajectory, which only eases a small part of a pure-rotation dwell.
+    #
+    # "Optimize Trajectory": at a turnaround, the machine otherwise goes from
     # "X moving, A rotating a little (the helix)" straight into "X frozen, A
     # rotating a lot (the dwell)" in one abrupt move. Klipper's look-ahead
     # planner treats consecutive moves as one combined (X,Y,A) vector, and a
@@ -295,7 +375,14 @@ def compute_dwell_blend(dwell_amount, optimize, n_steps=3, max_fraction=0.3, max
     #               normal helix rotation for the FIRST n_steps of the
     #               traversal leading OUT of this dwell.
     #   core_dwell: the remaining rotation for the dwell move itself.
-    if not optimize or dwell_amount <= 0:
+    if dwell_amount <= 0:
+        return [], [], dwell_amount
+    if zone_steps > 0:
+        per_step = dwell_amount / (2 * zone_steps)
+        tail_blend = [per_step] * zone_steps
+        head_blend = [per_step] * zone_steps
+        return head_blend, tail_blend, dwell_amount - sum(tail_blend) - sum(head_blend)
+    if not optimize:
         return [], [], dwell_amount
     blend_each_side = min(max_deg, dwell_amount * max_fraction)
     weights = list(range(1, n_steps + 1))
@@ -375,11 +462,12 @@ def compute_wind_angle_bounds(tank_length, tank_diameter, bandwidth):
 
 def compute_cycles_for_full_coverage(dt, wind_angle, bandwidth, pattern_number):
     # Each cycle lays `pattern_number` strands evenly spread around the full
-    # circumference; between cycles the whole spread advances by exactly one
-    # tow-width. So the tank is fully covered once (total bands needed for one
-    # wrap) / pattern_number cycles have run, where total bands = circumference
-    # / effective tow-width (tow-width widened by 1/cos(wind_angle) to account
-    # for the helix angle, same conversion used for shift_degrees elsewhere).
+    # circumference, and the layup's cycles share out the gap between two
+    # strands evenly (see plan_layup). So the tank is fully covered once
+    # (total bands needed for one wrap) / pattern_number cycles have run, where
+    # total bands = circumference / effective tow-width (tow-width widened by
+    # 1/cos(wind_angle) to account for the helix angle, same conversion used
+    # for band_degrees elsewhere). Fractional; see full_coverage_cycles.
     if wind_angle <= 0 or wind_angle >= 90 or bandwidth <= 0 or pattern_number <= 0:
         return 0.0
     circumference = math.pi * dt
@@ -388,36 +476,63 @@ def compute_cycles_for_full_coverage(dt, wind_angle, bandwidth, pattern_number):
     return total_bands / pattern_number
 
 
+def full_coverage_cycles(dt, wind_angle, bandwidth, pattern_number):
+    """The fewest whole cycles that cover the tank 100 % -- what an auto-cycle
+    layup winds -- or None if the inputs don't allow computing it."""
+    cycles = compute_cycles_for_full_coverage(dt, wind_angle, bandwidth, pattern_number)
+    if cycles <= 0:
+        return None
+    # The tolerance keeps float noise on an exact fit (e.g. 30.000000000001)
+    # from costing a whole extra cycle.
+    return max(1, math.ceil(cycles - 1e-9))
+
+
 class LayupPlan(NamedTuple):
     """Per-layup constants derived once from the job, shared by the motion
     generator and the instant (non-simulated) estimates."""
     pitch: float            # axial advance per mandrel revolution (mm)
-    shift_degrees: float    # rotation between consecutive cycles: one effective tow width
+    shift_degrees: float    # rotation added between consecutive cycles (the closing shift)
+    band_degrees: float     # angular width of one band around the tank (tow width / cos(angle))
     total_circuits: int
+    skip: int               # pattern slots stepped per circuit (see compute_pattern_skip)
     extra_within: float     # alignment rotation after a circuit that stays within its cycle
     extra_between: float    # alignment rotation after a cycle's last circuit
     right_offset: float     # fixed share of the extra rotation given to every far-end turnaround
 
+    @property
+    def coverage(self):
+        # Fraction of the surface the layup's bands cover: each cycle moves the
+        # pattern on by shift_degrees, so 1.0 means bands exactly edge to edge,
+        # above 1.0 they overlap evenly, below 1.0 evenly spaced gaps remain.
+        return self.band_degrees / self.shift_degrees
+
     def extra_after(self, circuit, n_strands):
-        # The alignment rotation owed at the end of `circuit`. The layup's very
-        # last circuit has nothing of its own pattern left to align to, so it
-        # gets none.
-        if circuit + 1 >= self.total_circuits:
-            return 0.0
+        # The alignment rotation owed at the end of `circuit`. The layup's last
+        # circuit gets it too: that closes the pattern, so a following identical
+        # layup winds exactly on top of this one (the Excel sheet's "layers").
         return self.extra_between if (circuit + 1) % n_strands == 0 else self.extra_within
 
 
 def plan_layup(job, layup):
     dt, lt = job.tank_diameter, job.tank_length
+    p = layup.pattern_number
     pitch = (math.pi * dt) / math.tan(math.radians(layup.wind_angle))
-    shift_degrees = (job.bandwidth / math.cos(math.radians(layup.wind_angle)) / (math.pi * dt)) * 360.0
-    total_circuits = layup.pattern_number * layup.passes
+    band_degrees = (job.bandwidth / math.cos(math.radians(layup.wind_angle)) / (math.pi * dt)) * 360.0
+    # Closing shift: the gap between two neighbouring pattern slots (360/p) is
+    # divided evenly over the layup's cycles, so after its last cycle the bands
+    # meet the first ones exactly -- evenly overlapping when the layup has at
+    # least "Cycles for Full Coverage" cycles, instead of one lumped overlap
+    # seam from stepping a whole band width per cycle. Same idea as the Excel
+    # sheet's (360/p) / circuits-for-coverage shift, but applied once per cycle
+    # rather than smeared over every circuit: the sheet's smeared version
+    # offsets each pattern slot by a different fraction of a band, which leaves
+    # uncovered strips up to several mm wide at some slot seams.
+    shift_degrees = (360.0 / p) / layup.passes
+    total_circuits = p * layup.passes
     traverse_rotation = (2.0 * lt / pitch) * 360.0
-    extra_within, extra_between = compute_dwell_extras(traverse_rotation, layup.turnaround_angle,
-                                                       360.0 / layup.pattern_number, shift_degrees)
-    right_offset = compute_turnaround_balance_offset(total_circuits, layup.pattern_number,
-                                                     layup.turnaround_angle, extra_within, extra_between)
-    return LayupPlan(pitch, shift_degrees, total_circuits, extra_within, extra_between, right_offset)
+    extra_within, extra_between, skip = compute_dwell_extras(traverse_rotation, layup.turnaround_angle, p, shift_degrees)
+    right_offset = compute_turnaround_balance_offset(total_circuits, p, layup.turnaround_angle, extra_within, extra_between)
+    return LayupPlan(pitch, shift_degrees, band_degrees, total_circuits, skip, extra_within, extra_between, right_offset)
 
 
 # --- The motion generator ---
@@ -432,7 +547,7 @@ class Move(NamedTuple):
     r: float          # tank radius at the target X (mm)
     layup: int        # index into job.layups
     circuit: int      # circuit index within its layup
-    dwell: bool       # True for the pure-rotation turnaround move
+    dwell: bool       # True for a pure-rotation turnaround move (none with a turnaround zone)
 
 
 class CycleComplete(NamedTuple):
@@ -490,6 +605,7 @@ def iter_program(job):
     eye_y = _eye_y_function(job, geom)
     max_a_speed = job.max_a_speed
     n_layups = len(job.layups)
+    zone_steps = job.turnaround_zone_steps
 
     x, a = x_start, 0.0
     y = eye_y(x)
@@ -511,7 +627,7 @@ def iter_program(job):
             for direction in (1, -1):
                 target_x = x_end if direction == 1 else x_start
                 dwell_amount = layup.turnaround_angle + (plan.right_offset if direction == 1 else (extra - plan.right_offset))
-                head_blend, tail_blend, core_dwell = compute_dwell_blend(dwell_amount, job.optimize_trajectory)
+                head_blend, tail_blend, core_dwell = compute_dwell_blend(dwell_amount, job.optimize_trajectory, zone_steps)
                 if li == n_layups - 1 and i == plan.total_circuits - 1 and direction == -1:
                     # Nothing follows the program's very last dwell to absorb a
                     # head blend into, so fold it back into the dwell move itself
@@ -528,10 +644,13 @@ def iter_program(job):
                     yield Move(x_next, y_next, a_next, feed, duration, tow, r_next, li, i, False)
                     x, y, a, r = x_next, y_next, a_next, r_next
                 pending_head_blend = head_blend
-                a_next = a + core_dwell
-                feed, duration, tow = calc_move(x, y, a, x, y, a_next, max_a_speed, r)
-                yield Move(x, y, a_next, feed, duration, tow, r, li, i, True)
-                a = a_next
+                # A turnaround zone spreads all of the rotation over the steps,
+                # leaving nothing (but float dust) for a pure-rotation move.
+                if abs(core_dwell) > 1e-6:
+                    a_next = a + core_dwell
+                    feed, duration, tow = calc_move(x, y, a, x, y, a_next, max_a_speed, r)
+                    yield Move(x, y, a_next, feed, duration, tow, r, li, i, True)
+                    a = a_next
             if (i + 1) % n_strands == 0:
                 cycle_number += 1
                 yield CycleComplete(cycle_number, li, a)
@@ -572,7 +691,10 @@ def simulate(job):
     total_time, total_tow = 0.0, 0.0
     x_prev, a_prev = geom.x_start, 0.0
     r_prev = geom.radius(x_prev)
-    current_run = None
+    # The run being recorded, and the (layup, circuit, X direction) it belongs
+    # to. A run ends at a pure-rotation dwell, or -- with a turnaround zone,
+    # where there is none -- wherever the traverse reverses direction.
+    current_run, run_key = None, None
     for ev in iter_program(job):
         if type(ev) is not Move:
             continue
@@ -580,38 +702,38 @@ def simulate(job):
         res = results[ev.layup]
         res.time += ev.duration
         res.tow += ev.tow
-        if ev.circuit < job.layups[ev.layup].pattern_number:
-            if ev.dwell:
-                if current_run is not None:
-                    res.strand_runs[ev.circuit].append(current_run)
-                    current_run = None
-            else:
-                if current_run is None:
-                    current_run = [(x_prev, r_prev, a_prev)]
-                # STEP_SIZE is a fixed X distance, not an angular one, so near
-                # the steep end of the wind-angle range (where pitch shrinks
-                # toward the tow width) a single step can sweep close to -- or,
-                # right at the computed max angle, exactly -- a full revolution.
-                # Recording only the step's endpoint then aliases the helix for
-                # rendering: whole visible arcs can fall entirely between two
-                # samples (dropped strand segments), and at the point where one
-                # step's sweep is an exact multiple of 360 deg, every sample
-                # lands at the same rotational phase, which flattens the drawn
-                # path into what looks like a shallow straight line instead of a
-                # tight helix. Subdividing by rotation (not distance) fixes the
-                # rendering without touching the motion or the time/tow
-                # accumulation above, so the G-code this mirrors is completely
-                # unaffected; only how densely the already-correct path gets
-                # sampled for drawing changes.
-                a_delta = ev.a - a_prev
-                n_sub = max(1, min(60, math.ceil(abs(a_delta) / RENDER_MAX_DEG_PER_STEP)))
-                for k in range(1, n_sub + 1):
-                    frac = k / n_sub
-                    fx = x_prev + (ev.x - x_prev) * frac
-                    fa = a_prev + a_delta * frac
-                    fr = ev.r if k == n_sub else geom.radius(fx)
-                    current_run.append((fx, fr, fa))
+        key = None if ev.dwell else (ev.layup, ev.circuit, ev.x > x_prev)
+        if current_run is not None and key != run_key:
+            results[run_key[0]].strand_runs[run_key[1]].append(current_run)
+            current_run = None
+        if key is not None and ev.circuit < job.layups[ev.layup].pattern_number:
+            if current_run is None:
+                current_run, run_key = [(x_prev, r_prev, a_prev)], key
+            # STEP_SIZE is a fixed X distance, not an angular one, so near the
+            # steep end of the wind-angle range (where pitch shrinks toward the
+            # tow width) a single step can sweep close to -- or, right at the
+            # computed max angle, exactly -- a full revolution. Recording only
+            # the step's endpoint then aliases the helix for rendering: whole
+            # visible arcs can fall entirely between two samples (dropped strand
+            # segments), and at the point where one step's sweep is an exact
+            # multiple of 360 deg, every sample lands at the same rotational
+            # phase, which flattens the drawn path into what looks like a
+            # shallow straight line instead of a tight helix. Subdividing by
+            # rotation (not distance) fixes the rendering without touching the
+            # motion or the time/tow accumulation above, so the G-code this
+            # mirrors is completely unaffected; only how densely the
+            # already-correct path gets sampled for drawing changes.
+            a_delta = ev.a - a_prev
+            n_sub = max(1, min(60, math.ceil(abs(a_delta) / RENDER_MAX_DEG_PER_STEP)))
+            for k in range(1, n_sub + 1):
+                frac = k / n_sub
+                fx = x_prev + (ev.x - x_prev) * frac
+                fa = a_prev + a_delta * frac
+                fr = ev.r if k == n_sub else geom.radius(fx)
+                current_run.append((fx, fr, fa))
         x_prev, r_prev, a_prev = ev.x, ev.r, ev.a
+    if current_run is not None:
+        results[run_key[0]].strand_runs[run_key[1]].append(current_run)
     return SimulationResult(total_time, total_tow, results)
 
 
@@ -632,8 +754,17 @@ def settings_items(job):
 def layups_from_header(settings):
     """Rebuilds the layup list from a parsed settings header ({key: raw string}).
     Also reads files written before multi-layup support, which stored a single
-    pattern's settings as top-level keys. Returns None if there's nothing to
-    restore."""
+    pattern's settings as top-level keys. Settings a file predates keep their
+    defaults -- in particular, its cycle counts stay exactly as written (not
+    auto). Returns None if there's nothing to restore."""
+    def parse(values):
+        parsed = {}
+        for f in fields(Layup):
+            if f.name in values:
+                raw = values[f.name].strip()
+                parsed[f.name] = raw.lower() in ("1", "true", "yes", "on") if f.type in (bool, "bool") else float(raw)
+        return Layup(**parsed)
+
     try:
         count = int(float(settings.get("layups", 0)))
     except ValueError:
@@ -643,16 +774,16 @@ def layups_from_header(settings):
         raw = settings.get(f"layup_{n}")
         if raw is None:
             continue
-        values = dict(token.split("=", 1) for token in raw.split() if "=" in token)
         try:
-            layups.append(Layup(**{key: float(values[key]) for key in LAYUP_KEYS if key in values}))
+            layups.append(parse(dict(token.split("=", 1) for token in raw.split() if "=" in token)))
         except ValueError:
             continue
     if layups:
         return layups
-    if all(key in settings for key in LAYUP_KEYS):
+    legacy_keys = ("passes", "pattern_number", "wind_angle", "turnaround_angle")
+    if all(key in settings for key in legacy_keys):
         try:
-            return [Layup(**{key: float(settings[key]) for key in LAYUP_KEYS})]
+            return [parse({key: settings[key] for key in legacy_keys})]
         except ValueError:
             return None
     return None

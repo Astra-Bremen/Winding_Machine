@@ -42,6 +42,7 @@ PALETTES = {
         "reach": "#df8c1f",
         "warn_text": "#cc6041",
         "muted": "#8a9490",
+        "auto_text": "#a2aaa7",  # an entry field's value while the app sets it (vs. #5a5a5a typed)
     },
     "dark": {
         "canvas_bg": "#22282a",
@@ -55,6 +56,7 @@ PALETTES = {
         "reach": "#ffb454",
         "warn_text": "#e2836a",
         "muted": "#7a8486",
+        "auto_text": "#7f8a8c",
     },
 }
 
