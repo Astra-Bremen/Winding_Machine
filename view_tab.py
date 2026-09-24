@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import math
+import theme
+import winding
 from theme import VIEWPORT_PALETTE as VP
 
 class ViewTab:
@@ -16,6 +18,12 @@ class ViewTab:
         self.cmd_cycles = []
         self.cycle_starts = {}
         self.total_cycles = 0
+        # Which layup (0-based) each command belongs to, from the file's
+        # "; LAYUP_START:n" markers; files written before multi-layup support
+        # have none, and are treated as one single layup.
+        self.cmd_layups = []
+        self.layup_count = 1
+        self.layup_var = tk.StringVar(value="")
         self.gcode_path_var = tk.StringVar(value="No file loaded")
         self.timeline_var = tk.IntVar(value=0)
         self.line_var = tk.IntVar(value=0)
@@ -39,6 +47,7 @@ class ViewTab:
         top_bar = ttk.Frame(self.parent)
         top_bar.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(top_bar, textvariable=self.gcode_path_var).pack(side=tk.LEFT, padx=5)
+        ttk.Label(top_bar, textvariable=self.layup_var, font=("TkDefaultFont", 9, "bold")).pack(side=tk.RIGHT, padx=5)
 
         view_content = ttk.Frame(self.parent)
         view_content.pack(fill=tk.BOTH, expand=True)
@@ -162,11 +171,13 @@ class ViewTab:
         self._path_static, self._path_substeps, self._cache_key = [], [], None
         self.cmd_cycles, self.cycle_starts = [], {}
         self.cmd_times = []
+        self.cmd_layups, self.layup_count = [], 1
         try:
             with open(filepath, 'r') as f:
                 cx, cy, ca = 0.0, 0.0, 0.0
                 a_offset = 0.0
                 cycle_num = 1
+                layup = 0
                 feed = 0.0  # G-code F persists across lines that don't repeat it
                 elapsed = 0.0
                 prev_x, prev_y, prev_a = None, None, None
@@ -175,6 +186,9 @@ class ViewTab:
                     if line.startswith(";"):
                         if line.startswith("; CYCLE_COMPLETE:"):
                             try: cycle_num = int(line.split(":", 1)[1].strip()) + 1
+                            except ValueError: pass
+                        elif line.startswith("; LAYUP_START:"):
+                            try: layup = max(0, int(line.split(":", 1)[1].strip()) - 1)
                             except ValueError: pass
                         elif ":" in line:
                             p = line[1:].split(":", 1)
@@ -220,13 +234,17 @@ class ViewTab:
                         if cycle_num not in self.cycle_starts:
                             self.cycle_starts[cycle_num] = len(self.gcode_commands) - 1
                         self.cmd_cycles.append(cycle_num)
-            try: self.total_cycles = int(float(self.view_settings.get("passes", cycle_num)))
-            except ValueError: self.total_cycles = cycle_num
-            self.timeline_slider.config(to=max(0, len(self.gcode_commands)-1))
-            self.timeline_var.set(0)
-            self.line_total_var.set(f"/ {len(self.gcode_commands)}")
-            self.cycle_total_var.set(f"/ {self.total_cycles}")
-        except: pass
+                        self.cmd_layups.append(layup)
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            messagebox.showerror("Error", f"Couldn't read the G-code file:\n{e}")
+            return
+        header_layups = winding.layups_from_header(self.view_settings)
+        self.total_cycles = sum(l.passes for l in header_layups) if header_layups else cycle_num
+        self.layup_count = max(len(header_layups) if header_layups else 1, max(self.cmd_layups, default=0) + 1)
+        self.timeline_slider.config(to=max(0, len(self.gcode_commands)-1))
+        self.timeline_var.set(0)
+        self.line_total_var.set(f"/ {len(self.gcode_commands)}")
+        self.cycle_total_var.set(f"/ {self.total_cycles}")
 
     def _sync_settings_to_app_params(self):
         for key, var in self.app.params.items():
@@ -238,6 +256,10 @@ class ViewTab:
                 elif isinstance(var, tk.DoubleVar): var.set(float(raw))
                 else: var.set(raw)
             except ValueError: pass
+        # Restores every layup, including from files written before multi-layup
+        # support (a single pattern stored as top-level settings).
+        layups = winding.layups_from_header(self.view_settings)
+        if layups: self.app.load_layups(layups)
 
     def jump_to_line(self, event=None):
         if not self.gcode_commands: return
@@ -272,10 +294,11 @@ class ViewTab:
         # most-recently-laid point always sits at the eye, meaning every already-
         # laid point's screen position must be re-derived relative to the CURRENT
         # rotation on every redraw, not fixed at whatever it was when laid down.
+        # Each point also carries its layup index, which picks its strand color.
         pts = []
-        for cx, cy, ca, ca_raw in self.gcode_commands:
-            r = self.app.calc_R(cx - co, 0, lt, rt, rc, ld, cap_type)
-            pts.append((ox - cx * scale, r, ca))
+        for (cx, cy, ca, ca_raw), layup in zip(self.gcode_commands, self.cmd_layups):
+            r = winding.calc_R(cx - co, 0, lt, rt, rc, ld, cap_type)
+            pts.append((ox - cx * scale, r, ca, layup))
         self._path_static = pts
 
         # Each stored point is one real G-code command, which -- at a steep wind
@@ -295,17 +318,18 @@ class ViewTab:
         raw_cx = [cmd[0] for cmd in self.gcode_commands]
         raw_ca = [cmd[2] for cmd in self.gcode_commands]
         subs = []
-        cap_deg = self.app.RENDER_MAX_DEG_PER_STEP
+        cap_deg = winding.RENDER_MAX_DEG_PER_STEP
         for i in range(len(self.gcode_commands) - 1):
             dx, da = raw_cx[i + 1] - raw_cx[i], raw_ca[i + 1] - raw_ca[i]
             n_sub = min(60, math.ceil(abs(da) / cap_deg)) if abs(da) > cap_deg else 1
+            layup = self.cmd_layups[i + 1]  # the move from i to i+1 belongs to its target's layup
             seg = []
             for k in range(1, n_sub):
                 frac = k / n_sub
                 scx = raw_cx[i] + dx * frac
                 sca = raw_ca[i] + da * frac
-                sr = self.app.calc_R(scx - co, 0, lt, rt, rc, ld, cap_type)
-                seg.append((ox - scx * scale, sr, sca))
+                sr = winding.calc_R(scx - co, 0, lt, rt, rc, ld, cap_type)
+                seg.append((ox - scx * scale, sr, sca, layup))
             subs.append(seg)
         self._path_substeps = subs
 
@@ -340,9 +364,29 @@ class ViewTab:
         # Auto-rotate OFF: the original plain 2D side view -- every point rendered
         # at its own recorded angle directly, camera fixed in the world frame, tank
         # never appears to spin.
+        #
+        # Each layup is drawn in its own identity color (theme.layup_style), the
+        # G-code viewport counterpart of the Settings Preview's layup colors.
         VIS_TOLERANCE = math.sin(math.radians(20))
         poly = []
-        def emit(px, r, ca_recorded):
+        poly_layup = None  # the layup whose color `poly` is drawn in
+
+        def flush():
+            if len(poly) >= 2:
+                color, dash = theme.layup_style(VP, poly_layup)
+                self.view_canvas.create_line(*[c for p in poly for c in p], fill=color, dash=dash or "", width=1)
+            poly.clear()
+
+        def emit(px, r, ca_recorded, layup):
+            nonlocal poly_layup
+            if layup != poly_layup:
+                # Layup boundary: finish the previous layup's line in its own
+                # color, then carry on from its last point in the new color so
+                # the path stays visually continuous across the change.
+                last = poly[-1] if poly else None
+                flush()
+                if last is not None: poly.append(last)
+                poly_layup = layup
             if auto_rotate:
                 # Subtracting (not adding) the elapsed rotation matches the tank's
                 # actual spin direction: material that has just left the eye stays
@@ -357,9 +401,7 @@ class ViewTab:
             if visible:
                 poly.append((px, py))
             else:
-                if len(poly) >= 2:
-                    self.view_canvas.create_line(*[c for p in poly for c in p], fill=VP["strand"], width=1)
-                poly.clear()
+                flush()
         for i in range(idx + 1):
             emit(*self._path_static[i])
             # The substeps between real point i and i+1 retrace what that single
@@ -368,8 +410,7 @@ class ViewTab:
             if i < idx and i < len(self._path_substeps):
                 for spt in self._path_substeps[i]:
                     emit(*spt)
-        if len(poly) >= 2:
-            self.view_canvas.create_line(*[c for p in poly for c in p], fill=VP["strand"], width=1)
+        flush()
 
     def _draw_rotation_grid(self, co, lt, rt, rc, ld, cap_type, scale, ox, oy, ca):
         # A cylinder's outer silhouette never visually changes as it spins around
@@ -389,7 +430,7 @@ class ViewTab:
             poly = []
             for i in range(n_samples + 1):
                 x = i * (lt / n_samples)
-                r = self.app.calc_R(x, 0, lt, rt, rc, ld, cap_type)
+                r = winding.calc_R(x, 0, lt, rt, rc, ld, cap_type)
                 eff = stripe_angle - math.radians(ca)
                 px, py = ox - (co + x) * scale, oy - r * math.cos(eff) * scale
                 if math.sin(eff) >= 0:
@@ -408,6 +449,10 @@ class ViewTab:
         cmd = self.gcode_commands[idx]
         self.line_var.set(idx)
         self.cycle_var.set(self.cmd_cycles[idx] if idx < len(self.cmd_cycles) else 0)
+        if self.layup_count > 1 and idx < len(self.cmd_layups):
+            self.layup_var.set(f"Layup {self.cmd_layups[idx] + 1} / {self.layup_count}")
+        else:
+            self.layup_var.set("")
         # Fixed-width, integer X/Y (only A keeps decimals) so the readout doesn't
         # change length -- and therefore doesn't visibly shift -- as the numbers
         # change while scrubbing/playing.
@@ -428,7 +473,7 @@ class ViewTab:
             ox, oy = c_w / 2.0 + (co + lt / 2.0) * scale, c_h / 2
             tank_top, tank_bottom = [], []
             for i in range(51):
-                x = i * (lt / 50); r = self.app.calc_R(x, 0, lt, rt, rc, ld, cap_type)
+                x = i * (lt / 50); r = winding.calc_R(x, 0, lt, rt, rc, ld, cap_type)
                 tank_top.append((ox - (co + x) * scale, oy - r * scale))
                 tank_bottom.append((ox - (co + x) * scale, oy + r * scale))
             self.view_canvas.create_polygon(tank_top + tank_bottom[::-1], fill=VP["tank"], outline=VP["tank_outline"])
@@ -442,8 +487,8 @@ class ViewTab:
                 self._cache_key = cache_key
             self._draw_wound_path(oy, scale, cmd[2], idx, auto_rotate)
 
-            tool_x, eye_y = ox - cmd[0] * scale, oy + (550 - arm - cmd[1]) * scale
-            self.view_canvas.create_line(tool_x, oy + (550 - arm) * scale, tool_x, eye_y, width=3, fill=VP["eye_line"])
+            tool_x, eye_y = ox - cmd[0] * scale, oy + (winding.Y_REFERENCE - arm - cmd[1]) * scale
+            self.view_canvas.create_line(tool_x, oy + (winding.Y_REFERENCE - arm) * scale, tool_x, eye_y, width=3, fill=VP["eye_line"])
             # Eye footprint: drawn to scale so its physical width along X (the
             # dimension the safety clearance now accounts for) is visible, especially
             # near the tank ends where a zero-width marker would be misleading.
