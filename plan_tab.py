@@ -27,7 +27,8 @@ LAYUP_FIELDS = [
     ("Winding Angle (Degrees)", "wind_angle"),
     ("Turnaround / Dwell Angle (Deg)", "turnaround_angle"),
 ]
-FIELD_LABELS = {key: label for label, key in MACHINE_FIELDS + TANK_FIELDS + WINDING_FIELDS + LAYUP_FIELDS}
+START_X_FIELD = ("Start Wind at X (mm)", "start_x")
+FIELD_LABELS = {key: label for label, key in MACHINE_FIELDS + [START_X_FIELD] + TANK_FIELDS + WINDING_FIELDS + LAYUP_FIELDS}
 
 LEGEND_FONT = ("TkDefaultFont", 8)
 LEGEND_FONT_ACTIVE = ("TkDefaultFont", 8, "bold")
@@ -37,6 +38,105 @@ SWATCH_W, SWATCH_H = 24, 12
 def _format_hms(seconds):
     h, m = divmod(int(seconds), 3600); m, s = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _set_if_changed(var, value):
+    # Setting a watched variable triggers a redraw; skip it when nothing changes.
+    try:
+        current = var.get()
+    except tk.TclError:
+        current = None
+    if current != value:
+        var.set(value)
+
+
+class AutoEntry:
+    """An entry field whose value the app computes -- "auto": grey text with an
+    AUTO tag inside the field -- until the user types a value of their own --
+    "custom": normal text, never changed by the app again. Clearing the field
+    and leaving it (or pressing Enter) puts it back on auto.
+
+    `auto_var` returns the BooleanVar holding the field's mode (a callable, as
+    for per-layup fields it changes with the selected layup). `on_mode_change`
+    is called with the new mode when the user leaves the field in a different
+    mode than they entered it."""
+
+    def __init__(self, tab, entry, auto_var, on_mode_change):
+        self.tab, self.entry = tab, entry
+        self._auto_var = auto_var
+        self._on_mode_change = on_mode_change
+        self._mode_at_focus = None      # mode when the field gained focus
+        self._fill_while_focused = False  # one-shot: allow a refill although focused
+        # Key validation fires only for the user's own typing/pasting -- never
+        # for the app setting the variable -- which is exactly the line between
+        # "custom" and "auto". It never rejects anything.
+        entry.configure(validate="key", validatecommand=(entry.register(self._typed), "%P"))
+        entry.bind("<FocusIn>", self._focus_in, add="+")
+        entry.bind("<FocusOut>", self._focus_out, add="+")
+        entry.bind("<Return>", self._focus_out, add="+")
+        self.tag = tk.Label(entry, text="AUTO", font=("TkDefaultFont", 7, "bold"), bd=0, padx=0, pady=0, cursor="xterm")
+        # The tag sits on top of the field, so a click on it has to reach the field.
+        self.tag.bind("<Button-1>", lambda e: (entry.focus_set(), "break")[1])
+
+    @property
+    def auto(self):
+        return bool(self._auto_var().get())
+
+    def has_focus(self):
+        try:
+            return self.tab.app.root.focus_get() is self.entry
+        except KeyError:  # focus is in a Tk-internal widget (e.g. a combobox popdown)
+            return False
+
+    def editing(self):
+        """True while the user is in the field, so the app mustn't overwrite it
+        -- except once, right after they leave it or press Enter."""
+        editing = self.has_focus() and not self._fill_while_focused
+        self._fill_while_focused = False
+        return editing
+
+    def rebind(self):
+        # The field now edits another layup's value (switched while in it).
+        if self.has_focus():
+            self._mode_at_focus = self.auto
+
+    def refresh(self):
+        # Grey text and the AUTO tag while auto; the theme's normal text when
+        # custom. A disabled field shows neither: its own greyed look says it all.
+        if self.auto and not self.entry.instate(["disabled"]):
+            color = self.tab.app.canvas_palette["auto_text"]
+            self.entry.configure(foreground=color)
+            self.tag.configure(fg=color, bg=self.tab.app.root.style.colors.inputbg)
+            self.tag.place(relx=1.0, rely=0.5, x=-7, anchor="e")
+        else:
+            self.entry.configure(foreground="")
+            self.tag.place_forget()
+
+    def _typed(self, new_text):
+        # An emptied field counts as auto straight away (the preview follows at
+        # once); it's refilled with the computed value when the user leaves it.
+        auto = new_text.strip() == ""
+        auto_var = self._auto_var()
+        if bool(auto_var.get()) != auto:
+            auto_var.set(auto)
+            self.refresh()
+        return True
+
+    def _focus_in(self, event=None):
+        self._mode_at_focus = self.auto
+        if self._mode_at_focus:
+            # Select the computed value, so typing replaces it rather than
+            # appending to it. Deferred until the click has placed the cursor.
+            self.tab.app.root.after_idle(lambda: self.has_focus() and self.entry.select_range(0, tk.END))
+
+    def _focus_out(self, event=None):
+        auto = self.auto
+        if auto:
+            self._fill_while_focused = True  # also on Enter, where focus stays put
+            self.tab._redraw_now()
+        if self._mode_at_focus is not None and self._mode_at_focus != auto:
+            self._on_mode_change(auto)
+        self._mode_at_focus = auto if self.has_focus() else None
 
 
 class PlanTab:
@@ -120,7 +220,7 @@ class PlanTab:
         LBL, ENT, CMB, FRM = "Settings.TLabel", "Settings.TEntry", "Settings.TCombobox", "Settings.TLabelframe"
         # Section padding (horizontal, vertical) and the gap below each section,
         # kept tight so the whole panel fits a maximized window without scrolling.
-        FRAME_PAD, FRAME_GAP = (8, 5), (0, 6)
+        FRAME_PAD, FRAME_GAP = (8, 4), (0, 6)
 
         def add_fields(frame, fields, first_row=0, store=None):
             for i, (label_text, key) in enumerate(fields):
@@ -141,7 +241,16 @@ class PlanTab:
         # Settings -- just the compact Settings font, no color/Toolbutton style.
         ttk.Checkbutton(machine_frame, text="Home Axes (G28) Before Winding",
                         variable=self.app.params["home_before_wind"],
-                        style="Settings.TCheckbutton").grid(row=len(MACHINE_FIELDS), column=0, columnspan=2, sticky="w", pady=(8, 0))
+                        style="Settings.TCheckbutton").grid(row=len(MACHINE_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 2))
+        # Depends on the checkbox above (indented under it, disabled without
+        # homing): where the wind starts after homing. Auto: where the dome ends.
+        row = len(MACHINE_FIELDS) + 1
+        self._start_x_label = ttk.Label(machine_frame, text=START_X_FIELD[0], style=LBL)
+        self._start_x_label.grid(row=row, column=0, sticky="w", pady=1, padx=(22, 10))
+        self._start_x_entry = ttk.Entry(machine_frame, textvariable=self.app.params["start_x"], width=12, style=ENT)
+        self._start_x_entry.grid(row=row, column=1, sticky="e", pady=1)
+        self._start_x_field = AutoEntry(self, self._start_x_entry, lambda: self.app.params["start_x_auto"],
+                                        self._start_x_mode_changed)
 
         # 2. Tank Settings
         tank_frame = ttk.LabelFrame(left_panel, text="Tank Settings", padding=FRAME_PAD, style=FRM)
@@ -167,7 +276,7 @@ class PlanTab:
         self._optimize_check = ttk.Checkbutton(winding_frame, text="Optimize Trajectory (experimental)",
                                                variable=self.app.params["optimize_trajectory"],
                                                style="Settings.TCheckbutton")
-        self._optimize_check.grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._optimize_check.grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # 4. Layups -- the switchable per-layup settings. The section's title is
         # itself the switcher: [swatch] Layup 2 of 3 [<] [>] [-] [+], where the
@@ -200,7 +309,9 @@ class PlanTab:
         # value worth fighting).
         self.layup_entries["wind_angle"].bind("<FocusOut>", self._validate_wind_angle)
         self.layup_entries["wind_angle"].bind("<Return>", self._validate_wind_angle)
-        self._setup_cycles_field(self.layup_entries["passes"])
+        self._cycles_field = AutoEntry(self, self.layup_entries["passes"],
+                                       lambda: self.app.layups[self.app.active_layup]["auto_cycles"],
+                                       self._cycles_mode_changed)
 
         # Side by side, equal widths: the primary action filled, the secondary
         # one outlined in the same color.
@@ -354,103 +465,52 @@ class PlanTab:
         val = self._xspeed_mm_s if unit == "mm/s" else self._xspeed_mm_s / 1000.0
         self.est["xspeed"].set(f"{val:.2f} {unit}")
 
-    # --- Number of Cycles: auto (full coverage) or custom ---
-    # Auto: the app keeps the field at the cycles needed for 100 % coverage (see
-    # winding.WindingJob), shown in grey with an "AUTO" tag inside the field.
-    # Typing a number makes it custom: normal text, no tag, never touched again.
-    # Clearing the field and leaving it (or pressing Enter) puts it back on auto.
+    # --- Auto/custom fields: Number of Cycles and Start Wind at X ---
 
-    def _setup_cycles_field(self, entry):
-        # Key validation fires only for the user's own typing/pasting -- never
-        # for the app setting the variable -- which is exactly the line between
-        # "custom" and "auto" here. It never rejects anything.
-        entry.configure(validate="key", validatecommand=(entry.register(self._on_cycles_typed), "%P"))
-        entry.bind("<FocusIn>", self._on_cycles_focus_in, add="+")
-        entry.bind("<FocusOut>", self._on_cycles_focus_out, add="+")
-        entry.bind("<Return>", self._on_cycles_focus_out, add="+")
-        self._cycles_tag = tk.Label(entry, text="AUTO", font=("TkDefaultFont", 7, "bold"), bd=0, padx=0, pady=0,
-                                    cursor="xterm")
-        # The tag sits on top of the field, so a click on it has to reach the field.
-        self._cycles_tag.bind("<Button-1>", lambda e: (entry.focus_set(), "break")[1])
-        self._cycles_mode_at_focus = None  # auto flag when the field gained focus
-        self._fill_focused_cycles = False  # one-shot: refill the field even though it has focus
-
-    def _active_cycles_auto(self):
-        return bool(self.app.layups[self.app.active_layup]["auto_cycles"].get())
-
-    def _cycles_field_has_focus(self):
-        try:
-            return self.app.root.focus_get() is self.layup_entries["passes"]
-        except KeyError:  # focus is in a Tk-internal widget (e.g. a combobox popdown)
-            return False
-
-    def _on_cycles_typed(self, new_text):
-        # An emptied field counts as auto straight away (the preview follows at
-        # once); it's refilled with the computed value when the user leaves it.
-        auto = new_text.strip() == ""
-        auto_var = self.app.layups[self.app.active_layup]["auto_cycles"]
-        if bool(auto_var.get()) != auto:
-            auto_var.set(auto)
-            self._update_cycles_field()
-        return True
-
-    def _on_cycles_focus_in(self, event=None):
-        self._cycles_mode_at_focus = self._active_cycles_auto()
-        if self._cycles_mode_at_focus:
-            # Select the computed value, so typing replaces it rather than
-            # appending to it. Deferred until the click has placed the cursor.
-            entry = self.layup_entries["passes"]
-            self.app.root.after_idle(lambda: self._cycles_field_has_focus() and entry.select_range(0, tk.END))
-
-    def _on_cycles_focus_out(self, event=None):
-        auto = self._active_cycles_auto()
+    def _cycles_mode_changed(self, auto):
+        n = len(self.app.layups)
+        prefix = f"Layup {self.app.active_layup + 1}: " if n > 1 else ""
+        value = self.layup_entries["passes"].get().strip()
         if auto:
-            self._fill_focused_cycles = True  # also on Enter, where focus stays put
-            if self.redraw_timer:
-                self.app.root.after_cancel(self.redraw_timer)
-            self.draw_visualization()
-        if self._cycles_mode_at_focus is not None and self._cycles_mode_at_focus != auto:
-            n = len(self.app.layups)
-            prefix = f"Layup {self.app.active_layup + 1}: " if n > 1 else ""
-            value = self.layup_entries["passes"].get().strip()
-            if auto:
-                self.app.set_status(f"{prefix}Number of Cycles is back on auto -- {value} cycles for full coverage.")
-            else:
-                self.app.set_status(f"{prefix}Number of Cycles set to {value} and fixed there. "
-                                    "Clear the field to put it back on auto (full coverage).")
-        self._cycles_mode_at_focus = auto if self._cycles_field_has_focus() else None
+            self.app.set_status(f"{prefix}Number of Cycles is back on auto -- {value} cycles for full coverage.")
+        else:
+            self.app.set_status(f"{prefix}Number of Cycles set to {value} and fixed there. "
+                                "Clear the field to put it back on auto (full coverage).")
 
-    def _sync_auto_cycles(self, job):
-        # Writes each auto layup's computed cycle count into its field (for the
-        # layups not on screen too, so switching shows the right number at once).
-        # The field the user is currently editing is left alone until they leave
-        # it, so a cleared field isn't refilled under their cursor.
-        editing = self._cycles_field_has_focus() and not self._fill_focused_cycles
-        self._fill_focused_cycles = False
+    def _start_x_mode_changed(self, auto):
+        value = self._start_x_entry.get().strip()
+        if auto:
+            self.app.set_status(f"Start Wind at X is back on auto -- {value} mm, where the dome ends and the tank turns straight.")
+        else:
+            self.app.set_status(f"Start Wind at X set to {value} mm and fixed there. "
+                                "Clear the field to put it back on auto (where the dome ends).")
+
+    def _sync_auto_values(self, job):
+        # Writes each auto setting's computed value into its field -- for the
+        # layups not on screen too, so switching shows the right number at once.
+        # A field the user is typing in is left alone until they leave it, so a
+        # cleared field isn't refilled under their cursor.
+        editing = self._cycles_field.editing()
         for i, (layup_vars, layup) in enumerate(zip(self.app.layups, job.layups)):
             if not layup.auto_cycles or (editing and i == self.app.active_layup):
                 continue
             if winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number) is None:
                 continue  # not computable right now; geometry_errors() explains why
-            var = layup_vars["passes"]
-            try:
-                current = var.get()
-            except tk.TclError:
-                current = None
-            if current != layup.passes:
-                var.set(layup.passes)
-        self._update_cycles_field()
+            _set_if_changed(layup_vars["passes"], layup.passes)
+        if job.start_x_auto and not self._start_x_field.editing():
+            _set_if_changed(self.app.params["start_x"], round(job.start_x, 1))
+        # Start Wind at X only applies when homing first.
+        state = ["!disabled"] if job.home_before_wind else ["disabled"]
+        self._start_x_entry.state(state)
+        self._start_x_label.state(state)
+        self._cycles_field.refresh()
+        self._start_x_field.refresh()
 
-    def _update_cycles_field(self):
-        entry, tag = self.layup_entries["passes"], self._cycles_tag
-        if self._active_cycles_auto():
-            color = self.app.canvas_palette["auto_text"]
-            entry.configure(foreground=color)
-            tag.configure(fg=color, bg=self.app.root.style.colors.inputbg)
-            tag.place(relx=1.0, rely=0.5, x=-7, anchor="e")
-        else:
-            entry.configure(foreground="")  # back to the theme's normal text color
-            tag.place_forget()
+    def _redraw_now(self):
+        if self.redraw_timer:
+            self.app.root.after_cancel(self.redraw_timer)
+            self.redraw_timer = None
+        self.draw_visualization()
 
     # --- Layup switching ---
 
@@ -468,10 +528,8 @@ class PlanTab:
         self._next_btn.configure(state="normal" if i < n - 1 else "disabled")
         self._remove_btn.configure(state="normal" if n > 1 else "disabled")
         self._draw_layup_swatch()
-        self._update_cycles_field()
-        if self._cycles_field_has_focus():
-            # Switched layups while in the field: it now edits another layup.
-            self._cycles_mode_at_focus = self._active_cycles_auto()
+        self._cycles_field.refresh()
+        self._cycles_field.rebind()
         # Redraw right away rather than debounced: nothing here is slow (a
         # switch that doesn't change any setting redraws from the cached
         # simulation), and an instant response is what makes switching feel snappy.
@@ -504,6 +562,7 @@ class PlanTab:
     def _on_show_all_toggled(self):
         self._draw_legend()
         self._draw_caption()
+        self._draw_start_marker()
         self._redraw_strands()
 
     def describe_settings_error(self, error):
@@ -577,11 +636,12 @@ class PlanTab:
                 self.canvas.create_text(c_w / 2, c_h / 2, text=self.describe_settings_error(e),
                                         fill=pal["muted"], font=("TkDefaultFont", 10))
             self._draw_legend()
-            self._update_cycles_field()
+            self._cycles_field.refresh()
+            self._start_x_field.refresh()
             self._update_indicator()
             return
         self._job = job
-        self._sync_auto_cycles(job)
+        self._sync_auto_values(job)
         layup = job.layups[self.app.active_layup]
         self._update_instant_estimates(job, layup)
         self._optimize_check.state(["disabled"] if job.turnaround_zone > 0 else ["!disabled"])
@@ -593,6 +653,7 @@ class PlanTab:
         if c_w >= 100 and c_h >= 100 and job.tank_length > 0 and job.tank_diameter > 0:
             self._draw_tank(job, c_w, c_h)
             self._draw_end_view(job.tank_diameter / 2, job.eye_arm_length)
+            self._draw_start_marker()
         self._draw_warnings(errors, c_w)
         self._draw_caption()
         self._draw_legend()
@@ -638,6 +699,32 @@ class PlanTab:
             tank_bottom.append((ox - (co + x) * scale, oy + r * scale))
         self.canvas.create_polygon(tank_top + tank_bottom[::-1], fill=pal["tank"], outline=pal["tank_outline"], width=2)
         self._draw_cylinder_shading(tank_top, tank_bottom)
+
+    def _draw_start_marker(self):
+        # Where the wind starts -- Start Wind at X, or the tank's end without
+        # homing -- shown with the first layup only, whose first pass begins
+        # there. A dashed line across the tank on a halo (so it reads over any
+        # strand color), a pointer, and a label; the arrow shows the winding
+        # direction: +X runs to the left in this view.
+        self.canvas.delete("start_marker")
+        job = self._job
+        if job is None or not self._view_geom or not (self.app.active_layup == 0 or self.show_all_var.get()):
+            return
+        pal = self.app.canvas_palette
+        scale, ox, oy = self._view_geom
+        x = job.wind_start_x
+        r = winding.calc_R(x - job.chuck_offset, 0, job.tank_length, job.tank_diameter / 2, job.end_cap_diameter / 2,
+                           job.dome_length, job.end_cap_type)
+        px, top, bottom = ox - x * scale, oy - r * scale - 8, oy + r * scale + 8
+        tag = "start_marker"
+        self.canvas.create_line(px, top, px, bottom, fill=pal["marker_halo"], width=4, tags=tag)
+        self.canvas.create_line(px, top, px, bottom, fill=pal["marker"], width=2, dash=(6, 3), tags=tag)
+        self.canvas.create_polygon(px - 5, top - 8, px + 5, top - 8, px, top - 1, fill=pal["marker"], outline="", tags=tag)
+        label = self.canvas.create_text(px, top - 12, text=f"Wind start  X {x:.1f}", anchor="s", fill=pal["marker"],
+                                        font=("TkDefaultFont", 9, "bold"), tags=tag)
+        x0, y0, x1, y1 = self.canvas.bbox(label)
+        self.canvas.create_line(x0 - 6, (y0 + y1) / 2, x0 - 30, (y0 + y1) / 2, fill=pal["marker"], width=2,
+                                arrow=tk.LAST, arrowshape=(7, 8, 3), tags=tag)
 
     def _draw_warnings(self, errors, c_w):
         # Stacked top-center, each wrapped to the canvas width, measured from the
@@ -864,7 +951,9 @@ class PlanTab:
                     if len(poly) >= 2:
                         self.canvas.create_line(*[c for p in poly for c in p], **style)
         # Strand paths draw on top of everything else drawn synchronously (tank,
-        # warnings); keep the caption and calc indicator above that in turn.
+        # warnings); keep the start marker, caption and calc indicator above
+        # that in turn.
+        self.canvas.tag_raise("start_marker")
         self.canvas.tag_raise("caption")
         self.canvas.tag_raise("calc_indicator")
 

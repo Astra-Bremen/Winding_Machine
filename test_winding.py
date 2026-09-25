@@ -83,12 +83,11 @@ class GoldenMaster(unittest.TestCase):
     """Pins the exact G-code body (everything after the settings header) so an
     unintended change to the motion shows up. Regenerate these deliberately,
     and only together with a change that is meant to alter the output. (Last
-    regenerated for Max Move Time -- long moves split into pieces, feed rates
-    computed from the written coordinates -- together with the 80 mm default
-    turnaround zone. MoveSplitting checks the split path matches the unsplit
-    one exactly.)"""
+    regenerated for the wind start: with homing, the program now moves to
+    Start Wind at X -- by default where the dome ends -- and pauses there, and
+    the first pass starts from it. WindStart checks the pattern is unchanged.)"""
     CASES = {
-        "default": (WindingJob(), 12027, "c1acfaf70ee652ebc961de2a503eba74cd77b69f9e61388e3fa95b0f057babf6"),
+        "default": (WindingJob(), 12018, "acd2c9e7a1f820065a678423382bc51a62ef071f792a1aab23a5ac551257ada2"),
         "flat_p1_optimized_nohome": (
             WindingJob(end_cap_type="Flat", optimize_trajectory=True, home_before_wind=False,
                        layups=(Layup(passes=4, pattern_number=1, wind_angle=60.0, turnaround_angle=180.0),)),
@@ -96,17 +95,17 @@ class GoldenMaster(unittest.TestCase):
         "round_p5_steep_optimized": (
             WindingJob(bandwidth=8.0, optimize_trajectory=True,
                        layups=(Layup(passes=2, pattern_number=5, wind_angle=70.0, turnaround_angle=90.0),)),
-            4009, "64d9b49c8105e649cf47b983ccd5ba3758cfe11d7351c28356f766729f48443e"),
+            4000, "6c725086fb2d1fdc4ab4ea0d1f69c4ca089c9b624b188824abefc2f72a2ede48"),
         "round_small_dwell": (
             WindingJob(tank_length=640.0, tank_diameter=160.0, end_cap_diameter=40.0, eye_width=35.0,
                        min_spacing=6.0, max_surface_speed=150.0,
                        layups=(Layup(passes=3, pattern_number=2, wind_angle=30.0, turnaround_angle=10.0),)),
-            1548, "a1800981765c617ae90251bb83426157f3d21126b0d910c7e163c69fd0812716"),
+            1543, "82a8cf44e24e320b9fc981ef91dcf47bdb065f20509e6116702cf864f59bb47d"),
         "excel_style_zone": (
             WindingJob(tank_length=1640.0, tank_diameter=250.0, bandwidth=7.0, turnaround_zone=80.0,
                        layups=(Layup(passes=3, pattern_number=5, wind_angle=12.0, turnaround_angle=156.0),
                                Layup(passes=2, pattern_number=7, wind_angle=54.0, turnaround_angle=72.0))),
-            19039, "23fc31bb578f656b8e77c6756f06059320b09f369c83be8a94966bae7f5ee3cc"),
+            19025, "cf8ebda65d10ed5747601ba7aa4ca17bee50ebdb271c363938c587f01dc9919b"),
     }
 
     def test_output_unchanged(self):
@@ -239,18 +238,19 @@ class AutoCycles(unittest.TestCase):
 
 def gcode_moves(lines):
     """(dx, dy, da, feed) of every G1 exactly as the machine runs it, from the
-    written coordinates: A is tracked across the per-cycle "G92 A0" resets."""
-    moves, pos = [], None
+    written coordinates, starting at the machine origin (where G28 leaves it):
+    axes a G1 doesn't name keep their position, and A is tracked across the
+    "G92 A0" resets."""
+    moves, pos = [], [0.0, 0.0, 0.0]
     for ln in lines:
         if ln.startswith("G92"):
-            if pos: pos = (pos[0], pos[1], 0.0)
+            pos[2] = 0.0
             continue
         if not ln.startswith("G1"):
             continue
-        w = {tok[0]: float(tok[1:]) for tok in ln.split()[1:]}
-        new = (w["X"], w["Y"], w["A"])
-        if pos is not None:
-            moves.append((new[0] - pos[0], new[1] - pos[1], new[2] - pos[2], w["F"]))
+        w = {tok[0]: float(tok[1:]) for tok in ln.split(";")[0].split()[1:]}
+        new = [w.get("X", pos[0]), w.get("Y", pos[1]), w.get("A", pos[2])]
+        moves.append((new[0] - pos[0], new[1] - pos[1], new[2] - pos[2], w["F"]))
         pos = new
     return moves
 
@@ -324,6 +324,63 @@ class MaxRotationSpeed(unittest.TestCase):
     def test_rotation_limit_too_low_to_write(self):
         self.assertIn("Max Rotation Speed is too low for this tank diameter.",
                       winding.geometry_errors(WindingJob(max_surface_speed=0.001)))
+
+
+class WindStart(unittest.TestCase):
+    def test_auto_start_is_where_the_dome_ends(self):
+        job = WindingJob()
+        self.assertAlmostEqual(job.wind_start_x, job.chuck_offset + job.dome_length)
+        first = next(ev for ev in winding.iter_program(job) if type(ev) is Move)
+        self.assertGreater(first.x, job.wind_start_x)  # winds on toward +X from there
+        flat = WindingJob(end_cap_type="Flat")
+        self.assertEqual(flat.wind_start_x, flat.chuck_offset)  # no dome: straight from the end
+
+    def test_custom_start_and_no_homing(self):
+        self.assertEqual(WindingJob(start_x_auto=False, start_x=300.0).wind_start_x, 300.0)
+        # Without homing the start setting doesn't apply: the wind starts at the tank's end.
+        self.assertEqual(WindingJob(home_before_wind=False, start_x_auto=False, start_x=300.0).wind_start_x, 50.0)
+
+    def test_start_is_validated_only_when_homing(self):
+        message = "Start Wind at X must be between"
+        self.assertTrue(any(message in e for e in winding.geometry_errors(WindingJob(start_x_auto=False, start_x=10.0))))
+        self.assertTrue(any(message in e for e in winding.geometry_errors(WindingJob(start_x_auto=False, start_x=1000.0))))
+        self.assertFalse(winding.geometry_errors(WindingJob(home_before_wind=False, start_x_auto=False, start_x=10.0)))
+
+    def test_later_start_keeps_the_pattern(self):
+        # Starting part-way only shifts the whole program by a constant angle:
+        # every layup still tiles the tank exactly.
+        job = WindingJob(start_x_auto=False, start_x=400.0, layups=MULTI.layups)
+        fwd, ret = crossings(job)
+        for li, layup in enumerate(job.layups):
+            n = layup.passes * layup.pattern_number
+            assert_perfect_grid(self, [a for k, a in fwd.items() if k[0] == li], n)
+            assert_perfect_grid(self, [a for k, a in ret.items() if k[0] == li], n)
+
+    def test_move_to_start_then_pause(self):
+        # G28, pull the eye back, travel along X, move in at the start, PAUSE,
+        # zero A (the mandrel may be turned by hand), then wind.
+        job = WindingJob()
+        lines = [ln for ln in gcode(job)[gcode(job).index("; -----------------------") + 1:] if ln]
+        pause = lines.index("PAUSE")
+        setup = [ln for ln in lines[:pause] if ln.startswith("G1")]
+        self.assertEqual(lines[0], "G28")
+        self.assertTrue(setup[0].startswith("G1 Y0.000 "))
+        x_moves = [ln for ln in setup if " X" in ln]
+        y_moves = [ln for ln in setup[1:] if " Y" in ln]
+        self.assertTrue(all(" Y" not in ln for ln in x_moves))  # X travel only while pulled back
+        self.assertLess(setup.index(x_moves[-1]), setup.index(y_moves[0]))  # moves in only after arriving
+        x, y = winding.start_position(job)
+        self.assertAlmostEqual(float(x_moves[-1].split()[1][1:]), x, places=3)
+        self.assertAlmostEqual(float(y_moves[-1].split()[1][1:]), y, places=3)
+        self.assertEqual(lines[pause + 1], "G92 A0")
+        self.assertFalse(any(ln == "PAUSE" for ln in gcode(WindingJob(home_before_wind=False))))
+
+    def test_old_files_restore_their_start(self):
+        # Files from before the setting existed started at the tank's end.
+        settings = {"chuck_offset": "75.0"}
+        value = winding.LEGACY_VALUES["start_x"]
+        self.assertEqual(value(settings) if callable(value) else value, 75.0)
+        self.assertIs(winding.LEGACY_VALUES["start_x_auto"], False)
 
 
 class TurnaroundZone(unittest.TestCase):
@@ -401,7 +458,9 @@ class MultiLayupProgram(unittest.TestCase):
         lines = gcode(MULTI)
         self.assertEqual([ln for ln in lines if ln.startswith("; LAYUP_START")],
                          ["; LAYUP_START:1", "; LAYUP_START:2", "; LAYUP_START:3"])
-        self.assertEqual(sum(ln == "G92 A0" for ln in lines), MULTI.total_cycles)
+        # One reset per cycle within the wind (plus the one zeroing A at resume).
+        wind = lines[lines.index("; LAYUP_START:1"):]
+        self.assertEqual(sum(ln == "G92 A0" for ln in wind), MULTI.total_cycles)
         self.assertEqual(lines[-2:], [f"; CYCLE_COMPLETE:{MULTI.total_cycles}", "G92 A0"])
         # A is reset after every cycle, so written values stay near one cycle's worth
         # of rotation rather than growing with the whole program.

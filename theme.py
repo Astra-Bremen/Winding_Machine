@@ -43,6 +43,10 @@ PALETTES = {
         "warn_text": "#cc6041",
         "muted": "#8a9490",
         "auto_text": "#a2aaa7",  # an entry field's value while the app sets it (vs. #5a5a5a typed)
+        # Machine-position markers drawn over the tank and strands (the wind
+        # start): ink-dark on a light halo, so they read on any strand color.
+        "marker": "#1f2d2a",
+        "marker_halo": "#ffffff",
     },
     "dark": {
         "canvas_bg": "#22282a",
@@ -57,6 +61,8 @@ PALETTES = {
         "warn_text": "#e2836a",
         "muted": "#7a8486",
         "auto_text": "#7f8a8c",
+        "marker": "#eef3f1",
+        "marker_halo": "#22282a",
     },
 }
 

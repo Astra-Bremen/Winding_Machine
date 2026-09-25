@@ -217,23 +217,21 @@ class CFRPWinderApp:
     def build_job(self):
         """An immutable snapshot of every current setting. Raises SettingsError
         if an entry field doesn't hold a valid number right now."""
-        values = {}
-        for key, var in self.params.items():
-            try: values[key] = var.get()
-            except tk.TclError: raise winding.SettingsError(key) from None
-        layups = []
-        for index, layup_vars in enumerate(self.layups):
-            auto_cycles = bool(layup_vars["auto_cycles"].get())
-            layup_values = {}
-            for key, var in layup_vars.items():
-                try: layup_values[key] = var.get()
+        def read(variables, layup_index=None):
+            values = {}
+            for key, var in variables.items():
+                try:
+                    values[key] = var.get()
                 except tk.TclError:
-                    # An auto-cycle layup's field may be empty (e.g. just cleared
-                    # to return it to auto); the WindingJob computes the value.
-                    if key == "passes" and auto_cycles: layup_values[key] = 1
-                    else: raise winding.SettingsError(key, index) from None
-            layups.append(winding.Layup(**layup_values))
-        return winding.WindingJob(**values, layups=tuple(layups))
+                    # An auto setting's field may be empty (e.g. just cleared to
+                    # return it to auto); the WindingJob computes the value.
+                    flag = winding.AUTO_FLAGS.get(key)
+                    if flag and bool(variables[flag].get()): values[key] = 1
+                    else: raise winding.SettingsError(key, layup_index) from None
+            return values
+
+        layups = tuple(winding.Layup(**read(layup_vars, index)) for index, layup_vars in enumerate(self.layups))
+        return winding.WindingJob(**read(self.params), layups=layups)
 
     # --- G-code generation ---
 

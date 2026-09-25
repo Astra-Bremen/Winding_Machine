@@ -66,6 +66,12 @@ class WindingJob:
     a job doubles as the cache key for the preview's background simulation."""
     chuck_offset: float = 50.0
     home_before_wind: bool = True
+    # Where the wind starts (machine X, mm) when homing first: the machine moves
+    # the eye there after G28 and pauses so the fiber can be attached, then
+    # winds toward +X from there. Auto: where the chuck-side dome ends and the
+    # tank turns straight. Without homing the wind starts at the tank's end.
+    start_x: float = 0.0
+    start_x_auto: bool = True
     eye_arm_length: float = 370.0
     eye_width: float = 20.0
     min_spacing: float = 10.0
@@ -92,6 +98,24 @@ class WindingJob:
         # this job's own tank and tow -- so every consumer (motion, estimates,
         # settings header, cache key) sees the same, never-stale number.
         object.__setattr__(self, "layups", tuple(self._resolve_cycles(layup) for layup in self.layups))
+        # Same for an auto start position.
+        if self.start_x_auto:
+            object.__setattr__(self, "start_x", self.chuck_offset + self.dome_length)
+
+    @property
+    def wind_start_x(self):
+        """Machine X where the wind begins: the Start Wind at X setting after
+        homing, otherwise the tank's chuck-side end (the machine then can't be
+        assumed to know where anything else is)."""
+        return self.start_x if self.home_before_wind else self.chuck_offset
+
+    @property
+    def start_x_range(self):
+        # From the tank's chuck-side end up to where the first pass still has
+        # room for the far end's full turnaround zone (or Optimize Trajectory's
+        # easing) before it turns around.
+        x_end = self.chuck_offset + self.tank_length
+        return self.chuck_offset, x_end - STEP_SIZE * max(self.turnaround_zone_steps, 3)
 
     def _resolve_cycles(self, layup):
         if not layup.auto_cycles:
@@ -134,11 +158,21 @@ def _traversal_step_count(length):
 GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
 LAYUP_KEYS = tuple(f.name for f in fields(Layup))
 
+# Settings the WindingJob can compute itself: value key -> the flag that, while
+# set, makes it do so (the value given is then ignored).
+AUTO_FLAGS = {"passes": "auto_cycles", "start_x": "start_x_auto"}
+
 # How files written before a setting existed were actually wound, where that
 # differs from the setting's current default: restoring such a file uses these
-# values, so it regenerates the motion it was made with. (Max Move Time needs
-# no entry: splitting moves never changes the path.)
-LEGACY_VALUES = {"turnaround_zone": 0.0}
+# values (or calls them with the file's settings header), so it regenerates
+# the motion it was made with. (Max Move Time needs no entry: splitting moves
+# never changes the path.)
+LEGACY_VALUES = {
+    "turnaround_zone": 0.0,
+    # Those winds started at the tank's chuck-side end.
+    "start_x_auto": False,
+    "start_x": lambda settings: float(settings["chuck_offset"]),
+}
 
 
 class SettingsError(ValueError):
@@ -172,6 +206,11 @@ def geometry_errors(job):
         errors.append("Max Rotation Speed is too low for this tank diameter.")
     if job.max_move_time < MIN_MOVE_TIME:
         errors.append(f"Max Move Time must be at least {MIN_MOVE_TIME:g} s.")
+    if job.home_before_wind and job.tank_length > 0:
+        lo, hi = job.start_x_range
+        if not lo - 1e-9 <= job.start_x <= hi + 1e-9:
+            errors.append(f"Start Wind at X must be between {lo:.1f} and {hi:.1f} mm "
+                          "(on the tank, clear of the far end's turnaround).")
     if job.turnaround_zone < 0:
         errors.append("Turnaround Zone can't be negative.")
     elif job.tank_length > 0 and 2 * job.turnaround_zone_steps > _traversal_step_count(job.tank_length):
@@ -609,8 +648,8 @@ def _eye_y_function(job, geom):
 
 def start_position(job):
     """(x, y) of the carriage before the first traversal."""
-    geom = _tank_geometry(job)
-    return geom.x_start, _eye_y_function(job, geom)(geom.x_start)
+    x = job.wind_start_x
+    return x, _eye_y_function(job, _tank_geometry(job))(x)
 
 
 def iter_program(job):
@@ -650,7 +689,13 @@ def iter_program(job):
             yield Move(qx, qy, qa, feed, piece_duration, tow, qr, layup_index, circuit, dwell)
             px, py, pa = qx, qy, qa
 
-    x, a = x_start, 0.0
+    # The wind starts at wind_start_x, so its very first pass runs from there
+    # (not from the tank's end) toward +X. Every circuit still turns the mandrel
+    # by exactly the same amount, so this only shifts the whole program by a
+    # constant angle: the pattern is untouched, and the part skipped (the
+    # first pass over the chuck-side dome) is one band where every band
+    # overlaps anyway.
+    x, a = job.wind_start_x, 0.0
     y = eye_y(x)
     cycle_number = 0
     pending_head_blend = []  # blend carried from the previous dwell into this traversal's first steps
@@ -728,7 +773,7 @@ def simulate(job):
     geom = _tank_geometry(job)
     results = [LayupResult(strand_runs=[[] for _ in range(l.pattern_number)]) for l in job.layups]
     total_time, total_tow = 0.0, 0.0
-    x_prev, a_prev = geom.x_start, 0.0
+    x_prev, a_prev = job.wind_start_x, 0.0
     r_prev = geom.radius(x_prev)
     # The run being recorded, and the (layup, circuit, X direction) it belongs
     # to. A run ends at a pure-rotation dwell, or -- with a turnaround zone,
@@ -842,6 +887,38 @@ def _rotation_limited_feed(dx, dy, da, max_a_speed):
     return max(1, math.floor(max_a_speed * length / da))
 
 
+def _split_travel(start, end, max_distance):
+    # Evenly spaced stops from `start` to `end`, none further apart than
+    # max_distance (the last one is `end` itself).
+    n = max(1, math.ceil(abs(end - start) / max_distance - 1e-9))
+    return [start + (end - start) * k / n for k in range(1, n + 1)]
+
+
+def _write_move_to_start(out, job, x, y):
+    # After homing, bring the eye to the wind's start without crossing the
+    # tank: pull it fully back first (Y0 is the far end of its travel, away
+    # from the tank; G28 normally leaves it there already), travel along X,
+    # and only then move in to winding distance at the start. Then PAUSE, so
+    # the fiber can be attached there before winding begins; the wind resumes
+    # from the machine. Assumes G28 leaves the carriage at X0 Y0, the app's
+    # machine origin. Travel runs at Max Rotation Speed's rate along the move,
+    # split like every other move so none takes longer than Max Move Time.
+    feed = int(job.max_a_speed)
+    max_distance = feed / 60.0 * job.max_move_time
+    out.write("; --- MOVE TO WIND START ---\n")
+    out.write(f"G1 Y{0.0:.3f} F{feed}\n")
+    for xi in _split_travel(0.0, x, max_distance):
+        out.write(f"G1 X{xi:.3f} F{feed}\n")
+    for yi in _split_travel(0.0, y, max_distance):
+        out.write(f"G1 Y{yi:.3f} F{feed}\n")
+    out.write("; Attach the fiber here, then resume on the machine to start winding\n")
+    out.write("PAUSE\n")
+    # The mandrel may have been turned by hand while attaching the fiber: its
+    # angle at resume becomes the wind's zero (the pattern is relative anyway),
+    # so the first move doesn't turn it back.
+    out.write("G92 A0\n")
+
+
 def write_gcode(out, job, start_gcode="", end_gcode=""):
     """Writes the complete program for `job` to the text stream `out`. The job
     must pass validate()."""
@@ -849,14 +926,15 @@ def write_gcode(out, job, start_gcode="", end_gcode=""):
     for key, value in settings_items(job):
         out.write(f"; {key}: {value}\n")
     out.write(f"; ld: {job.dome_length:.3f}\n; -----------------------\n\n")
+    x, y = start_position(job)
     if job.home_before_wind:
         out.write("G28\n")
+        _write_move_to_start(out, job, x, y)
     else:
         # Skip homing: just define wherever the carriage/mandrel currently
         # is as the zero reference for this wind, without moving.
         out.write("G92 A0\n")
     if start_gcode: out.write(start_gcode + "\n")
-    x, y = start_position(job)
     # No rotation is planned here, and with F = Max Rotation Speed any rotation
     # the machine does need (e.g. an A axis not homed to 0) can't be faster.
     out.write(f"G1 X{x:.3f} Y{y:.3f} A{0.0:.3f} F{int(job.max_a_speed)}\n")

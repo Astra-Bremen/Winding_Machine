@@ -177,7 +177,9 @@ class ViewTab:
                 cx, cy, ca = 0.0, 0.0, 0.0
                 a_offset = 0.0
                 cycle_num = 1
-                layup = 0
+                # Moves before the first "; LAYUP_START" marker (homing, the
+                # move to the wind start) are setup, not fiber: layup SETUP.
+                layup, saw_layup_marker = self.SETUP, False
                 feed = 0.0  # G-code F persists across lines that don't repeat it
                 elapsed = 0.0
                 prev_x, prev_y, prev_a = None, None, None
@@ -188,7 +190,7 @@ class ViewTab:
                             try: cycle_num = int(line.split(":", 1)[1].strip()) + 1
                             except ValueError: pass
                         elif line.startswith("; LAYUP_START:"):
-                            try: layup = max(0, int(line.split(":", 1)[1].strip()) - 1)
+                            try: layup, saw_layup_marker = max(0, int(line.split(":", 1)[1].strip()) - 1), True
                             except ValueError: pass
                         elif ":" in line:
                             p = line[1:].split(":", 1)
@@ -238,6 +240,9 @@ class ViewTab:
         except (OSError, UnicodeDecodeError, ValueError) as e:
             messagebox.showerror("Error", f"Couldn't read the G-code file:\n{e}")
             return
+        if not saw_layup_marker:
+            # Written before layups existed: every move is part of the wind.
+            self.cmd_layups = [0] * len(self.cmd_layups)
         header_layups = winding.layups_from_header(self.view_settings)
         self.total_cycles = sum(l.passes for l in header_layups) if header_layups else cycle_num
         self.layup_count = max(len(header_layups) if header_layups else 1, max(self.cmd_layups, default=0) + 1)
@@ -256,7 +261,9 @@ class ViewTab:
         defaults = winding.WindingJob()
         for key, var in self.app.params.items():
             if key not in self.view_settings:
-                if is_winder_file: var.set(winding.LEGACY_VALUES.get(key, getattr(defaults, key)))
+                if is_winder_file:
+                    value = winding.LEGACY_VALUES.get(key, getattr(defaults, key))
+                    var.set(value(self.view_settings) if callable(value) else value)
                 continue
             raw = self.view_settings[key]
             try:
@@ -295,6 +302,9 @@ class ViewTab:
     # position, so the strand visibly originates right where the eye is drawn
     # instead of at the tank's centerline.
     EYE_REF_ANGLE_DEG = 180.0
+
+    # cmd_layups value of setup moves (homing, travel to the wind start).
+    SETUP = -1
 
     def _build_path_cache(self, co, lt, rt, rc, ld, cap_type, scale, ox, oy):
         # Caches only what never changes once computed: a point's X-projection and
@@ -381,7 +391,7 @@ class ViewTab:
         poly_layup = None  # the layup whose color `poly` is drawn in
 
         def flush():
-            if len(poly) >= 2:
+            if len(poly) >= 2 and poly_layup != self.SETUP:
                 color, dash = theme.layup_style(VP, poly_layup)
                 self.view_canvas.create_line(*[c for p in poly for c in p], fill=color, dash=dash or "", width=1)
             poly.clear()
@@ -407,7 +417,11 @@ class ViewTab:
                 eff = math.radians(ca_recorded)
                 visible = math.sin(eff) >= 0
             py = oy - r * math.cos(eff) * scale
-            if visible:
+            if layup == self.SETUP:
+                # Setup travel lays no fiber: only remember where it ended, so
+                # the wound path starts right there.
+                poly[:] = [(px, py)] if visible else []
+            elif visible:
                 poly.append((px, py))
             else:
                 flush()
@@ -458,8 +472,11 @@ class ViewTab:
         cmd = self.gcode_commands[idx]
         self.line_var.set(idx)
         self.cycle_var.set(self.cmd_cycles[idx] if idx < len(self.cmd_cycles) else 0)
-        if self.layup_count > 1 and idx < len(self.cmd_layups):
-            self.layup_var.set(f"Layup {self.cmd_layups[idx] + 1} / {self.layup_count}")
+        layup = self.cmd_layups[idx] if idx < len(self.cmd_layups) else 0
+        if layup == self.SETUP:
+            self.layup_var.set("Moving to wind start")
+        elif self.layup_count > 1:
+            self.layup_var.set(f"Layup {layup + 1} / {self.layup_count}")
         else:
             self.layup_var.set("")
         # Fixed-width, integer X/Y (only A keeps decimals) so the readout doesn't

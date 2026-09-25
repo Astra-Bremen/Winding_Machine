@@ -48,6 +48,16 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   to normal text and no longer changes on its own. To return it to auto, clear
   the field and click out of it (or press Enter). New layups always start on
   auto.
+- **Wind start and fiber attachment:** with *Home Axes (G28) Before Winding*
+  on, the wind starts at *Start Wind at X*. By default (auto, same field
+  behavior as above) that is where the chuck-side dome ends and the tank turns
+  straight. After homing, the machine pulls the eye fully back, travels to
+  that X, moves the eye in to winding distance, and runs `PAUSE`. Attach the
+  fiber, then resume on the machine: the wind runs from there toward +X. The
+  mandrel's angle at resume becomes the wind's zero, so turning it by hand
+  while attaching the fiber is fine. The Settings Preview marks the start on
+  the tank when Layup 1 is shown. Without homing, the wind starts at the tank's
+  end as before.
 - **Pattern-correct, balanced turnarounds:** each turnaround has a minimum
   dwell angle. The app adds a small extra rotation so that every circuit
   starts exactly on the pattern, and gives both tank ends the same turnaround
@@ -111,6 +121,9 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; --- WINDER SETTINGS ---
 ; chuck_offset: 50.0          <- every setting is saved as a comment, so a
 ; ...                             file can be reopened and its settings restored
+; start_x: 146.82458365518542
+; start_x_auto: True
+; ...
 ; max_move_time: 0.5
 ; turnaround_zone: 80.0
 ; optimize_trajectory: False
@@ -119,10 +132,17 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; layup_2: passes=4 pattern_number=5 wind_angle=75.0 turnaround_angle=270.0 auto_cycles=False
 ; ld: 96.825                  <- computed dome length
 ; -----------------------
-G28                           <- or "G92 A0" if "Home Axes Before Winding" is off
-G1 X50.000 Y... A0.000 F...   <- move to the start position
+G28                           <- or just "G92 A0" if "Home Axes Before Winding" is off
+; --- MOVE TO WIND START ---
+G1 Y0.000 F...                <- pull the eye fully back first
+G1 X48.942 F...               <- travel to Start Wind at X (in pieces, see Max Move Time)
+...
+G1 Y70.000 F...               <- then move in to winding distance
+PAUSE                         <- attach the fiber, resume on the machine
+G92 A0                        <- the mandrel's angle at resume is the wind's zero
+G1 X146.825 Y70.000 A0.000 F...   <- the start position
 ; LAYUP_START:1
-G1 X55.000 Y... A... F...     <- traversal in 5 mm X steps
+G1 X151.825 Y... A... F...    <- traversal in 5 mm X steps, toward +X
 ...
 G1 X... Y... A... F...        <- turnaround: extra rotation on the steps of the zone
 ...                              (or one A-only move at the end without a zone)
@@ -212,7 +232,9 @@ python main.py
    every layup on the tank at once.
 4. Click **Generate G-Code** and choose where to save the file. The file
    opens in the G-Code Preview automatically.
-5. Use **Open G-Code** to inspect a file generated earlier.
+5. Run it on the machine. With homing on, it homes, moves the eye to the wind
+   start and pauses: attach the fiber there, then resume on the machine.
+6. Use **Open G-Code** to inspect a file generated earlier.
 
 ## Tests
 
@@ -262,6 +284,13 @@ python -m unittest -v test_winding
   same pieces. `write_gcode()` computes each F from the written coordinates via
   `_rotation_limited_feed()`. The `MoveSplitting` and `MaxRotationSpeed` tests
   check both on the written file.
+- **Homing position:** the move to the wind start assumes `G28` leaves the
+  carriage at X0 Y0, with Y0 the eye's fully retracted end (farthest from the
+  tank), as in the app's machine model. It is written by `_write_move_to_start()`
+  in `winding.py`; adjust it there if the machine homes elsewhere.
+- **Auto/custom fields:** `AutoEntry` in `plan_tab.py` gives *Number of Cycles*
+  and *Start Wind at X* their shared auto/custom behavior. A new auto setting
+  needs a flag in the model (see `winding.AUTO_FLAGS`) and one `AutoEntry`.
 - **Feed rate and Klipper:** feed rates assume the controller applies F to the
   combined X/Y/A move length, with A in degrees, as the original generator did.
   If Klipper's `max_velocity` or `max_accel` are lower than what the file asks
