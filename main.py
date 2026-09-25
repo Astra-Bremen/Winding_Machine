@@ -7,6 +7,7 @@ import ttkbootstrap as tb
 import theme
 import winding
 from plan_tab import PlanTab
+from partial_page import PartialPage
 from view_tab import ViewTab
 
 
@@ -58,6 +59,10 @@ class CFRPWinderApp:
         # coverage); only an explicit entry in the field makes it custom.
         self.layups = [self._make_layup_vars({**dataclasses.asdict(defaults.layups[0]), "auto_cycles": True})]
         self.active_layup = 0
+        # The partial-export page's values (1-based layup/cycle, mandrel angle,
+        # rehome): kept here so they survive leaving and reopening the page.
+        self.partial_vars = {"layup": tk.IntVar(value=1), "cycle": tk.IntVar(value=1),
+                             "angle": tk.DoubleVar(value=0.0), "rehome": tk.BooleanVar(value=False)}
 
         self._build_menu()
 
@@ -85,10 +90,13 @@ class CFRPWinderApp:
         left_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=True)
         self._left_canvas = left_canvas
 
+        # The panel shows one page at a time: the settings, or the partial-export
+        # page that temporarily takes their place (see show_partial_page).
         settings_inner = ttk.Frame(left_canvas)
         left_canvas_window = left_canvas.create_window((0, 0), window=settings_inner, anchor="nw")
         settings_inner.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
         left_canvas.bind("<Configure>", lambda e: left_canvas.itemconfig(left_canvas_window, width=e.width))
+        self._settings_page, self._left_window = settings_inner, left_canvas_window
 
         def _on_mousewheel(event):
             left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -105,6 +113,10 @@ class CFRPWinderApp:
 
         self.plan_tab = PlanTab(settings_inner, settings_preview_frame, self)
         self.view_tab = ViewTab(gcode_preview_frame, self)
+        self.partial_page = PartialPage(left_canvas, self)
+        self.partial_page.frame.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")),
+                                     add="+")
+        self._partial_shown = False
 
         root.update_idletasks()
         left_canvas.configure(width=settings_inner.winfo_reqwidth())
@@ -151,6 +163,7 @@ class CFRPWinderApp:
         # gets swept into the light/dark toggle too.
         if hasattr(self, "plan_tab"): self.plan_tab.on_theme_changed()
         if hasattr(self, "view_tab"): self.view_tab.reapply_viewport_colors()
+        if hasattr(self, "partial_page"): self.partial_page.on_theme_changed()
 
     def set_status(self, text):
         if hasattr(self, "status_var"): self.status_var.set(text)
@@ -164,6 +177,7 @@ class CFRPWinderApp:
 
     def _on_setting_changed(self, *args):
         if hasattr(self, "plan_tab"): self.plan_tab.schedule_redraw()
+        if getattr(self, "_partial_shown", False): self.partial_page.refresh()
 
     def _make_layup_vars(self, values):
         # `values` maps every layup key to its initial value.
@@ -177,6 +191,36 @@ class CFRPWinderApp:
 
     def _layups_changed(self):
         if hasattr(self, "plan_tab"): self.plan_tab.on_layups_changed()
+        if getattr(self, "_partial_shown", False): self.partial_page.refresh()
+
+    # --- Settings panel pages ---
+
+    def show_partial_page(self):
+        """Swap the settings for the partial-export page (see partial_page)."""
+        if self._partial_shown:
+            return
+        self._partial_shown = True
+        self._left_canvas.itemconfigure(self._left_window, window=self.partial_page.frame)
+        self._left_canvas.yview_moveto(0)
+        self.partial_page.on_show()
+
+    def show_settings_page(self):
+        if not self._partial_shown:
+            return
+        self._partial_shown = False
+        self.partial_page.on_hide()
+        self._left_canvas.itemconfigure(self._left_window, window=self._settings_page)
+        self._left_canvas.yview_moveto(0)
+
+    def load_partial(self, resume):
+        """Restores a partial program's continue point (from a reopened file)
+        and shows it on the partial-export page."""
+        p = resume.point
+        self.partial_vars["layup"].set(p.layup + 1)
+        self.partial_vars["cycle"].set(p.cycle + 1)
+        self.partial_vars["angle"].set(round(p.angle, 3))
+        self.partial_vars["rehome"].set(resume.rehome)
+        self.show_partial_page()
 
     def add_layup(self):
         # A new layup inherits every setting from the last one, so building up a
@@ -235,7 +279,9 @@ class CFRPWinderApp:
 
     # --- G-code generation ---
 
-    def generate(self):
+    def generate(self, resume=None):
+        """Writes the program to a file the user picks. With a winding.Resume,
+        writes a partial program that continues an interrupted wind instead."""
         try:
             job = self.build_job()
         except winding.SettingsError as e:
@@ -252,11 +298,22 @@ class CFRPWinderApp:
         # duration is taken from the Settings Preview's own live estimate
         # (already kept in sync with these same settings) rather than
         # recomputed here, so clicking Generate never blocks on a second full
-        # simulation pass over a potentially long wind.
+        # simulation pass over a potentially long wind. A partial program is
+        # marked "PARTIAL-L<layup>C<cycle>" and shows the time it has left.
         cap_code = "RND" if job.end_cap_type == "Round" else "FLT"
-        seconds = int(self.plan_tab.estimated_total_time() or 0)
-        h, m = divmod(seconds, 3600); m, s = divmod(m, 60)
-        suggested_name = f"{datetime.datetime.now().strftime('%d_%m_%H_%M')}-{cap_code}-{h:02d}_{m:02d}_{s:02d}.gcode"
+        seconds = self.plan_tab.estimated_total_time() or 0
+        partial_code = ""
+        if resume is not None:
+            try:
+                location = winding.locate(job, resume.point)
+            except winding.PointError as e:
+                messagebox.showerror("Error", f"Can't continue from there:\n{e}")
+                return
+            seconds = max(0.0, seconds - location.elapsed)
+            partial_code = f"PARTIAL-L{resume.point.layup + 1}C{resume.point.cycle + 1}-"
+        h, m = divmod(int(seconds), 3600); m, s = divmod(m, 60)
+        suggested_name = (f"{datetime.datetime.now().strftime('%d_%m_%H_%M')}-{cap_code}-{partial_code}"
+                          f"{h:02d}_{m:02d}_{s:02d}.gcode")
         filepath = filedialog.asksaveasfilename(defaultextension=".gcode", filetypes=[("G-Code Files", "*.gcode")], initialfile=suggested_name)
         if not filepath: return
         # Written to a temporary file next to the target and only moved into
@@ -265,7 +322,7 @@ class CFRPWinderApp:
         tmp_path = filepath + ".part"
         try:
             with open(tmp_path, "w") as f:
-                winding.write_gcode(f, job, self.START_GCODE, self.END_GCODE)
+                winding.write_gcode(f, job, self.START_GCODE, self.END_GCODE, resume=resume)
             os.replace(tmp_path, filepath)
         except Exception as e:
             messagebox.showerror("Error", f"G-code generation failed:\n{e}")
@@ -273,9 +330,15 @@ class CFRPWinderApp:
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        layup_note = f" ({len(job.layups)} layups, {job.total_cycles} cycles)" if len(job.layups) > 1 else ""
-        self.set_status(f"G-code generated{layup_note}: {filepath}")
-        messagebox.showinfo("Success", f"G-Code generated!\nSaved to: {filepath}")
+        if resume is not None:
+            p = resume.point
+            self.set_status(f"Partial G-code generated (continues from Layup {p.layup + 1}, Cycle {p.cycle + 1}, "
+                            f"A {p.angle:.1f}°): {filepath}")
+        else:
+            layup_note = f" ({len(job.layups)} layups, {job.total_cycles} cycles)" if len(job.layups) > 1 else ""
+            self.set_status(f"G-code generated{layup_note}: {filepath}")
+        kind = "Partial G-Code" if resume is not None else "G-Code"
+        messagebox.showinfo("Success", f"{kind} generated!\nSaved to: {filepath}")
         self.view_tab.open_gcode_view(filepath)
 
 

@@ -87,6 +87,13 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   produce are corrected automatically. At angles that are too steep, each wrap
   would lie on top of the previous one. At angles that are too shallow, the
   strand barely moves around the tank.
+- **Pause after each layup:** on by default. The program runs `PAUSE` after
+  every layup except the last, so the fiber can be checked (for slipping, say)
+  after each pattern change. Resume on the machine to continue.
+- **Continuing an interrupted wind (Export Partial G-Code):** if something goes
+  wrong, cancel the program on the machine, adjust the settings if needed, and
+  export a partial program that continues from where the wind stopped. See
+  [Continuing an interrupted wind](#continuing-an-interrupted-wind).
 - **Optimize Trajectory (experimental):** moves part of each dwell rotation
   into the X steps just before and after it. The motion planner then does not
   have to slow almost to a stop at the turnaround, and the winding pattern
@@ -149,6 +156,8 @@ G1 X... Y... A... F...        <- turnaround: extra rotation on the steps of the 
 ; CYCLE_COMPLETE:1            <- cycles are numbered across the whole program
 G92 A0                        <- reset A after each cycle so the value never grows too large
 ...
+; Layup 1 complete - check the fiber, then resume on the machine
+PAUSE                         <- with "Pause After Each Layup" (not after the last)
 ; LAYUP_START:2
 ...
 ```
@@ -158,6 +167,43 @@ unintended change to the motion shows up in the tests.
 
 The suggested file name records the time of generation, the end-cap type and
 the estimated duration, for example `17_09_14_32-RND-00_07_26.gcode`.
+
+## Continuing an interrupted wind
+
+**Export Partial G-Code…** (under the settings) swaps the settings panel for a
+page that exports a program continuing from a chosen point of the wind. **‹**
+returns to the settings; the page remembers its values for the rest of the
+session.
+
+1. On the machine, cancel the program. Change settings if needed. Changes to
+   the layups still to come are safe. Changing the one being continued also
+   changes its pattern from that point on.
+2. Enter where the wind stopped: the **Layup**, the **Cycle**, and the
+   **Mandrel Angle A** the machine shows. A restarts at 0 with every cycle, so
+   together they pin down the exact point; 0 means the start of the cycle.
+   After a *Pause After Each Layup* stop, that is simply the next layup,
+   cycle 1, A 0. Alternatively, open the original G-code in the G-Code
+   Preview, move to where the machine stopped, and click **Use G-Code Preview
+   Position**.
+3. Check the result. The Settings Preview shows the tank as it should look at
+   that point, with the eye where it should be. Layups that cover the tank
+   completely appear as a solid layer of their color. The page shows the eye
+   position, how much is wound, and the time and tow still to go.
+4. Leave **Move to Starting Position** off while the fiber is still attached
+   and the eye is at the point: the program then continues right away. Turn it
+   on only if the fiber broke. The program then homes X and Y (not the
+   mandrel, so the wound pattern stays aligned), moves the eye to the point
+   without crossing the tank, and pauses to let you reattach the fiber.
+5. Click **Export Partial G-Code**.
+
+The partial program runs exactly the same moves as the complete one from that
+point on, in the same A frame (it declares the machine's A with `G92 A…`), so
+the wind continues seamlessly, including later layup pauses. Its file name is
+marked `PARTIAL-L<layup>C<cycle>` and shows the time left. Its settings header
+also records the continue point (`partial_layup`, `partial_cycle`,
+`partial_angle`, `partial_rehome`). Opening the file restores those on the
+partial page along with the settings, and the G-Code Preview numbers its cycles
+as in the complete program.
 
 ## Pattern alignment
 
@@ -234,7 +280,8 @@ python main.py
    opens in the G-Code Preview automatically.
 5. Run it on the machine. With homing on, it homes, moves the eye to the wind
    start and pauses: attach the fiber there, then resume on the machine.
-6. Use **Open G-Code** to inspect a file generated earlier.
+6. Use **Open G-Code** to inspect a file generated earlier, and **Export
+   Partial G-Code…** to continue a wind that was interrupted.
 
 ## Tests
 
@@ -250,7 +297,8 @@ python -m unittest -v test_winding
 |------|---------|
 | `main.py` | App entry point and `CFRPWinderApp`: window layout and menus, the settings model (global settings plus one set of variables per layup), and G-code file output. |
 | `winding.py` | All winding math, with no GUI dependency: the `WindingJob`/`Layup` settings, validation, geometry, dwell/pattern alignment, trajectory blending, the motion generator (`iter_program`), the preview simulation (`simulate`), and the G-code writer and header parser. |
-| `plan_tab.py` | `PlanTab`: settings form with the layup switcher, live Settings Preview (3D tank, end view, estimates, Show All Layups legend), wind-angle validation and the background calculation thread. |
+| `plan_tab.py` | `PlanTab`: settings form with the layup switcher, live Settings Preview (3D tank, end view, estimates, Show All Layups legend, the tank's progress while continuing a wind), wind-angle validation and the background calculations. |
+| `partial_page.py` | `PartialPage`: the Export Partial G-Code page that replaces the settings while continuing an interrupted wind. |
 | `view_tab.py` | `ViewTab`: G-code parser and playback viewer. |
 | `theme.py` | ttkbootstrap theme setup, canvas color palettes (including the layup colors) and the generated app icon. |
 | `test_winding.py` | Headless tests for `winding.py`. |
@@ -288,6 +336,14 @@ python -m unittest -v test_winding
   carriage at X0 Y0, with Y0 the eye's fully retracted end (farthest from the
   tank), as in the app's machine model. It is written by `_write_move_to_start()`
   in `winding.py`; adjust it there if the machine homes elsewhere.
+- **Partial programs:** `winding.ProgramPoint` is a point to continue from and
+  `winding.Resume` adds the rehome option. `_walk_to()` walks the program to
+  the point and returns the rest of it. `locate()` and `progress()` use it for
+  the page and the preview, and `write_gcode(..., resume=...)` uses it to write
+  the partial program.
+- **Background calculations:** `_BackgroundCalc` in `plan_tab.py` runs one
+  calculation at a time on a worker thread and delivers only the newest
+  result. It runs both the simulation and the progress of a partial wind.
 - **Auto/custom fields:** `AutoEntry` in `plan_tab.py` gives *Number of Cycles*
   and *Start Wind at X* their shared auto/custom behavior. A new auto setting
   needs a flag in the model (see `winding.AUTO_FLAGS`) and one `AutoEntry`.

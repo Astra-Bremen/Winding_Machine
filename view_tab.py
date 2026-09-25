@@ -24,6 +24,8 @@ class ViewTab:
         self.cmd_layups = []
         self.layup_count = 1
         self.layup_var = tk.StringVar(value="")
+        # How a partial program continues (winding.Resume), from its header.
+        self.resume = None
         self.gcode_path_var = tk.StringVar(value="No file loaded")
         self.timeline_var = tk.IntVar(value=0)
         self.line_var = tk.IntVar(value=0)
@@ -172,11 +174,12 @@ class ViewTab:
         self.cmd_cycles, self.cycle_starts = [], {}
         self.cmd_times = []
         self.cmd_layups, self.layup_count = [], 1
+        self.resume = None
         try:
             with open(filepath, 'r') as f:
                 cx, cy, ca = 0.0, 0.0, 0.0
                 a_offset = 0.0
-                cycle_num = 1
+                cycle_num = None  # known once the settings header has been read
                 # Moves before the first "; LAYUP_START" marker (homing, the
                 # move to the wind start) are setup, not fiber: layup SETUP.
                 layup, saw_layup_marker = self.SETUP, False
@@ -233,6 +236,8 @@ class ViewTab:
                         # matches what the machine actually receives at this line.
                         self.gcode_commands.append((cx, cy, ca, ca_raw))
                         self.cmd_times.append(elapsed)
+                        if cycle_num is None:
+                            cycle_num = self._first_cycle_number()
                         if cycle_num not in self.cycle_starts:
                             self.cycle_starts[cycle_num] = len(self.gcode_commands) - 1
                         self.cmd_cycles.append(cycle_num)
@@ -243,13 +248,38 @@ class ViewTab:
         if not saw_layup_marker:
             # Written before layups existed: every move is part of the wind.
             self.cmd_layups = [0] * len(self.cmd_layups)
+        self.resume = winding.resume_from_header(self.view_settings)
         header_layups = winding.layups_from_header(self.view_settings)
-        self.total_cycles = sum(l.passes for l in header_layups) if header_layups else cycle_num
+        self.total_cycles = sum(l.passes for l in header_layups) if header_layups else (cycle_num or 1)
         self.layup_count = max(len(header_layups) if header_layups else 1, max(self.cmd_layups, default=0) + 1)
         self.timeline_slider.config(to=max(0, len(self.gcode_commands)-1))
         self.timeline_var.set(0)
         self.line_total_var.set(f"/ {len(self.gcode_commands)}")
         self.cycle_total_var.set(f"/ {self.total_cycles}")
+
+    def _first_cycle_number(self):
+        # The number of the file's first cycle, counted across the whole
+        # program: 1, except in a partial program, which continues mid-program.
+        layups = winding.layups_from_header(self.view_settings)
+        resume = winding.resume_from_header(self.view_settings)
+        if resume is None or not layups:
+            return 1
+        return sum(l.passes for l in layups[:resume.point.layup]) + resume.point.cycle + 1
+
+    def current_point(self):
+        """The program point at the timeline position, as a winding.ProgramPoint
+        -- for continuing an interrupted wind from where the machine stopped --
+        or None without a file."""
+        if not self.gcode_commands:
+            return None
+        idx = min(self.timeline_var.get(), len(self.gcode_commands) - 1)
+        layup = self.cmd_layups[idx]
+        if layup == self.SETUP:
+            # Not winding yet: the file's own starting point.
+            return self.resume.point if self.resume else winding.ProgramPoint(0, 0, 0.0)
+        layups = winding.layups_from_header(self.view_settings) or []
+        cycle = self.cmd_cycles[idx] - 1 - sum(l.passes for l in layups[:layup])
+        return winding.ProgramPoint(layup, max(0, cycle), max(0.0, self.gcode_commands[idx][3]))
 
     def _sync_settings_to_app_params(self):
         # A file written by this app always records the tank geometry; one that
@@ -276,6 +306,10 @@ class ViewTab:
         # support (a single pattern stored as top-level settings).
         layups = winding.layups_from_header(self.view_settings)
         if layups: self.app.load_layups(layups)
+        # A partial program also records where it continues from: restore that
+        # on the partial-export page, recreating the conditions it was made in.
+        if self.resume is not None:
+            self.app.load_partial(self.resume)
 
     def jump_to_line(self, event=None):
         if not self.gcode_commands: return

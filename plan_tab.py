@@ -30,12 +30,15 @@ LAYUP_FIELDS = [
 START_X_FIELD = ("Start Wind at X (mm)", "start_x")
 FIELD_LABELS = {key: label for label, key in MACHINE_FIELDS + [START_X_FIELD] + TANK_FIELDS + WINDING_FIELDS + LAYUP_FIELDS}
 
+# Entry fields use the same compact size as their labels (a ttk style can't
+# set an entry's font; it has to be given to the widget itself).
+FIELD_FONT = ("TkDefaultFont", 8)
 LEGEND_FONT = ("TkDefaultFont", 8)
 LEGEND_FONT_ACTIVE = ("TkDefaultFont", 8, "bold")
 SWATCH_W, SWATCH_H = 24, 12
 
 
-def _format_hms(seconds):
+def format_hms(seconds):
     h, m = divmod(int(seconds), 3600); m, s = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
@@ -48,6 +51,70 @@ def _set_if_changed(var, value):
         current = None
     if current != value:
         var.set(value)
+
+
+class _BackgroundCalc:
+    """Runs fn(key) on a worker thread, for the newest requested key only, and
+    hands the outcome to on_result(key, result, error) on the GUI thread (from
+    poll()). Only one calculation is ever in flight; a request made while one
+    runs just overwrites the single pending slot -- which is exactly how an
+    outdated queued calculation gets "cancelled": it's replaced before it ever
+    starts. Each request gets a unique token, and only the newest request's
+    outcome is delivered; anything else that arrives is stale and discarded."""
+
+    def __init__(self, fn, on_result):
+        self._fn, self._on_result = fn, on_result
+        self._queue = queue.Queue()
+        self._thread = None
+        self._next_token = 0
+        self._wanted = None
+        self.pending = None   # (token, key) waiting for the worker
+        self.inflight = None  # (token, key) being calculated right now
+
+    @property
+    def busy(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def request(self, key):
+        if self.inflight is not None and self.inflight[1] == key:
+            # Already being calculated (e.g. a value was changed and changed
+            # straight back) -- drop anything queued behind it.
+            self.pending, self._wanted = None, self.inflight[0]
+            return
+        if self.pending is not None and self.pending[1] == key:
+            return
+        self._next_token += 1
+        self._wanted = self._next_token
+        self.pending = (self._next_token, key)
+        if not self.busy:
+            self._launch()
+
+    def _launch(self):
+        if self.pending is None:
+            return
+        self.inflight, self.pending = self.pending, None
+        self._thread = threading.Thread(target=self._work, args=self.inflight, daemon=True)
+        self._thread.start()
+
+    def _work(self, token, key):
+        # Worker thread: pure math only, no Tkinter access.
+        try:
+            self._queue.put((token, key, self._fn(key), None))
+        except Exception as e:
+            self._queue.put((token, key, None, e))
+
+    def poll(self):
+        # GUI thread: the only place outcomes may touch widgets.
+        try:
+            while True:
+                token, key, result, error = self._queue.get_nowait()
+                self._thread = self.inflight = None
+                if token == self._wanted:
+                    self._on_result(key, result, error)
+                if self.pending is not None:
+                    self._launch()
+        except queue.Empty:
+            pass
 
 
 class AutoEntry:
@@ -150,30 +217,29 @@ class PlanTab:
         self.layup_entries = {}
 
         # --- Background calculation state ---
-        # The strand-path simulation can be slow for long winds, so it always runs
-        # on a worker thread instead of the GUI thread. Only one calculation is ever
-        # in flight; if settings change again while it's running, the new request
-        # just overwrites `_pending` (there is only one pending slot), which is
-        # exactly how an outdated queued calculation gets "cancelled" -- it's
-        # simply replaced before it ever gets to start. Each request gets a unique
-        # token, and only the result for `_wanted_token` (the newest settings) is
-        # ever drawn; anything else that arrives is stale and discarded.
+        # The strand-path simulation (and, while continuing a wind, the tank's
+        # progress up to the continue point) can be slow for long winds, so both
+        # run on worker threads (see _BackgroundCalc) instead of the GUI thread.
         #
-        # Every request is keyed by its immutable winding.WindingJob, and the last
-        # finished result is cached against it. Anything that doesn't change the
-        # job -- switching the displayed layup, toggling "Show All Layups",
+        # Every simulation is keyed by its immutable winding.WindingJob, and the
+        # last finished result is cached against it. Anything that doesn't change
+        # the job -- switching the displayed layup, toggling "Show All Layups",
         # resizing, rotating the view -- redraws straight from that cache without
         # re-running the simulation, which is what keeps layup switching instant.
-        self._calc_queue = queue.Queue()
-        self._calc_thread = None
-        self._next_token = 0
-        self._wanted_token = None
-        self._pending = None       # (token, job) waiting for the worker
-        self._inflight = None      # (token, job) the worker is simulating right now
+        # Progress is keyed and cached the same way, by (job, continue point).
+        self._sim = _BackgroundCalc(winding.simulate, self._apply_calc_result)
+        self._prog = _BackgroundCalc(lambda key: winding.progress(*key), self._apply_progress_result)
         self._result = None        # (job, winding.SimulationResult) of the last finished simulation
+        self._progress = None      # ((job, point), winding.Progress) of the last finished progress
         self._job = None           # job currently shown; None while a field holds invalid input
         self._sim_blocked = False  # True while the current job can't be simulated at all
         self._view_geom = None     # (scale, ox, oy) the tank is currently drawn with
+        self._tank_outline = None  # the tank silhouette polygon's screen points
+        # While the partial page is open: the ProgramPoint to continue from (the
+        # preview then shows the tank as wound up to it), and who to tell about
+        # its location / problems (on_progress(location, error)).
+        self.partial_point = None
+        self.on_progress = None
 
         # --- 3D-ish strand view rotation state ---
         # The tank's outer silhouette looks identical from any angle around its own
@@ -228,7 +294,7 @@ class PlanTab:
                 # Layup entries are bound to a variable later (on_layups_changed),
                 # since which layup's variables they edit changes on every switch.
                 var = self.app.params.get(key)
-                entry = ttk.Entry(frame, textvariable=var, width=12, style=ENT) if var is not None else ttk.Entry(frame, width=12, style=ENT)
+                entry = ttk.Entry(frame, width=12, style=ENT, font=FIELD_FONT, **({"textvariable": var} if var is not None else {}))
                 entry.grid(row=first_row + i, column=1, sticky="e", pady=1)
                 if store is not None: store[key] = entry
             frame.columnconfigure(0, weight=1)
@@ -247,7 +313,7 @@ class PlanTab:
         row = len(MACHINE_FIELDS) + 1
         self._start_x_label = ttk.Label(machine_frame, text=START_X_FIELD[0], style=LBL)
         self._start_x_label.grid(row=row, column=0, sticky="w", pady=1, padx=(22, 10))
-        self._start_x_entry = ttk.Entry(machine_frame, textvariable=self.app.params["start_x"], width=12, style=ENT)
+        self._start_x_entry = ttk.Entry(machine_frame, textvariable=self.app.params["start_x"], width=12, style=ENT, font=FIELD_FONT)
         self._start_x_entry.grid(row=row, column=1, sticky="e", pady=1)
         self._start_x_field = AutoEntry(self, self._start_x_entry, lambda: self.app.params["start_x_auto"],
                                         self._start_x_mode_changed)
@@ -256,7 +322,7 @@ class PlanTab:
         tank_frame = ttk.LabelFrame(left_panel, text="Tank Settings", padding=FRAME_PAD, style=FRM)
         tank_frame.pack(fill=tk.X, pady=FRAME_GAP)
         ttk.Label(tank_frame, text="End-Cap Type", style=LBL).grid(row=0, column=0, sticky="w", pady=1, padx=(0, 10))
-        self.cap_type_combo = ttk.Combobox(tank_frame, textvariable=self.app.params["end_cap_type"], values=["Round", "Flat"], state="readonly", width=10, style=CMB)
+        self.cap_type_combo = ttk.Combobox(tank_frame, textvariable=self.app.params["end_cap_type"], values=["Round", "Flat"], state="readonly", width=10, style=CMB, font=FIELD_FONT)
         self.cap_type_combo.grid(row=0, column=1, sticky="e", pady=1)
         self.app.params["end_cap_type"].trace_add("write", self.on_cap_type_change)
         add_fields(tank_frame, TANK_FIELDS, first_row=1, store=self.tank_entries)
@@ -277,6 +343,10 @@ class PlanTab:
                                                variable=self.app.params["optimize_trajectory"],
                                                style="Settings.TCheckbutton")
         self._optimize_check.grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        # PAUSE between layups, to check the fiber after every pattern change.
+        ttk.Checkbutton(winding_frame, text="Pause After Each Layup", variable=self.app.params["pause_after_layup"],
+                        style="Settings.TCheckbutton").grid(row=len(WINDING_FIELDS) + 1, column=0, columnspan=2,
+                                                            sticky="w", pady=(2, 0))
 
         # 4. Layups -- the switchable per-layup settings. The section's title is
         # itself the switcher: [swatch] Layup 2 of 3 [<] [>] [-] [+], where the
@@ -322,6 +392,9 @@ class PlanTab:
         self.generate_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3), ipady=4)
         ttk.Button(actions, text="Open G-Code", command=lambda: self.app.view_tab.open_gcode_view(),
                    style="primary.Outline.TButton").grid(row=0, column=1, sticky="ew", padx=(3, 0), ipady=4)
+        # Opens the page for continuing an interrupted wind (see partial_page).
+        ttk.Button(actions, text="Export Partial G-Code…", command=self.app.show_partial_page,
+                   style="primary.Outline.TButton").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0), ipady=1)
 
         # Visualization Section. Bottom strip first (so it claims its height
         # before the row above expands): the "Show All Layups" toggle plus the
@@ -660,12 +733,16 @@ class PlanTab:
 
         if geometry_errors:
             self._sim_blocked = True
+            if self.partial_point is not None and self.on_progress is not None:
+                self.on_progress(None, None, winding.PointError(geometry_errors[0]))
         else:
             self._sim_blocked = False
             if self._result is not None and self._result[0] == job:
                 self._redraw_strands()
             else:
                 self._request_calc(job)
+            if self.partial_point is not None:
+                self._update_progress()
         self._update_sim_estimates()
         self._update_indicator()
 
@@ -697,7 +774,8 @@ class PlanTab:
             x = i * (lt / 100); r = winding.calc_R(x, 0, lt, rt, rc, ld, cap_type)
             tank_top.append((ox - (co + x) * scale, oy - r * scale))
             tank_bottom.append((ox - (co + x) * scale, oy + r * scale))
-        self.canvas.create_polygon(tank_top + tank_bottom[::-1], fill=pal["tank"], outline=pal["tank_outline"], width=2)
+        self._tank_outline = tank_top + tank_bottom[::-1]
+        self.canvas.create_polygon(self._tank_outline, fill=pal["tank"], outline=pal["tank_outline"], width=2)
         self._draw_cylinder_shading(tank_top, tank_bottom)
 
     def _draw_start_marker(self):
@@ -708,23 +786,29 @@ class PlanTab:
         # direction: +X runs to the left in this view.
         self.canvas.delete("start_marker")
         job = self._job
-        if job is None or not self._view_geom or not (self.app.active_layup == 0 or self.show_all_var.get()):
+        if (job is None or not self._view_geom or self.partial_point is not None
+                or not (self.app.active_layup == 0 or self.show_all_var.get())):
             return
-        pal = self.app.canvas_palette
+        self._draw_marker(job.wind_start_x, "start_marker", f"Wind start  X {job.wind_start_x:.1f}", direction_arrow=True)
+
+    def _draw_marker(self, x, tag, text, direction_arrow=False):
+        # A machine position across the tank: a dashed line on a halo (so it
+        # reads over any strand color), a pointer and a label above.
+        self.canvas.delete(tag)
+        job, pal = self._job, self.app.canvas_palette
         scale, ox, oy = self._view_geom
-        x = job.wind_start_x
         r = winding.calc_R(x - job.chuck_offset, 0, job.tank_length, job.tank_diameter / 2, job.end_cap_diameter / 2,
                            job.dome_length, job.end_cap_type)
         px, top, bottom = ox - x * scale, oy - r * scale - 8, oy + r * scale + 8
-        tag = "start_marker"
         self.canvas.create_line(px, top, px, bottom, fill=pal["marker_halo"], width=4, tags=tag)
         self.canvas.create_line(px, top, px, bottom, fill=pal["marker"], width=2, dash=(6, 3), tags=tag)
         self.canvas.create_polygon(px - 5, top - 8, px + 5, top - 8, px, top - 1, fill=pal["marker"], outline="", tags=tag)
-        label = self.canvas.create_text(px, top - 12, text=f"Wind start  X {x:.1f}", anchor="s", fill=pal["marker"],
+        label = self.canvas.create_text(px, top - 12, text=text, anchor="s", fill=pal["marker"],
                                         font=("TkDefaultFont", 9, "bold"), tags=tag)
-        x0, y0, x1, y1 = self.canvas.bbox(label)
-        self.canvas.create_line(x0 - 6, (y0 + y1) / 2, x0 - 30, (y0 + y1) / 2, fill=pal["marker"], width=2,
-                                arrow=tk.LAST, arrowshape=(7, 8, 3), tags=tag)
+        if direction_arrow:
+            x0, y0, x1, y1 = self.canvas.bbox(label)
+            self.canvas.create_line(x0 - 6, (y0 + y1) / 2, x0 - 30, (y0 + y1) / 2, fill=pal["marker"], width=2,
+                                    arrow=tk.LAST, arrowshape=(7, 8, 3), tags=tag)
 
     def _draw_warnings(self, errors, c_w):
         # Stacked top-center, each wrapped to the canvas width, measured from the
@@ -743,8 +827,17 @@ class PlanTab:
         self.canvas.delete("caption")
         n = len(self.app.layups)
         c_h = self.canvas.winfo_height()
-        if n <= 1 or c_h < 100 or self._job is None: return
-        if self.show_all_var.get():
+        if c_h < 100 or self._job is None: return
+        if self.partial_point is not None:
+            if self._progress is None or self._progress[0] != self._progress_key() or isinstance(self._progress[1], Exception):
+                return
+            location = self._progress[1].location
+            p = location.point
+            text = (f"Wound up to Layup {p.layup + 1} of {n} · Cycle {p.cycle + 1} of "
+                    f"{self._job.layups[p.layup].passes} · A {p.angle:.1f}°")
+        elif n <= 1:
+            return
+        elif self.show_all_var.get():
             text = f"All {n} layups · first cycle of each"
         else:
             text = f"Layup {self.app.active_layup + 1} of {n} · first cycle"
@@ -841,17 +934,17 @@ class PlanTab:
             for key in keys: self.est[key].set("--")
             return
         job, result = self._result
-        self.est["time"].set(_format_hms(result.total_time))
+        self.est["time"].set(format_hms(result.total_time))
         self.est["tow"].set(f"{result.total_tow / 1000.0:.2f} m")
         i = self.app.active_layup
         if i < len(result.layups):
             lr = result.layups[i]
-            self.est["layup_time"].set(_format_hms(lr.time))
+            self.est["layup_time"].set(format_hms(lr.time))
             # Average time per cycle -- individual cycles can vary a little (the
             # extra turnaround rotation that keeps the pattern aligned differs
             # slightly cycle to cycle), so this is the layup's time split evenly
             # across its number of cycles.
-            self.est["cycle_time"].set(_format_hms(lr.time / max(1, job.layups[i].passes)))
+            self.est["cycle_time"].set(format_hms(lr.time / max(1, job.layups[i].passes)))
             self.est["layup_tow"].set(f"{lr.tow / 1000.0:.2f} m")
         else:
             # A layup that was just added isn't part of the cached result yet.
@@ -860,102 +953,160 @@ class PlanTab:
     # --- Background calculation plumbing ---
 
     def _request_calc(self, job):
-        if self._inflight is not None and self._inflight[1] == job:
-            # These exact settings are already being simulated (e.g. a value was
-            # changed and changed straight back) -- drop anything queued behind.
-            self._pending = None
-            self._wanted_token = self._inflight[0]
-            return
-        if self._pending is not None and self._pending[1] == job:
-            return
-        self._next_token += 1
-        self._wanted_token = self._next_token
-        self._pending = (self._next_token, job)
-        if self._calc_thread is None or not self._calc_thread.is_alive():
-            self._launch_calc_thread()
+        self._sim.request(job)
 
-    def _launch_calc_thread(self):
-        if self._pending is None:
-            return
-        self._inflight, self._pending = self._pending, None
-        t = threading.Thread(target=self._calc_worker, args=self._inflight, daemon=True)
-        self._calc_thread = t
-        t.start()
+    @property
+    def job(self):
+        """The WindingJob currently shown, or None while a field holds invalid input."""
+        return self._job
 
-    def _calc_worker(self, token, job):
-        # Runs on a background thread: pure math only, no Tkinter access.
-        try:
-            self._calc_queue.put((token, job, winding.simulate(job), None))
-        except Exception as e:
-            self._calc_queue.put((token, job, None, e))
+    def calculating(self):
+        """True while a background calculation is running or queued."""
+        return any(c.busy or c.pending is not None for c in (self._sim, self._prog))
 
     def _poll_calc_queue(self):
-        # Runs on the GUI thread via after(); this is the only place background
-        # results are allowed to touch the canvas/Tk variables.
-        try:
-            while True:
-                token, job, result, err = self._calc_queue.get_nowait()
-                self._calc_thread = None
-                self._inflight = None
-                if token == self._wanted_token:
-                    # Still the most recent request -- nothing changed while it ran.
-                    if err is not None: print(f"Calc error: {err}")
-                    else: self._apply_calc_result(job, result)
-                # A stale result (superseded by a newer request while this one was
-                # running) is simply discarded here.
-                if self._pending is not None:
-                    self._launch_calc_thread()
-        except queue.Empty:
-            pass
+        # Runs on the GUI thread via after(): delivers finished calculations.
+        self._sim.poll()
+        self._prog.poll()
         self._update_indicator()
         self.app.root.after(50, self._poll_calc_queue)
 
-    def _apply_calc_result(self, job, result):
+    def _apply_calc_result(self, job, result, error):
+        if error is not None:
+            print(f"Calc error: {error}")
+            return
         self._result = (job, result)
         self._update_sim_estimates()
         self._redraw_strands()
+        self.report_progress()  # remaining time needs the total
+
+    # --- Continuing a wind (the partial page) ---
+
+    def set_partial_point(self, point):
+        """Show the tank as wound up to `point` (a winding.ProgramPoint) instead of
+        the layups' first cycles -- or go back to normal with None."""
+        if point == self.partial_point:
+            return
+        self.partial_point = point
+        self._redraw_now()
+
+    def _progress_key(self):
+        return (self._job, self.partial_point)
+
+    def _update_progress(self):
+        # From draw_visualization: draw the cached progress if it matches what's
+        # on screen, otherwise have it calculated.
+        if self._progress is not None and self._progress[0] == self._progress_key():
+            self._redraw_strands()
+            self.report_progress()
+        else:
+            self._prog.request(self._progress_key())
+
+    def _apply_progress_result(self, key, result, error):
+        self._progress = (key, result if error is None else error)
+        if key == self._progress_key():
+            self._redraw_strands()
+            self.report_progress()
+
+    def report_progress(self):
+        # Tell the partial page where the point is (or what's wrong with it).
+        if self.on_progress is None or self.partial_point is None:
+            return
+        if self._progress is None or self._progress[0] != self._progress_key():
+            self.on_progress(None, None, None)
+            return
+        outcome = self._progress[1]
+        if isinstance(outcome, Exception):
+            self.on_progress(None, None, outcome)
+        else:
+            total = self._result[1] if self._result is not None and self._result[0] == self._job else None
+            self.on_progress(outcome.location, total, None)
+
+    # --- Strands ---
 
     def _redraw_strands(self):
-        # Draws the selected layup's first cycle -- or, with "Show All Layups",
-        # every layup's first cycle in its own identity color, in winding order so
-        # later layups lie on top of earlier ones like they do on the real tank.
+        # Draws the wound strands: normally the selected layup's first cycle --
+        # or, with "Show All Layups", every layup's first cycle -- and while the
+        # partial page is open, the tank as wound up to the continue point.
         # Only front-facing path segments are drawn; which portions count as
         # "front" depends on self._view_azimuth, so this alone is re-run (cheaply)
         # on every rotate-animation frame, while the tank/shaft/end-view stay
-        # untouched. Only a result simulated from the exact settings on screen
-        # is ever drawn.
+        # untouched. Only results calculated from the exact settings on screen
+        # are ever drawn.
         self.canvas.delete("strand_path")
-        if not self._view_geom or self._result is None or self._result[0] != self._job:
-            return
-        job, result = self._result
+        if self.partial_point is not None:
+            self._draw_progress()
+        elif self._view_geom and self._result is not None and self._result[0] == self._job:
+            job, result = self._result
+            indices = range(len(result.layups)) if self.show_all_var.get() else [self.app.active_layup]
+            # In winding order, so later layups lie on top of earlier ones like
+            # they do on the real tank.
+            for li in indices:
+                self._draw_runs(li, [run for runs in result.layups[li].strand_runs for run in runs])
+        # Strand paths draw on top of everything else drawn synchronously (tank,
+        # warnings); keep the markers, caption and calc indicator above that.
+        for tag in ("start_marker", "continue_marker", "eye", "caption", "calc_indicator"):
+            self.canvas.tag_raise(tag)
+
+    def _draw_runs(self, layup_index, runs):
         scale, ox, oy = self._view_geom
-        path_w = max(1, int(job.bandwidth * scale))
         pal = self.app.canvas_palette
+        color, dash = theme.layup_style(pal, layup_index)
+        style = dict(fill=color, width=max(1, int(self._job.bandwidth * scale)), capstyle=tk.ROUND, dash=dash or "",
+                     tags="strand_path")
         az = math.radians(self._view_azimuth)
-        indices = range(len(result.layups)) if self.show_all_var.get() else [self.app.active_layup]
-        for li in indices:
-            color, dash = theme.layup_style(pal, li)
-            style = dict(fill=color, width=path_w, capstyle=tk.ROUND, dash=dash or "", tags="strand_path")
-            for runs in result.layups[li].strand_runs:
-                for run in runs:
-                    poly = []
-                    for x, r, a in run:
-                        eff = math.radians(a) - az
-                        px, py = ox - x * scale, oy - r * math.cos(eff) * scale
-                        if math.sin(eff) >= 0:
-                            poly.append((px, py))
-                        else:
-                            if len(poly) >= 2:
-                                self.canvas.create_line(*[c for p in poly for c in p], **style)
-                            poly = []
+        for run in runs:
+            poly = []
+            for x, r, a in run:
+                eff = math.radians(a) - az
+                px, py = ox - x * scale, oy - r * math.cos(eff) * scale
+                if math.sin(eff) >= 0:
+                    poly.append((px, py))
+                else:
                     if len(poly) >= 2:
                         self.canvas.create_line(*[c for p in poly for c in p], **style)
-        # Strand paths draw on top of everything else drawn synchronously (tank,
-        # warnings); keep the start marker, caption and calc indicator above
-        # that in turn.
-        self.canvas.tag_raise("start_marker")
-        self.canvas.tag_raise("caption")
-        self.canvas.tag_raise("calc_indicator")
+                    poly = []
+            if len(poly) >= 2:
+                self.canvas.create_line(*[c for p in poly for c in p], **style)
+
+    def _draw_progress(self):
+        # The tank as it should look at the continue point: every layup wound
+        # before it, in winding order -- one that covers the whole tank as a
+        # solid layer of its color (every band overlaps the next, so that's what
+        # the tank looks like), others and the point's own layup as the bands
+        # wound so far -- then the eye where it should be, and a marker.
+        self.canvas.delete("continue_marker", "eye")
+        if not self._view_geom or self._progress is None or self._progress[0] != self._progress_key():
+            return
+        progress = self._progress[1]
+        if isinstance(progress, Exception):
+            return
+        pal = self.app.canvas_palette
+        for li in range(progress.location.point.layup + 1):
+            if li in progress.covered and self._tank_outline:
+                color, _ = theme.layup_style(pal, li)
+                self.canvas.create_polygon(self._tank_outline, fill=color, outline=pal["tank_outline"], width=2,
+                                           tags="strand_path")
+            elif li in progress.runs:
+                self._draw_runs(li, progress.runs[li])
+        self._draw_eye(progress.location)
+        self._draw_marker(progress.location.x, "continue_marker",
+                          f"Continue here  X {progress.location.x:.1f}  A {progress.location.point.angle:.1f}°")
+        self._draw_caption()
+
+    def _draw_eye(self, location):
+        # The eye at the continue point, as in the G-Code Preview: its arm (in
+        # the eye-reach color) reaching up to the eye, drawn to scale across its
+        # width, keeping min_spacing from the tank.
+        job, (scale, ox, oy) = self._job, self._view_geom
+        pal = self.app.canvas_palette
+        px = ox - location.x * scale
+        eye_y = oy + (winding.Y_REFERENCE - job.eye_arm_length - location.y) * scale
+        base_y = oy + (winding.Y_REFERENCE - job.eye_arm_length) * scale
+        half_w = max(3.0, job.eye_width / 2 * scale)
+        self.canvas.create_line(px, base_y, px, eye_y, fill=pal["reach"], width=3, tags="eye")
+        self.canvas.create_rectangle(px - half_w, eye_y - 4, px + half_w, eye_y + 4, fill=pal["marker"],
+                                     outline=pal["marker_halo"], tags="eye")
 
     # --- View rotation (up/down arrows) ---
     # Velocity-based rather than a per-press "ease toward a target" animation: an
@@ -1029,10 +1180,10 @@ class PlanTab:
 
     def _update_indicator(self):
         self.canvas.delete("calc_indicator")
-        calculating = self._calc_thread is not None and self._calc_thread.is_alive()
-        if not calculating: return
+        calcs = (self._sim, self._prog)
+        if not any(c.busy for c in calcs): return
         pal = self.app.canvas_palette
-        if self._pending is not None:
+        if any(c.busy and c.pending is not None for c in calcs):
             # A newer change has already arrived and will start as soon as the
             # in-flight calculation finishes -- flag that the preview shown once
             # this one lands will immediately be stale.

@@ -83,9 +83,8 @@ class GoldenMaster(unittest.TestCase):
     """Pins the exact G-code body (everything after the settings header) so an
     unintended change to the motion shows up. Regenerate these deliberately,
     and only together with a change that is meant to alter the output. (Last
-    regenerated for the wind start: with homing, the program now moves to
-    Start Wind at X -- by default where the dome ends -- and pauses there, and
-    the first pass starts from it. WindStart checks the pattern is unchanged.)"""
+    regenerated for Pause After Each Layup, which adds a PAUSE between
+    layups -- only excel_style_zone has more than one.)"""
     CASES = {
         "default": (WindingJob(), 12018, "acd2c9e7a1f820065a678423382bc51a62ef071f792a1aab23a5ac551257ada2"),
         "flat_p1_optimized_nohome": (
@@ -105,7 +104,7 @@ class GoldenMaster(unittest.TestCase):
             WindingJob(tank_length=1640.0, tank_diameter=250.0, bandwidth=7.0, turnaround_zone=80.0,
                        layups=(Layup(passes=3, pattern_number=5, wind_angle=12.0, turnaround_angle=156.0),
                                Layup(passes=2, pattern_number=7, wind_angle=54.0, turnaround_angle=72.0))),
-            19025, "cf8ebda65d10ed5747601ba7aa4ca17bee50ebdb271c363938c587f01dc9919b"),
+            19027, "bda7b1cd0ddc12dd4b1e696d26a504c75ff541d818fae817f1ce4db7f5fb9da1"),
     }
 
     def test_output_unchanged(self):
@@ -239,12 +238,12 @@ class AutoCycles(unittest.TestCase):
 def gcode_moves(lines):
     """(dx, dy, da, feed) of every G1 exactly as the machine runs it, from the
     written coordinates, starting at the machine origin (where G28 leaves it):
-    axes a G1 doesn't name keep their position, and A is tracked across the
-    "G92 A0" resets."""
+    axes a G1 doesn't name keep their position, and A follows the "G92 A..."
+    redefinitions."""
     moves, pos = [], [0.0, 0.0, 0.0]
     for ln in lines:
         if ln.startswith("G92"):
-            pos[2] = 0.0
+            pos[2] = float(ln.split("A", 1)[1])
             continue
         if not ln.startswith("G1"):
             continue
@@ -381,6 +380,101 @@ class WindStart(unittest.TestCase):
         value = winding.LEGACY_VALUES["start_x"]
         self.assertEqual(value(settings) if callable(value) else value, 75.0)
         self.assertIs(winding.LEGACY_VALUES["start_x_auto"], False)
+
+
+TWO_LAYUPS = WindingJob(layups=(Layup(passes=2, pattern_number=3), Layup(passes=2, pattern_number=5, wind_angle=70.0)))
+
+
+def partial(job, point, rehome=False):
+    buf = io.StringIO()
+    winding.write_gcode(buf, job, resume=winding.Resume(point, rehome))
+    return buf.getvalue().splitlines()
+
+
+class PauseAfterLayup(unittest.TestCase):
+    def test_pause_between_layups_only(self):
+        lines = gcode(TWO_LAYUPS)
+        i = lines.index("; LAYUP_START:2")
+        self.assertEqual(lines[i - 1], "PAUSE")
+        self.assertEqual(lines[i - 3:i - 1][0], "G92 A0")  # after the last cycle's reset
+        self.assertEqual(sum(ln == "PAUSE" for ln in lines), 2)  # plus the one at the wind start
+        self.assertNotEqual(lines[-1], "PAUSE")
+
+    def test_can_be_switched_off(self):
+        job = WindingJob(pause_after_layup=False, layups=TWO_LAYUPS.layups)
+        self.assertEqual(sum(ln == "PAUSE" for ln in gcode(job)), 1)
+
+
+class PartialProgram(unittest.TestCase):
+    def test_from_a_layup_start_is_the_complete_programs_tail(self):
+        full, part = gcode(TWO_LAYUPS), partial(TWO_LAYUPS, winding.ProgramPoint(1, 0, 0.0))
+        tail = lambda lines: lines[lines.index("; LAYUP_START:2") + 1:]
+        self.assertEqual(tail(part), tail(full))
+        self.assertNotIn("G28", part)  # the eye is already there
+        self.assertNotIn("PAUSE", part)  # the pause this continues from has been had
+
+    def test_from_mid_cycle_continues_in_the_machines_a_frame(self):
+        point = winding.ProgramPoint(0, 1, 500.0)
+        part = partial(TWO_LAYUPS, point)
+        body = part[part.index("; -----------------------") + 2:]
+        self.assertEqual(body[0], "G92 A500.000")  # the machine's A there is declared
+        location = winding.locate(TWO_LAYUPS, point)
+        self.assertEqual(body[1].split()[1:4], [f"X{location.x:.3f}", f"Y{location.y:.3f}", "A500.000"])
+        # From there on, the same lines as the complete program.
+        full = gcode(TWO_LAYUPS)
+        rest = body[body.index("; LAYUP_START:1") + 2:]  # skip the cut-short first move
+        start = full.index(rest[0])
+        self.assertEqual(full[start:start + len(rest)], rest)
+        self.assertEqual(full[start:], rest)
+
+    def test_the_rest_of_the_wind_is_exactly_what_remains(self):
+        point = winding.ProgramPoint(1, 1, 250.0)
+        location = winding.locate(TWO_LAYUPS, point)
+        whole = winding.simulate(TWO_LAYUPS).total_time
+        moves = gcode_moves(partial(TWO_LAYUPS, point))
+        start = next(i for i, (dx, dy, da, f) in enumerate(moves) if da > 0)  # skip the positioning
+        remaining = sum(math.sqrt(dx * dx + dy * dy + da * da) / f * 60 for dx, dy, da, f in moves[start:])
+        self.assertAlmostEqual(location.elapsed + remaining, whole, delta=whole * 0.002)
+
+    def test_rehome_homes_x_and_y_moves_there_and_pauses(self):
+        point = winding.ProgramPoint(1, 0, 120.0)
+        part = partial(TWO_LAYUPS, point, rehome=True)
+        body = part[part.index("; -----------------------") + 2:]
+        self.assertEqual(body[0], "G28 X Y")  # the mandrel keeps its angle
+        pause = body.index("PAUSE")
+        self.assertEqual(body[pause + 1], "G92 A120.000")
+        location = winding.locate(TWO_LAYUPS, point)
+        travel = [ln for ln in body[:pause] if ln.startswith("G1")]
+        self.assertTrue(travel[0].startswith("G1 Y0.000"))
+        self.assertAlmostEqual(float(travel[-1].split()[1][1:]), location.y, places=3)
+
+    def test_header_records_how_it_was_made(self):
+        resume = winding.Resume(winding.ProgramPoint(1, 1, 42.5), rehome=True)
+        buf = io.StringIO()
+        winding.write_gcode(buf, TWO_LAYUPS, resume=resume)
+        self.assertEqual(winding.resume_from_header(parse_header(buf.getvalue().splitlines())), resume)
+        self.assertIsNone(winding.resume_from_header(parse_header(gcode(TWO_LAYUPS))))
+
+    def test_points_that_dont_exist(self):
+        for point, message in ((winding.ProgramPoint(5, 0, 0.0), "There is no Layup 6."),
+                               (winding.ProgramPoint(0, 2, 0.0), "Layup 1 has cycles 1 to 2."),
+                               (winding.ProgramPoint(0, 0, -1.0), "can't be negative")):
+            with self.assertRaises(winding.PointError) as ctx:
+                winding.locate(TWO_LAYUPS, point)
+            self.assertIn(message, str(ctx.exception))
+        with self.assertRaises(winding.PointError) as ctx:
+            winding.locate(TWO_LAYUPS, winding.ProgramPoint(0, 0, 1e6))
+        self.assertIn("ends at A", str(ctx.exception))
+
+    def test_progress_shows_what_is_wound(self):
+        # Before the point: full-coverage layups as a solid layer, the point's
+        # own layup as the bands wound so far.
+        job = WindingJob(layups=(Layup(auto_cycles=True), Layup(passes=3, wind_angle=70.0)))
+        progress = winding.progress(job, winding.ProgramPoint(1, 1, 100.0))
+        self.assertEqual(progress.covered, (0,))
+        self.assertEqual(list(progress.runs), [1])
+        # A full cycle (3 circuits out and back) plus the start of the next.
+        self.assertGreaterEqual(len(progress.runs[1]), 6)
 
 
 class TurnaroundZone(unittest.TestCase):

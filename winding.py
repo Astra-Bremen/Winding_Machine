@@ -11,6 +11,7 @@ cycles with its own winding angle, pattern number and turnaround dwell, one
 after the other on the same tank; the tank geometry, machine settings, tow
 width and trajectory optimization are shared by the whole program.
 """
+import itertools
 import math
 from dataclasses import dataclass, field, fields, replace
 from typing import NamedTuple
@@ -90,6 +91,8 @@ class WindingJob:
     # rotation at the end. 0 = pure rotation at the end. See compute_dwell_blend.
     turnaround_zone: float = 80.0
     optimize_trajectory: bool = False
+    # PAUSE between layups, so the fiber can be checked after every pattern change.
+    pause_after_layup: bool = True
     layups: tuple = field(default=(Layup(),))
 
     def __post_init__(self):
@@ -169,6 +172,7 @@ AUTO_FLAGS = {"passes": "auto_cycles", "start_x": "start_x_auto"}
 # never changes the path.)
 LEGACY_VALUES = {
     "turnaround_zone": 0.0,
+    "pause_after_layup": False,
     # Those winds started at the tank's chuck-side end.
     "start_x_auto": False,
     "start_x": lambda settings: float(settings["chuck_offset"]),
@@ -758,27 +762,66 @@ class SimulationResult:
     layups: list  # one LayupResult per job layup
 
 
+class _RunRecorder:
+    """Collects raw (x, r, angle_deg) strand points from a stream of Moves for
+    the 3D previews, instead of pre-projected screen coordinates -- the
+    front/back split and (px, py) projection depend on the viewer's chosen
+    azimuth, which can change (e.g. via the rotate-view buttons) without
+    re-running the program, so that work is left to the caller. Points are
+    grouped into "runs": one per single-direction traversal, broken at every
+    turnaround (a pure-rotation dwell or, with a turnaround zone, wherever the
+    traverse reverses), so the caller knows which points to connect."""
+
+    def __init__(self, geom):
+        self.geom = geom
+        self.run = self.key = self.sink = None
+
+    def add(self, ev, prev, sink):
+        # `prev` is the (x, r, angle) the move starts from; `sink` the list its
+        # run belongs in, or None to leave the move out.
+        x0, _, a0 = prev
+        key = None if ev.dwell or sink is None else (ev.layup, ev.circuit, ev.x > x0)
+        if self.run is not None and key != self.key:
+            self.close()
+        if key is None:
+            return
+        if self.run is None:
+            self.run, self.key, self.sink = [prev], key, sink
+        # STEP_SIZE is a fixed X distance, not an angular one, so near the steep
+        # end of the wind-angle range (where pitch shrinks toward the tow width)
+        # a single step can sweep close to -- or, right at the computed max
+        # angle, exactly -- a full revolution. Recording only the step's
+        # endpoint then aliases the helix for rendering: whole visible arcs can
+        # fall entirely between two samples (dropped strand segments), and at the
+        # point where one step's sweep is an exact multiple of 360 deg, every
+        # sample lands at the same rotational phase, which flattens the drawn
+        # path into what looks like a shallow straight line instead of a tight
+        # helix. Subdividing by rotation (not distance) fixes the rendering
+        # without touching the motion or the time/tow accumulation, so the
+        # G-code this mirrors is completely unaffected; only how densely the
+        # already-correct path gets sampled for drawing changes.
+        a_delta = ev.a - a0
+        n_sub = max(1, min(60, math.ceil(abs(a_delta) / RENDER_MAX_DEG_PER_STEP)))
+        for k in range(1, n_sub + 1):
+            frac = k / n_sub
+            fx = x0 + (ev.x - x0) * frac
+            fr = ev.r if k == n_sub else self.geom.radius(fx)
+            self.run.append((fx, fr, a0 + a_delta * frac))
+
+    def close(self):
+        if self.run is not None:
+            self.sink.append(self.run)
+        self.run = self.key = self.sink = None
+
+
 def simulate(job):
     """Runs the whole program for the time/tow estimates, and records each
-    layup's first-cycle strand paths for the 3D preview.
-
-    Returns raw (x, r, angle_deg) points per strand/run instead of pre-projected
-    screen coordinates -- the front/back split and (px, py) projection depend on
-    the viewer's chosen azimuth, which can change (e.g. via the rotate-view
-    buttons) without re-running this simulation, so that work is left to the
-    caller. Points are grouped into "runs" (one per single-direction traversal,
-    i.e. broken at every turnaround) so the caller knows which points are
-    meant to be connected by a line and which are not.
-    """
+    layup's first-cycle strand paths for the 3D preview (see _RunRecorder)."""
     geom = _tank_geometry(job)
     results = [LayupResult(strand_runs=[[] for _ in range(l.pattern_number)]) for l in job.layups]
     total_time, total_tow = 0.0, 0.0
-    x_prev, a_prev = job.wind_start_x, 0.0
-    r_prev = geom.radius(x_prev)
-    # The run being recorded, and the (layup, circuit, X direction) it belongs
-    # to. A run ends at a pure-rotation dwell, or -- with a turnaround zone,
-    # where there is none -- wherever the traverse reverses direction.
-    current_run, run_key = None, None
+    recorder = _RunRecorder(geom)
+    prev = (job.wind_start_x, geom.radius(job.wind_start_x), 0.0)
     for ev in iter_program(job):
         if type(ev) is not Move:
             continue
@@ -786,39 +829,125 @@ def simulate(job):
         res = results[ev.layup]
         res.time += ev.duration
         res.tow += ev.tow
-        key = None if ev.dwell else (ev.layup, ev.circuit, ev.x > x_prev)
-        if current_run is not None and key != run_key:
-            results[run_key[0]].strand_runs[run_key[1]].append(current_run)
-            current_run = None
-        if key is not None and ev.circuit < job.layups[ev.layup].pattern_number:
-            if current_run is None:
-                current_run, run_key = [(x_prev, r_prev, a_prev)], key
-            # STEP_SIZE is a fixed X distance, not an angular one, so near the
-            # steep end of the wind-angle range (where pitch shrinks toward the
-            # tow width) a single step can sweep close to -- or, right at the
-            # computed max angle, exactly -- a full revolution. Recording only
-            # the step's endpoint then aliases the helix for rendering: whole
-            # visible arcs can fall entirely between two samples (dropped strand
-            # segments), and at the point where one step's sweep is an exact
-            # multiple of 360 deg, every sample lands at the same rotational
-            # phase, which flattens the drawn path into what looks like a
-            # shallow straight line instead of a tight helix. Subdividing by
-            # rotation (not distance) fixes the rendering without touching the
-            # motion or the time/tow accumulation above, so the G-code this
-            # mirrors is completely unaffected; only how densely the
-            # already-correct path gets sampled for drawing changes.
-            a_delta = ev.a - a_prev
-            n_sub = max(1, min(60, math.ceil(abs(a_delta) / RENDER_MAX_DEG_PER_STEP)))
-            for k in range(1, n_sub + 1):
-                frac = k / n_sub
-                fx = x_prev + (ev.x - x_prev) * frac
-                fa = a_prev + a_delta * frac
-                fr = ev.r if k == n_sub else geom.radius(fx)
-                current_run.append((fx, fr, fa))
-        x_prev, r_prev, a_prev = ev.x, ev.r, ev.a
-    if current_run is not None:
-        results[run_key[0]].strand_runs[run_key[1]].append(current_run)
+        first_cycle = ev.circuit < job.layups[ev.layup].pattern_number
+        recorder.add(ev, prev, res.strand_runs[ev.circuit] if first_cycle else None)
+        prev = (ev.x, ev.r, ev.a)
+    recorder.close()
     return SimulationResult(total_time, total_tow, results)
+
+
+# --- Continuing an interrupted wind ---
+
+class ProgramPoint(NamedTuple):
+    """A point in the program to continue an interrupted wind from."""
+    layup: int      # 0-based
+    cycle: int      # 0-based, within the layup
+    # Mandrel angle since the cycle began (deg): exactly the A the machine
+    # shows, since A is reset to 0 at every cycle. The mandrel never turns
+    # backwards, so within a cycle it pins down a single point -- unlike X,
+    # which every pass crosses.
+    angle: float = 0.0
+
+
+class Resume(NamedTuple):
+    """How a partial program continues from `point`. With `rehome` (for a
+    severed fiber), it homes X and Y, moves the eye to the point and pauses so
+    the fiber can be reattached; without it, the eye must already be there."""
+    point: ProgramPoint
+    rehome: bool = False
+
+
+class PointError(ValueError):
+    """The requested point doesn't exist in the program."""
+
+
+class Location(NamedTuple):
+    point: ProgramPoint
+    x: float
+    y: float
+    r: float            # tank radius under the eye
+    a: float            # continuous mandrel angle
+    a_offset: float     # continuous angle at the start of the point's cycle (A = a - a_offset)
+    elapsed: float      # seconds of winding before the point
+    tow: float          # mm of tow laid before the point
+    cycle_number: int   # the point's cycle, 1-based across the whole program
+
+
+def _check_point(job, point):
+    if not 0 <= point.layup < len(job.layups):
+        raise PointError(f"There is no Layup {point.layup + 1}.")
+    passes = job.layups[point.layup].passes
+    if not 0 <= point.cycle < passes:
+        raise PointError(f"Layup {point.layup + 1} has cycles 1 to {passes}.")
+    if point.angle < 0:
+        raise PointError("The mandrel angle can't be negative.")
+
+
+def _walk_to(job, point, on_move=None):
+    """Walks the program up to `point`. Returns (location, rest), where `rest`
+    iterates the program's events from the point on -- starting with what's
+    left of the move the point lies on. `on_move(move, prev)` is shown every
+    move before the point (the last one cut off at it), with `prev` the
+    (x, r, angle) it starts from. Raises PointError for a point that doesn't
+    exist, e.g. an angle beyond the end of its cycle."""
+    _check_point(job, point)
+    geom = _tank_geometry(job)
+    events = iter_program(job)
+    layup, cycle, a_offset, cycle_number = -1, 0, 0.0, 1
+    px, py = start_position(job)
+    pa, pr = 0.0, geom.radius(px)
+    elapsed = tow = 0.0
+    for ev in events:
+        kind = type(ev)
+        if kind is LayupStart:
+            layup, cycle = ev.index, 0
+            continue
+        if kind is CycleComplete:
+            if (layup, cycle) == (point.layup, point.cycle):
+                raise PointError(f"Cycle {point.cycle + 1} of Layup {point.layup + 1} ends at "
+                                 f"A {pa - a_offset:.1f}°.")
+            a_offset, cycle, cycle_number = ev.a, cycle + 1, cycle_number + 1
+            continue
+        if (layup, cycle) == (point.layup, point.cycle) and point.angle <= ev.a - a_offset + 1e-6:
+            start = pa - a_offset
+            f = 0.0 if point.angle <= start else (point.angle - start) / (ev.a - a_offset - start)
+            x, y, a = px + (ev.x - px) * f, py + (ev.y - py) * f, pa + (ev.a - pa) * f
+            r = geom.radius(x)
+            if on_move is not None and f > 0:
+                on_move(Move(x, y, a, ev.feed, ev.duration * f, ev.tow * f, r, ev.layup, ev.circuit, ev.dwell), (px, pr, pa))
+            location = Location(point, x, y, r, a, a_offset, elapsed + ev.duration * f, tow + ev.tow * f, cycle_number)
+            rest = [] if f >= 1 - 1e-12 else [
+                Move(ev.x, ev.y, ev.a, ev.feed, ev.duration * (1 - f), ev.tow * (1 - f), ev.r, ev.layup, ev.circuit, ev.dwell)]
+            return location, itertools.chain(rest, events)
+        if on_move is not None:
+            on_move(ev, (px, pr, pa))
+        elapsed, tow = elapsed + ev.duration, tow + ev.tow
+        px, py, pa, pr = ev.x, ev.y, ev.a, ev.r
+    raise PointError("That point is past the end of the program.")
+
+
+def locate(job, point):
+    """Where the machine is at `point` (a Location). Raises PointError."""
+    return _walk_to(job, point)[0]
+
+
+class Progress(NamedTuple):
+    """How the tank looks at a point of the program, for the preview."""
+    location: Location
+    covered: tuple      # earlier layups that cover the whole tank: drawn as a solid layer
+    # layup -> raw (x, r, angle) runs of every pass wound so far (see
+    # _RunRecorder), for the point's own layup and any earlier one with gaps.
+    runs: dict
+
+
+def progress(job, point):
+    _check_point(job, point)
+    covered = tuple(i for i in range(point.layup) if plan_layup(job, job.layups[i]).coverage >= 0.995)
+    runs = {i: [] for i in range(point.layup + 1) if i not in covered}
+    recorder = _RunRecorder(_tank_geometry(job))
+    location, _ = _walk_to(job, point, lambda ev, prev: recorder.add(ev, prev, runs.get(ev.layup)))
+    recorder.close()
+    return Progress(location, covered, runs)
 
 
 # --- G-code file format ---
@@ -873,6 +1002,32 @@ def layups_from_header(settings):
     return None
 
 
+def resume_items(resume):
+    """Settings-header entries recording how a partial program was built, so
+    reopening the file restores the conditions it continues from."""
+    p = resume.point
+    return [("partial", True), ("partial_layup", p.layup + 1), ("partial_cycle", p.cycle + 1),
+            ("partial_angle", f"{p.angle:.3f}"), ("partial_rehome", resume.rehome)]
+
+
+def resume_from_header(settings):
+    """The Resume a partial program was built with, from its parsed settings
+    header -- or None for a complete program."""
+    if settings.get("partial", "").strip().lower() != "true":
+        return None
+    try:
+        point = ProgramPoint(int(float(settings["partial_layup"])) - 1, int(float(settings["partial_cycle"])) - 1,
+                             float(settings["partial_angle"]))
+    except (KeyError, ValueError):
+        return None
+    return Resume(point, settings.get("partial_rehome", "").strip().lower() == "true")
+
+
+def _set_a(angle):
+    # "G92 A<angle>": declares the mandrel's current angle without moving it.
+    return "G92 A0" if abs(angle) < 5e-4 else f"G92 A{angle:.3f}"
+
+
 def _rotation_limited_feed(dx, dy, da, max_a_speed):
     # G-code F is the speed along the whole (X, Y, A) move, so the mandrel
     # turns at F * |da| / length. The largest whole F that keeps that at or
@@ -894,15 +1049,15 @@ def _split_travel(start, end, max_distance):
     return [start + (end - start) * k / n for k in range(1, n + 1)]
 
 
-def _write_move_to_start(out, job, x, y):
-    # After homing, bring the eye to the wind's start without crossing the
-    # tank: pull it fully back first (Y0 is the far end of its travel, away
-    # from the tank; G28 normally leaves it there already), travel along X,
-    # and only then move in to winding distance at the start. Then PAUSE, so
-    # the fiber can be attached there before winding begins; the wind resumes
-    # from the machine. Assumes G28 leaves the carriage at X0 Y0, the app's
-    # machine origin. Travel runs at Max Rotation Speed's rate along the move,
-    # split like every other move so none takes longer than Max Move Time.
+def _write_move_to_start(out, job, x, y, message, angle=0.0):
+    # After homing, bring the eye to (x, y) without crossing the tank: pull it
+    # fully back first (Y0 is the far end of its travel, away from the tank;
+    # G28 normally leaves it there already), travel along X, and only then
+    # move in to winding distance. Then PAUSE, so the fiber can be attached
+    # there; winding resumes from the machine. Assumes G28 leaves the carriage
+    # at X0 Y0, the app's machine origin. Travel runs at Max Rotation Speed's
+    # rate along the move, split like every other move so none takes longer
+    # than Max Move Time.
     feed = int(job.max_a_speed)
     max_distance = feed / 60.0 * job.max_move_time
     out.write("; --- MOVE TO WIND START ---\n")
@@ -911,39 +1066,66 @@ def _write_move_to_start(out, job, x, y):
         out.write(f"G1 X{xi:.3f} F{feed}\n")
     for yi in _split_travel(0.0, y, max_distance):
         out.write(f"G1 Y{yi:.3f} F{feed}\n")
-    out.write("; Attach the fiber here, then resume on the machine to start winding\n")
+    out.write(f"; {message}\n")
     out.write("PAUSE\n")
     # The mandrel may have been turned by hand while attaching the fiber: its
-    # angle at resume becomes the wind's zero (the pattern is relative anyway),
-    # so the first move doesn't turn it back.
-    out.write("G92 A0\n")
+    # angle at resume is declared to be `angle` (the wind's zero, or the A of
+    # the point a partial program continues from), so the first move doesn't
+    # turn it back.
+    out.write(_set_a(angle) + "\n")
 
 
-def write_gcode(out, job, start_gcode="", end_gcode=""):
-    """Writes the complete program for `job` to the text stream `out`. The job
-    must pass validate()."""
+def write_gcode(out, job, start_gcode="", end_gcode="", resume=None):
+    """Writes the program for `job` to the text stream `out`; the job must pass
+    validate(). With a Resume, writes a partial program instead: the same
+    moves as the complete one from resume.point on, in the same A frame, so it
+    continues an interrupted wind seamlessly (raises PointError for a point
+    that doesn't exist)."""
     out.write("; --- WINDER SETTINGS ---\n")
-    for key, value in settings_items(job):
+    for key, value in settings_items(job) + (resume_items(resume) if resume else []):
         out.write(f"; {key}: {value}\n")
     out.write(f"; ld: {job.dome_length:.3f}\n; -----------------------\n\n")
-    x, y = start_position(job)
-    if job.home_before_wind:
-        out.write("G28\n")
-        _write_move_to_start(out, job, x, y)
+    if resume is None:
+        x, y = start_position(job)
+        angle = a_offset = 0.0
+        events = iter_program(job)
+        if job.home_before_wind:
+            out.write("G28\n")
+            _write_move_to_start(out, job, x, y, "Attach the fiber here, then resume on the machine to start winding")
+        else:
+            # Skip homing: just define wherever the carriage/mandrel currently
+            # is as the zero reference for this wind, without moving.
+            out.write("G92 A0\n")
     else:
-        # Skip homing: just define wherever the carriage/mandrel currently
-        # is as the zero reference for this wind, without moving.
-        out.write("G92 A0\n")
+        location, events = _walk_to(job, resume.point)
+        x, y, a_offset = location.x, location.y, location.a_offset
+        angle = location.a - location.a_offset
+        if resume.rehome:
+            # X and Y only: the mandrel keeps its angle, so the fiber already
+            # wound stays lined up with the rest of the program.
+            out.write("G28 X Y\n")
+            _write_move_to_start(out, job, x, y, "Reattach the fiber here, then resume on the machine to continue winding",
+                                 angle)
+        else:
+            # The eye is already at the point; the mandrel's angle there is
+            # declared to be the program's A at the point.
+            out.write(_set_a(angle) + "\n")
     if start_gcode: out.write(start_gcode + "\n")
     # No rotation is planned here, and with F = Max Rotation Speed any rotation
     # the machine does need (e.g. an A axis not homed to 0) can't be faster.
-    out.write(f"G1 X{x:.3f} Y{y:.3f} A{0.0:.3f} F{int(job.max_a_speed)}\n")
+    out.write(f"G1 X{x:.3f} Y{y:.3f} A{angle:.3f} F{int(job.max_a_speed)}\n")
+    if resume is not None:
+        out.write(f"; LAYUP_START:{resume.point.layup + 1}\n")
+    _write_events(out, job, events, x, y, angle, a_offset)
+    if end_gcode: out.write(end_gcode + "\n")
+
+
+def _write_events(out, job, events, x, y, angle, a_offset):
     # The machine executes the coordinates as written (3 decimals), so feed
     # rates are computed from those -- relative to the previous written
     # position -- not from the unrounded ones.
-    wx, wy, wa = float(f"{x:.3f}"), float(f"{y:.3f}"), 0.0
-    a_offset = 0.0
-    for ev in iter_program(job):
+    wx, wy, wa = float(f"{x:.3f}"), float(f"{y:.3f}"), float(f"{angle:.3f}")
+    for ev in events:
         if type(ev) is Move:
             gx, gy, ga = f"{ev.x:.3f}", f"{ev.y:.3f}", f"{(ev.a - a_offset):.3f}"
             nx, ny, na = float(gx), float(gy), float(ga)
@@ -957,5 +1139,9 @@ def write_gcode(out, job, start_gcode="", end_gcode=""):
             out.write("G92 A0\n")
             a_offset, wa = ev.a, 0.0
         else:
+            if ev.index > 0 and job.pause_after_layup:
+                # The pattern changes here: stop so the fiber can be checked
+                # (e.g. for slipping) before the next layup starts.
+                out.write(f"; Layup {ev.index} complete - check the fiber, then resume on the machine\n")
+                out.write("PAUSE\n")
             out.write(f"; LAYUP_START:{ev.index + 1}\n")
-    if end_gcode: out.write(end_gcode + "\n")

@@ -134,6 +134,8 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     # name (e.g. "Nav.secondary.Outline.TButton") makes ttkbootstrap build that
     # color style app-wide, which restyles other buttons that reference it.
     style.configure("SettingsHeader.TLabel", font=("TkDefaultFont", header_size, "bold"))
+    # A page's title in the settings panel (the partial-export page).
+    style.configure("PageTitle.TLabel", font=("TkDefaultFont", header_size + 2, "bold"))
     style.configure("Nav.TButton", font=("TkDefaultFont", header_size + 1, "bold"), padding=(2, 0))
     # The settings panel's action buttons: Generate filled, Open outlined, both
     # in the theme's primary color. ttkbootstrap only builds a color style once
