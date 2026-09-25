@@ -5,8 +5,10 @@ import math
 import threading
 import queue
 import time
+import strength
 import theme
 import winding
+from ttkbootstrap.widgets.tooltip import ToolTip
 
 # (label, settings key) for every entry field, grouped as they appear in the
 # settings panel. Machine/Tank/Winding Settings are global to the whole program;
@@ -34,6 +36,8 @@ FIELD_LABELS = {key: label for label, key in MACHINE_FIELDS + [START_X_FIELD] + 
 # set an entry's font; it has to be given to the widget itself).
 FIELD_FONT = ("TkDefaultFont", 8)
 LEGEND_FONT = ("TkDefaultFont", 8)
+# The Estimates sidebar's rows: compact, a notch below the app's body text.
+ESTIMATE_FONT = ("TkDefaultFont", 9)
 LEGEND_FONT_ACTIVE = ("TkDefaultFont", 8, "bold")
 SWATCH_W, SWATCH_H = 24, 12
 
@@ -41,6 +45,12 @@ SWATCH_W, SWATCH_H = 24, 12
 def format_hms(seconds):
     h, m = divmod(int(seconds), 3600); m, s = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def short_time(seconds):
+    # "2:37" for short durations, "1:02:37" from an hour on.
+    h, m = divmod(int(seconds), 3600); m, s = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _set_if_changed(var, value):
@@ -231,6 +241,7 @@ class PlanTab:
         self._prog = _BackgroundCalc(lambda key: winding.progress(*key), self._apply_progress_result)
         self._result = None        # (job, winding.SimulationResult) of the last finished simulation
         self._progress = None      # ((job, point), winding.Progress) of the last finished progress
+        self.estimate = None       # (job, strength.Material, strength.Estimate) shown in the estimates
         self._job = None           # job currently shown; None while a field holds invalid input
         self._sim_blocked = False  # True while the current job can't be simulated at all
         self._view_geom = None     # (scale, ox, oy) the tank is currently drawn with
@@ -452,54 +463,66 @@ class PlanTab:
         self.on_cap_type_change()
 
     def _build_estimates_panel(self, parent):
-        # Two groups: "Program" figures cover the whole winding program (every
-        # layup back to back); the second group covers only the layup currently
-        # selected in the settings panel, and follows the layup switcher.
-        panel = ttk.Frame(parent, padding=(10, 0))
+        # A slim sidebar beside the pattern preview with two stacked groups:
+        # "Program" (the whole wind, every layup back to back) and the layup
+        # selected in the settings panel, which follows the layup switcher.
+        # Compact rows -- a short label and one value, or two related ones
+        # ("1169 m · 1.87 kg": the tow's length and its dry fiber mass).
+        # Hovering a row says what it shows; clicking the rotation or X-speed
+        # changes their units. The masses and the safety factor come from
+        # strength.estimate(), set up in the Strength & Materials window.
+        panel = ttk.Frame(parent, padding=(12, 0, 2, 0))
         panel.pack(side=tk.RIGHT, fill=tk.Y)
         panel.columnconfigure(1, weight=1)
-        heading_font = ("TkHeadingFont", 10, "bold")
-        self.est = {}
-        row = 0
+        self.est, self._est_values = {}, {}
 
         def heading(text=None, textvariable=None, top=0):
-            nonlocal row
-            ttk.Label(panel, text=text, textvariable=textvariable, font=heading_font).grid(
-                row=row, column=0, columnspan=2, sticky="w", pady=(top, 4))
-            row += 1
+            ttk.Label(panel, text=text, textvariable=textvariable, font=("TkHeadingFont", 10, "bold")).grid(
+                row=panel.grid_size()[1], column=0, columnspan=2, sticky="w", pady=(top, 3))
 
-        def estimate(key, name, initial, style=None, on_click=None):
-            nonlocal row
-            self.est[key] = tk.StringVar(value=initial)
-            ttk.Label(panel, text=name).grid(row=row, column=0, sticky="w", pady=1, padx=(0, 14))
-            value = ttk.Label(panel, textvariable=self.est[key], anchor="e", **({"style": style} if style else {}))
+        def estimate(key, name, tip, style=None, on_click=None):
+            row = panel.grid_size()[1]
+            self.est[key] = tk.StringVar(value="--")
+            name_label = ttk.Label(panel, text=name, font=ESTIMATE_FONT)
+            name_label.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=1)
+            value = ttk.Label(panel, textvariable=self.est[key], anchor="e", font=ESTIMATE_FONT,
+                              **({"style": style} if style else {}))
             value.grid(row=row, column=1, sticky="e", pady=1)
+            for widget in (name_label, value):
+                ToolTip(widget, text=tip, wraplength=260, delay=500)
             if on_click:
-                # Clickable to cycle units, styled identically to every other
-                # readout here (no color/underline) so it doesn't announce itself
-                # -- just a cursor change on hover as the only hint.
+                # Styled identically to every other readout (no color/underline)
+                # so it doesn't announce itself -- the hand cursor and the
+                # tooltip are the hints.
                 value.configure(cursor="hand2")
                 value.bind("<Button-1>", on_click)
-            row += 1
-            return value
+            self._est_values[key] = value
 
         heading("Program")
-        estimate("time", "Time", "00:00:00")
-        estimate("tow", "Required Tow", "0.00 m")
-        estimate("cycles", "Cycles", "-")
-        estimate("rotation", "Rotation Speed", "0.0 rpm", on_click=self._cycle_rotation_speed_unit)
-        estimate("reach", "Eye Reach", "- to - mm", style="warning.TLabel")
-        self.layup_heading_var = tk.StringVar(value="Layup 1")
-        heading(textvariable=self.layup_heading_var, top=12)
-        estimate("layup_time", "Time", "00:00:00")
-        estimate("cycle_time", "Time (1 Cycle)", "00:00:00")
-        estimate("layup_tow", "Required Tow", "0.00 m")
-        estimate("xspeed", "X-Speed", "0.00 mm/s", on_click=self._cycle_xspeed_unit)
-        estimate("coverage", "Cycles for Full Coverage", "-")
-        # How much of the surface the layup's bands cover with its Number of
-        # Cycles; shown in the warning color while gaps would remain.
-        self._coverage_label = estimate("coverage_pct", "Coverage", "-")
-        estimate("extra", "Extra Rotation", "-- / --")
+        estimate("time", "Time", "Total winding time · cycles in all layups together.")
+        estimate("tow", "Tow", "Tow length · its dry fiber mass (set up in Strength & Materials).")
+        estimate("resin", "Resin", "Resin mass for that fiber (set up in Strength & Materials).")
+        estimate("rotation", "Rotation", "Mandrel speed at Max Rotation Speed. Click to change units.",
+                 on_click=self._cycle_rotation_speed_unit)
+        estimate("reach", "Eye Reach", "How close to and how far from the tank axis the eye can get across its "
+                                       "Y travel.", style="warning.TLabel")
+        estimate("safety_factor", "Safety Factor", "Rough strength estimate at the operating pressure: allowable "
+                                                   "÷ actual hoop stress (Strength & Materials). Orange below 1.")
+        ttk.Button(panel, text="Strength & Materials…", style="primary.Outline.TButton",
+                   command=self.app.show_strength_dialog).grid(row=panel.grid_size()[1], column=0, columnspan=2,
+                                                               sticky="ew", pady=(6, 0))
+
+        self.layup_heading_var = tk.StringVar(value="Layup")
+        heading(textvariable=self.layup_heading_var, top=14)
+        estimate("layup_time", "Time", "This layup's winding time · its average time per cycle.")
+        estimate("layup_tow", "Tow", "This layup's tow length · its dry fiber mass.")
+        estimate("layup_resin", "Resin", "Resin mass for this layup's fiber.")
+        estimate("xspeed", "X-Speed", "Carriage speed along the straight section. Click to change units.",
+                 on_click=self._cycle_xspeed_unit)
+        estimate("coverage", "Coverage", "How much of the surface the layup's bands cover · the fewest cycles "
+                                         "that cover it completely. Orange while gaps remain.")
+        estimate("extra", "Extra Rotation", "Alignment rotation added at the far-end / chuck-side turnaround "
+                                            "(first circuit), on top of the dwell angle.")
 
         # Raw values cached in their base unit so clicking just re-formats them,
         # with no recalculation needed -- rotation speed is always exactly Max
@@ -694,9 +717,12 @@ class PlanTab:
         self.redraw_timer = None
         pal = self.app.canvas_palette
         self.canvas.delete("all")
-        self.canvas.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"])
+        # Colors (and the border) are set on every redraw: ttkbootstrap's theme
+        # switch recolors plain Tk widgets and drops canvas borders.
+        self.canvas.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"], highlightthickness=1)
+        panel_bg = self.app.root.style.colors.bg
         for btn in self._rotate_buttons:
-            btn.configure(fg=pal["muted"], activeforeground=pal["tank"])
+            btn.configure(fg=pal["muted"], activeforeground=pal["tank"], bg=panel_bg, activebackground=panel_bg)
         self.generate_btn.config(state="disabled")
         self._view_geom = None
         c_w, c_h = self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -752,13 +778,18 @@ class PlanTab:
                                         job.end_cap_diameter, job.end_cap_type, job.dome_length)
         rt, rc = dt / 2, dc / 2
 
-        # Scale and offset: center the view on the tank's X-center (chuck_offset +
-        # tank_length/2), accounting for the shaft's extension further left of the
-        # tank so neither side of the drawing gets clipped off-canvas.
+        # Scale and offset: the tank as large as the canvas allows, centered.
+        # Across: the tank's X-center in the middle, with room for the shaft's
+        # extension beyond the tank and for X=0 (the chuck side) so neither
+        # side gets clipped. Down: the tank's diameter plus a band above for
+        # the markers' labels (and warnings) and one below for the caption.
+        # (The end view beside it shows the eye's reach, so no vertical room
+        # needs keeping for that here.)
+        top, bottom, side = 64, 40, 40
         half_extent = max(co + lt / 2.0, lt / 2.0 + 100)
-        scale = min((c_w / 2.0 - 40) / half_extent, (c_h - 100) / (winding.Y_REFERENCE + 100))
+        scale = max(0.01, min((c_w / 2.0 - side) / half_extent, (c_h - top - bottom) / max(dt, 1.0)))
         ox = c_w / 2.0 + (co + lt / 2.0) * scale
-        oy = 150
+        oy = top + (c_h - top - bottom) / 2.0
         self._view_geom = (scale, ox, oy)
 
         # Draw center line / shaft
@@ -887,9 +918,7 @@ class PlanTab:
         # Everything here is cheap closed-form math, so it updates instantly on
         # every change (and every layup switch) without the background simulation.
         eye_dist_min, eye_dist_max = winding.eye_reach(job.eye_arm_length)
-        self.est["reach"].set(f"{eye_dist_min:.0f} to {eye_dist_max:.0f} mm")
-        n = len(job.layups)
-        self.est["cycles"].set(f"{job.total_cycles}" + (f" in {n} layups" if n > 1 else ""))
+        self.est["reach"].set(f"{eye_dist_min:.0f}–{eye_dist_max:.0f} mm")
 
         # Rotation Speed and X-Speed both follow directly from Max Rotation
         # Speed (the machine's rotation is always governed by it exactly, see
@@ -900,55 +929,102 @@ class PlanTab:
         self._xspeed_mm_s = job.max_surface_speed / math.tan(math.radians(layup.wind_angle)) if angle_ok else 0.0
         self._update_xspeed_display()
 
-        cycles_needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number)
-        self.est["coverage"].set(str(cycles_needed) if cycles_needed else "-")
-
-        # Extra Rotation (within the layup's first cycle): the pattern-alignment
-        # "extra" rotation needed on top of the base turnaround dwell, split
-        # between the far-end (return) turnaround -- which gets the same fixed
-        # share every circuit -- and the chuck-end (starting position)
-        # turnaround, which absorbs the rest (see
+        # Coverage · the fewest cycles for full coverage. Extra Rotation: the
+        # pattern-alignment rotation on top of the dwell angle, split between
+        # the far-end (return) turnaround -- the same fixed share every circuit
+        # -- and the chuck-end turnaround, which absorbs the rest (see
         # compute_turnaround_balance_offset). Shown for the first circuit.
+        cycles_needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number)
+        gaps = False
         if angle_ok and layup.passes >= 1 and layup.pattern_number >= 1 and job.tank_diameter > 0 and job.bandwidth > 0:
             plan = winding.plan_layup(job, layup)
             left_offset = plan.extra_after(0, layup.pattern_number) - plan.right_offset
             self.est["extra"].set(f"{plan.right_offset:.1f}° / {left_offset:.1f}°")
-            coverage = plan.coverage
-            self.est["coverage_pct"].set(f"{coverage * 100:.0f} %")
-            # Rounded display, so compare against what's shown: "100 %" never
-            # turns orange over a sub-percent shortfall.
-            gaps = round(coverage * 100) < 100
-            self._coverage_label.configure(foreground=self.app.canvas_palette["warn_text"] if gaps else "")
+            percent = round(plan.coverage * 100)
+            self.est["coverage"].set(f"{percent} %" + (f" · min {cycles_needed} cyc" if cycles_needed else ""))
+            # Compared as shown (rounded): "100 %" never turns orange over a
+            # sub-percent shortfall.
+            gaps = percent < 100
         else:
             self.est["extra"].set("-- / --")
-            self.est["coverage_pct"].set("-")
-            self._coverage_label.configure(foreground="")
+            self.est["coverage"].set("--")
+        self._est_values["coverage"].configure(foreground=self.app.canvas_palette["warn_text"] if gaps else "")
 
     def _update_sim_estimates(self):
-        # Figures that need the full simulation. While a newer calculation is
-        # running they keep showing the previous result (the "Calculating..."
-        # indicator flags that); they're blanked only when the current settings
-        # can't be simulated at all.
-        keys = ("time", "tow", "layup_time", "cycle_time", "layup_tow")
+        # Figures that need the full simulation (time, tow, masses, strength).
+        # While a newer calculation is running they keep showing the previous
+        # result (the "Calculating..." indicator flags that); they're blanked
+        # only when the current settings can't be simulated at all.
+        self.refresh_estimate()
+
+    def simulation_for(self, job):
+        """The finished simulation of exactly `job`, if there is one."""
+        return self._result[1] if self._result is not None and self._result[0] == job else None
+
+    def refresh_estimate(self):
+        """Refreshes every simulation-based figure -- time, tow, masses and the
+        safety factor, which also depend on the Strength & Materials inputs --
+        and the Strength & Materials window, if it's open."""
+        self.estimate = None
+        sf_label = self._est_values["safety_factor"]
+        sf_label.configure(foreground="")
         if self._sim_blocked or self._result is None:
-            for key in keys: self.est[key].set("--")
+            for key in ("time", "tow", "resin", "safety_factor", "layup_time", "layup_tow", "layup_resin"):
+                self.est[key].set("--")
+            self._refresh_strength_dialog()
             return
         job, result = self._result
-        self.est["time"].set(format_hms(result.total_time))
-        self.est["tow"].set(f"{result.total_tow / 1000.0:.2f} m")
+        try:
+            material = self.app.build_material()
+        except winding.SettingsError:
+            material = None
+        if material is not None and strength.errors(material):
+            material = None
+        cycles = (self._job or job).total_cycles
+
+        def tow_text(tow_mm):
+            meters = tow_mm / 1000.0
+            length = f"{meters:.0f} m" if meters >= 100 else f"{meters:.1f} m"
+            if material is None:
+                return f"{length} · -- kg"
+            return f"{length} · {strength.masses(tow_mm, material)[0]:.2f} kg"
+
+        def resin_text(tow_mm):
+            return "-- kg" if material is None else f"{strength.masses(tow_mm, material)[1]:.2f} kg"
+
+        self.est["time"].set(f"{format_hms(result.total_time)} · {cycles} cyc")
+        self.est["tow"].set(tow_text(result.total_tow))
+        self.est["resin"].set(resin_text(result.total_tow))
         i = self.app.active_layup
         if i < len(result.layups):
             lr = result.layups[i]
-            self.est["layup_time"].set(format_hms(lr.time))
             # Average time per cycle -- individual cycles can vary a little (the
             # extra turnaround rotation that keeps the pattern aligned differs
-            # slightly cycle to cycle), so this is the layup's time split evenly
-            # across its number of cycles.
-            self.est["cycle_time"].set(format_hms(lr.time / max(1, job.layups[i].passes)))
-            self.est["layup_tow"].set(f"{lr.tow / 1000.0:.2f} m")
+            # slightly cycle to cycle).
+            per_cycle = lr.time / max(1, job.layups[i].passes)
+            self.est["layup_time"].set(f"{format_hms(lr.time)} · {short_time(per_cycle)}/cyc")
+            self.est["layup_tow"].set(tow_text(lr.tow))
+            self.est["layup_resin"].set(resin_text(lr.tow))
         else:
             # A layup that was just added isn't part of the cached result yet.
-            for key in ("layup_time", "cycle_time", "layup_tow"): self.est[key].set("…")
+            for key in ("layup_time", "layup_tow", "layup_resin"): self.est[key].set("…")
+        if material is None:
+            self.est["safety_factor"].set("--")
+        else:
+            self.estimate = (job, material, strength.estimate(job, result, material))
+            e = self.estimate[2]
+            if e.safety_factor is None:
+                self.est["safety_factor"].set("--")
+            else:
+                self.est["safety_factor"].set(f"{e.safety_factor:.2f} @ {material.pressure:g} bar")
+                if e.safety_factor < 1:
+                    sf_label.configure(foreground=self.app.canvas_palette["warn_text"])
+        self._refresh_strength_dialog()
+
+    def _refresh_strength_dialog(self):
+        dialog = self.app.strength_dialog
+        if dialog is not None and dialog.exists():
+            dialog.refresh()
 
     # --- Background calculation plumbing ---
 
@@ -1102,7 +1178,8 @@ class PlanTab:
         pal = self.app.canvas_palette
         px = ox - location.x * scale
         eye_y = oy + (winding.Y_REFERENCE - job.eye_arm_length - location.y) * scale
-        base_y = oy + (winding.Y_REFERENCE - job.eye_arm_length) * scale
+        # The arm runs down to its base, or to the canvas edge when that's lower.
+        base_y = min(oy + (winding.Y_REFERENCE - job.eye_arm_length) * scale, self.canvas.winfo_height() - 2)
         half_w = max(3.0, job.eye_width / 2 * scale)
         self.canvas.create_line(px, base_y, px, eye_y, fill=pal["reach"], width=3, tags="eye")
         self.canvas.create_rectangle(px - half_w, eye_y - 4, px + half_w, eye_y + 4, fill=pal["marker"],
@@ -1160,7 +1237,7 @@ class PlanTab:
 
     def _draw_end_view(self, rt, arm):
         pal = self.app.canvas_palette
-        self.end_canvas.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"])
+        self.end_canvas.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"], highlightthickness=1)
         self.end_canvas.delete("all")
         w, h = self.end_canvas.winfo_width(), self.end_canvas.winfo_height()
         if w < 20 or h < 20:

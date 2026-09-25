@@ -143,6 +143,11 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     # plain grey until then), so build exactly these two up front.
     style.configure("primary.TButton")
     style.configure("primary.Outline.TButton")
+    # Likewise for the other color styles in use -- the Eye Reach readout
+    # (orange, like the reach lines it goes with) and the viewer's Play
+    # button -- so they look the same from startup, not just after a switch.
+    style.configure("warning.TLabel")
+    style.configure("success.TButton")
 
 
 def build_icon(primary_hex, size=64):

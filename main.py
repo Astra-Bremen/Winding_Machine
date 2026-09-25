@@ -4,6 +4,7 @@ import dataclasses
 import datetime
 import os
 import ttkbootstrap as tb
+import strength
 import theme
 import winding
 from plan_tab import PlanTab
@@ -63,6 +64,14 @@ class CFRPWinderApp:
         # rehome): kept here so they survive leaving and reopening the page.
         self.partial_vars = {"layup": tk.IntVar(value=1), "cycle": tk.IntVar(value=1),
                              "angle": tk.DoubleVar(value=0.0), "rehome": tk.BooleanVar(value=False)}
+        # The material/strength estimate's inputs (see strength.Material): not
+        # winding settings -- they never change the G-code's motion, only the
+        # estimates, so they don't trigger a re-simulation.
+        material = strength.Material()
+        self.material_vars = {key: tk.DoubleVar(value=getattr(material, key)) for key in strength.KEYS}
+        for var in self.material_vars.values():
+            var.trace_add("write", self._on_material_changed)
+        self.strength_dialog = None
 
         self._build_menu()
 
@@ -72,7 +81,7 @@ class CFRPWinderApp:
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(status_bar, textvariable=self.status_var, style="secondary.TLabel").pack(side=tk.LEFT)
+        ttk.Label(status_bar, textvariable=self.status_var).pack(side=tk.LEFT)
 
         # --- MAIN LAYOUT: settings on the left, split previews on the right ---
         main_frame = ttk.Frame(root, padding="10")
@@ -164,6 +173,9 @@ class CFRPWinderApp:
         if hasattr(self, "plan_tab"): self.plan_tab.on_theme_changed()
         if hasattr(self, "view_tab"): self.view_tab.reapply_viewport_colors()
         if hasattr(self, "partial_page"): self.partial_page.on_theme_changed()
+        if self.strength_dialog is not None and self.strength_dialog.exists():
+            self.strength_dialog.on_theme_changed()
+            self.strength_dialog.refresh()
 
     def set_status(self, text):
         if hasattr(self, "status_var"): self.status_var.set(text)
@@ -192,6 +204,32 @@ class CFRPWinderApp:
     def _layups_changed(self):
         if hasattr(self, "plan_tab"): self.plan_tab.on_layups_changed()
         if getattr(self, "_partial_shown", False): self.partial_page.refresh()
+
+    # --- Material / strength estimate ---
+
+    def build_material(self):
+        """The estimate's inputs as a strength.Material. Raises SettingsError if
+        a field doesn't hold a valid number right now."""
+        values = {}
+        for key, var in self.material_vars.items():
+            try: values[key] = var.get()
+            except tk.TclError: raise winding.SettingsError(key) from None
+        return strength.Material(**values)
+
+    def load_material(self, material):
+        """Restores estimate inputs (e.g. the ones a reopened G-code file was
+        made with)."""
+        for key, var in self.material_vars.items():
+            var.set(getattr(material, key))
+
+    def _on_material_changed(self, *args):
+        if hasattr(self, "plan_tab"): self.plan_tab.refresh_estimate()
+
+    def show_strength_dialog(self):
+        from strength_dialog import StrengthDialog
+        if self.strength_dialog is None or not self.strength_dialog.exists():
+            self.strength_dialog = StrengthDialog(self)
+        self.strength_dialog.show()
 
     # --- Settings panel pages ---
 
@@ -279,6 +317,17 @@ class CFRPWinderApp:
 
     # --- G-code generation ---
 
+    def _estimate_header(self, job):
+        # The material estimate's inputs and results, recorded in the file.
+        try:
+            material = self.build_material()
+        except winding.SettingsError:
+            return []
+        if strength.errors(material):
+            return strength.header_items(material)
+        result = self.plan_tab.simulation_for(job) or winding.simulate(job)
+        return strength.header_items(material, strength.estimate(job, result, material))
+
     def generate(self, resume=None):
         """Writes the program to a file the user picks. With a winding.Resume,
         writes a partial program that continues an interrupted wind instead."""
@@ -322,7 +371,8 @@ class CFRPWinderApp:
         tmp_path = filepath + ".part"
         try:
             with open(tmp_path, "w") as f:
-                winding.write_gcode(f, job, self.START_GCODE, self.END_GCODE, resume=resume)
+                winding.write_gcode(f, job, self.START_GCODE, self.END_GCODE, resume=resume,
+                                    extra_header=self._estimate_header(job))
             os.replace(tmp_path, filepath)
         except Exception as e:
             messagebox.showerror("Error", f"G-code generation failed:\n{e}")

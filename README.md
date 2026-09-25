@@ -99,14 +99,19 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   have to slow almost to a stop at the turnaround, and the winding pattern
   stays exactly the same. It has no effect while a turnaround zone is set,
   because the zone already spreads out the whole turnaround.
-- **Live Settings Preview:** a pseudo-3D tank view that you can rotate, an
-  end-on view showing the eye reach, and live estimates. The estimates come in
-  two groups:
-  - **Program:** total time, required tow, total cycles, rotation speed and eye
-    reach for the whole wind.
-  - **Selected layup:** its time, time per cycle, required tow, X speed, cycles
-    needed for full coverage, coverage (shown in orange while gaps would
-    remain) and extra turnaround rotation.
+- **Live Settings Preview:** a pseudo-3D tank view that you can rotate, drawn
+  as large as the preview allows, and an end-on view showing the eye reach. A
+  slim estimates sidebar sits beside them, with two groups:
+  - **Program:** time · total cycles, tow length · dry fiber mass, resin mass,
+    rotation speed, eye reach (orange, like the reach lines in the end view)
+    and the safety factor at the operating pressure (orange below 1).
+  - **Selected layup:** time · average time per cycle, tow length · dry fiber
+    mass, resin mass, X speed, coverage · the fewest cycles for full coverage
+    (orange while gaps would remain), and extra turnaround rotation.
+
+  Hover over a row for what it shows. Click the rotation or X speed to change
+  units. **Strength & Materials…** opens the inputs of the mass and strength
+  estimate next to its full result. See [Strength and material estimate](#strength-and-material-estimate).
 
   Click the rotation or X speed to change units. The preview shows the first
   cycle of the selected layup. Check **Show All Layups** to overlay every
@@ -137,6 +142,9 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; layups: 2
 ; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True
 ; layup_2: passes=4 pattern_number=5 wind_angle=75.0 turnaround_angle=270.0 auto_cycles=False
+; estimate_fiber_strength: 5100.0     <- the Strength & Materials inputs...
+; ...
+; estimate_result_safety_factor: 1.203  <- ...and what they gave for this wind
 ; ld: 96.825                  <- computed dome length
 ; -----------------------
 G28                           <- or just "G92 A0" if "Home Axes Before Winding" is off
@@ -167,6 +175,43 @@ unintended change to the motion shows up in the tests.
 
 The suggested file name records the time of generation, the end-cap type and
 the estimated duration, for example `17_09_14_32-RND-00_07_26.gcode`.
+
+## Strength and material estimate
+
+The estimate follows the original Excel sheet's "Rough Strength assumption
+(assumes 54 degree equivalent winding)". It is fed with the actual tow length
+from this app's simulation:
+
+| Step | Formula | Excel cell |
+|------|---------|------------|
+| Fiber mass | tow length × tow linear density | E63 |
+| Resin mass | fiber mass × (1 − fiber fraction) ÷ fiber fraction | F63 |
+| Wall thickness | composite mass ÷ (surface × composite density) | N3 |
+| Hoop stress | operating pressure × radius ÷ thickness | N5 |
+| Allowable stress | fiber strength × fiber fraction × strength translation × laminate factor | N7 |
+| Safety factor | allowable stress ÷ hoop stress | N8 |
+| Burst pressure | operating pressure × safety factor | – |
+
+The inputs default to the sheet's values: 1.6 g/m tow, 0.55 fiber mass fraction,
+1750 kg/m³ composite density, 5100 MPa fiber strength, 0.85 strength
+translation, 0.3 laminate factor and 70 bar. They can be changed in the
+**Strength & Materials** window; hover over an input for an explanation. The
+results update live, and **Reset to Excel Values** restores the defaults.
+
+**One deliberate difference:** the sheet's thickness formula adds the dome
+area without multiplying it by the density, so it effectively spreads the
+*whole* tank's mass over the cylinder. Dome and turnaround material doesn't
+carry the cylinder's hoop stress, so the app counts only the fiber actually
+laid on the straight section. That gives a thinner, more realistic wall and a
+lower, more conservative safety factor. The window also shows the sheet's
+method for comparison. With the sheet's own inputs, `test_strength.py` checks
+that the app reproduces its numbers exactly.
+
+This is a rough estimate, like the sheet's: thin-wall hoop stress only. It is
+not a substitute for a proper design analysis or a burst test.
+
+Generated files record the inputs and the results in their settings header,
+and opening a file restores the inputs.
 
 ## Continuing an interrupted wind
 
@@ -285,10 +330,10 @@ python main.py
 
 ## Tests
 
-The winding math has headless tests (no GUI needed):
+The winding math and the strength estimate have headless tests (no GUI needed):
 
 ```powershell
-python -m unittest -v test_winding
+python -m unittest -v
 ```
 
 ## Project structure
@@ -301,7 +346,9 @@ python -m unittest -v test_winding
 | `partial_page.py` | `PartialPage`: the Export Partial G-Code page that replaces the settings while continuing an interrupted wind. |
 | `view_tab.py` | `ViewTab`: G-code parser and playback viewer. |
 | `theme.py` | ttkbootstrap theme setup, canvas color palettes (including the layup colors) and the generated app icon. |
-| `test_winding.py` | Headless tests for `winding.py`. |
+| `strength.py` | The material and strength estimate (after the Excel sheet), its inputs, and their record in the G-code header. |
+| `strength_dialog.py` | `StrengthDialog`: the Strength & Materials window. |
+| `test_winding.py`, `test_strength.py` | Headless tests for `winding.py` and `strength.py`. |
 
 ## Notes for development
 

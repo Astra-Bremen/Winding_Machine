@@ -750,6 +750,7 @@ def iter_program(job):
 class LayupResult:
     time: float = 0.0   # seconds
     tow: float = 0.0    # mm
+    cylinder_tow: float = 0.0  # mm of it laid on the straight (cylindrical) section
     # strand_runs[strand] -> list of runs, each run a list of raw (x, r, angle_deg)
     # points along one single-direction traversal of the layup's FIRST cycle.
     strand_runs: list = field(default_factory=list)
@@ -760,6 +761,10 @@ class SimulationResult:
     total_time: float
     total_tow: float
     layups: list  # one LayupResult per job layup
+
+    @property
+    def cylinder_tow(self):
+        return sum(layup.cylinder_tow for layup in self.layups)
 
 
 class _RunRecorder:
@@ -820,6 +825,9 @@ def simulate(job):
     geom = _tank_geometry(job)
     results = [LayupResult(strand_runs=[[] for _ in range(l.pattern_number)]) for l in job.layups]
     total_time, total_tow = 0.0, 0.0
+    # The straight section, for the strength estimate: a move counts as laid
+    # there when its midpoint is (moves are 5 mm steps, so that's exact enough).
+    cyl_lo, cyl_hi = geom.x_start + geom.l_dome, geom.x_end - geom.l_dome
     recorder = _RunRecorder(geom)
     prev = (job.wind_start_x, geom.radius(job.wind_start_x), 0.0)
     for ev in iter_program(job):
@@ -829,6 +837,8 @@ def simulate(job):
         res = results[ev.layup]
         res.time += ev.duration
         res.tow += ev.tow
+        if cyl_lo <= (prev[0] + ev.x) / 2 <= cyl_hi:
+            res.cylinder_tow += ev.tow
         first_cycle = ev.circuit < job.layups[ev.layup].pattern_number
         recorder.add(ev, prev, res.strand_runs[ev.circuit] if first_cycle else None)
         prev = (ev.x, ev.r, ev.a)
@@ -1075,14 +1085,15 @@ def _write_move_to_start(out, job, x, y, message, angle=0.0):
     out.write(_set_a(angle) + "\n")
 
 
-def write_gcode(out, job, start_gcode="", end_gcode="", resume=None):
+def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_header=()):
     """Writes the program for `job` to the text stream `out`; the job must pass
     validate(). With a Resume, writes a partial program instead: the same
     moves as the complete one from resume.point on, in the same A frame, so it
     continues an interrupted wind seamlessly (raises PointError for a point
-    that doesn't exist)."""
+    that doesn't exist). `extra_header` adds (key, value) pairs to the settings
+    header, e.g. the material estimate the file was made with."""
     out.write("; --- WINDER SETTINGS ---\n")
-    for key, value in settings_items(job) + (resume_items(resume) if resume else []):
+    for key, value in settings_items(job) + (resume_items(resume) if resume else []) + list(extra_header):
         out.write(f"; {key}: {value}\n")
     out.write(f"; ld: {job.dome_length:.3f}\n; -----------------------\n\n")
     if resume is None:

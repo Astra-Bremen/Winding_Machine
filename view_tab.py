@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import math
+import strength
 import theme
 import winding
 from theme import VIEWPORT_PALETTE as VP
@@ -114,7 +115,7 @@ class ViewTab:
         # ttkbootstrap retroactively recolors every plain tk.Canvas (not just ttk
         # widgets) whenever the app's light/dark theme changes, which would
         # otherwise overwrite this viewport's intentionally fixed dark palette.
-        self.view_canvas.configure(bg=VP["bg"], highlightbackground=VP["tank_outline"])
+        self.view_canvas.configure(bg=VP["bg"], highlightbackground=VP["tank_outline"], highlightthickness=1)
         self._update_3d_button()
 
     def _toggle_3d(self):
@@ -306,6 +307,11 @@ class ViewTab:
         # support (a single pattern stored as top-level settings).
         layups = winding.layups_from_header(self.view_settings)
         if layups: self.app.load_layups(layups)
+        # The material estimate the file was made with (files without one keep
+        # the current inputs: they're not winding settings).
+        material = strength.material_from_header(self.view_settings)
+        if material is not None:
+            self.app.load_material(material)
         # A partial program also records where it continues from: restore that
         # on the partial-export page, recreating the conditions it was made in.
         if self.resume is not None:
