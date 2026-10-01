@@ -10,7 +10,14 @@ opened again later in the session.
 import tkinter as tk
 from tkinter import ttk
 import winding
+from ttkbootstrap.widgets.tooltip import ToolTip
 from plan_tab import FIELD_FONT, format_hms, layup_caption
+
+
+def _tip(text, *widgets):
+    # The same hover explanations as on the settings page.
+    for widget in widgets:
+        ToolTip(widget, text=text, wraplength=300, delay=400)
 
 
 class PartialPage:
@@ -34,8 +41,10 @@ class PartialPage:
 
         header = ttk.Frame(f)
         header.pack(fill=tk.X, pady=(0, 2))
-        ttk.Button(header, text="‹", width=2, style="Nav.TButton", takefocus=False,
-                   command=self.app.show_settings_page).pack(side=tk.LEFT)
+        back = ttk.Button(header, text="‹", width=2, style="Nav.TButton", takefocus=False,
+                          command=self.app.show_settings_page)
+        back.pack(side=tk.LEFT)
+        _tip("Back to the settings. The values on this page are kept.", back)
         ttk.Label(header, text="Export Partial G-Code", style="PageTitle.TLabel").pack(side=tk.LEFT, padx=(8, 0))
         self._hint(f, "Continue an interrupted wind from where it stopped. Settings changed on the settings "
                       "page (‹) apply to the rest of the wind.").pack(fill=tk.X, pady=(0, 8))
@@ -44,12 +53,16 @@ class PartialPage:
         where = ttk.LabelFrame(f, text="Continue From", padding=PAD, style=FRM)
         where.pack(fill=tk.X, pady=(0, 6))
         where.columnconfigure(0, weight=1)
-        ttk.Label(where, text="Layup", style=LBL).grid(row=0, column=0, sticky="w", pady=1)
+        layup_label = ttk.Label(where, text="Layup", style=LBL)
+        layup_label.grid(row=0, column=0, sticky="w", pady=1)
         self.layup_combo = ttk.Combobox(where, state="readonly", width=21, font=FIELD_FONT, style="Settings.TCombobox")
         self.layup_combo.grid(row=0, column=1, sticky="e", pady=1)
+        _tip("The layup the wind stopped in. While winding, Mainsail's status line shows it (\"Layup 2/3\").",
+             layup_label, self.layup_combo)
         self.layup_combo.bind("<<ComboboxSelected>>", lambda e: self.vars["layup"].set(self.layup_combo.current() + 1))
 
-        ttk.Label(where, text="Cycle", style=LBL).grid(row=1, column=0, sticky="w", pady=1)
+        cycle_label = ttk.Label(where, text="Cycle", style=LBL)
+        cycle_label.grid(row=1, column=0, sticky="w", pady=1)
         cycle_row = ttk.Frame(where)
         cycle_row.grid(row=1, column=1, sticky="e", pady=1)
         self.cycles_of = ttk.Label(cycle_row, text="of 1", style=LBL, width=7, anchor="w")
@@ -57,18 +70,27 @@ class PartialPage:
         self.cycle_spin = ttk.Spinbox(cycle_row, from_=1, to=1, increment=1, width=5, font=FIELD_FONT,
                                       textvariable=self.vars["cycle"], style="Settings.TSpinbox")
         self.cycle_spin.pack(side=tk.RIGHT)
+        _tip("The cycle of that layup the wind stopped in. While winding, Mainsail's status line shows it "
+             "(\"Layup 3/5 - Cycle 2/30\"). The mouse wheel steps it.", cycle_label, self.cycle_spin)
         # The wheel steps the cycle (instead of scrolling the panel).
         self.cycle_spin.bind("<MouseWheel>", lambda e: (self._step_cycle(1 if e.delta > 0 else -1), "break")[1])
 
-        ttk.Label(where, text="Mandrel Angle A (°)", style=LBL).grid(row=2, column=0, sticky="w", pady=1)
-        ttk.Entry(where, textvariable=self.vars["angle"], width=12, font=FIELD_FONT,
-                  style="Settings.TEntry").grid(row=2, column=1, sticky="e", pady=1)
+        angle_label = ttk.Label(where, text="Mandrel Angle A (°)", style=LBL)
+        angle_label.grid(row=2, column=0, sticky="w", pady=1)
+        angle_entry = ttk.Entry(where, textvariable=self.vars["angle"], width=12, font=FIELD_FONT, style="Settings.TEntry")
+        angle_entry.grid(row=2, column=1, sticky="e", pady=1)
+        _tip("The mandrel angle A the machine shows where it stopped (degrees). A restarts at 0 with every cycle, "
+             "so together with the cycle it pins down the exact point. 0 continues from the start of the cycle.\n\n"
+             "Take it from the machine's position readout: Mainsail's Layer field shows A too, but runs up to "
+             "about 2 s ahead of the motion.", angle_label, angle_entry)
         self._hint(where, "The A the machine shows; it restarts at 0 with every cycle. "
                           "0 continues from the start of the cycle.").grid(row=3, column=0, columnspan=2, sticky="we",
                                                                              pady=(0, 4))
         self.from_viewer_btn = ttk.Button(where, text="Use G-Code Preview Position", style="primary.Outline.TButton",
                                           command=self._take_viewer_position)
         self.from_viewer_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        _tip("Takes the layup, cycle and A from where the G-Code Preview's playback stands, e.g. after scrubbing "
+             "to where the wind stopped.", self.from_viewer_btn)
         ttk.Label(where, text="Eye Position", style=LBL).grid(row=5, column=0, sticky="w", pady=1)
         self.eye_value = ttk.Label(where, text="…", style=LBL)
         self.eye_value.grid(row=5, column=1, sticky="e", pady=1)
@@ -86,8 +108,12 @@ class PartialPage:
 
         options = ttk.LabelFrame(f, text="Options", padding=PAD, style=FRM)
         options.pack(fill=tk.X, pady=(0, 6))
-        ttk.Checkbutton(options, text="Move to Starting Position", variable=self.vars["rehome"],
-                        style="Settings.TCheckbutton").pack(anchor="w")
+        rehome = ttk.Checkbutton(options, text="Move to Starting Position", variable=self.vars["rehome"],
+                                 style="Settings.TCheckbutton")
+        rehome.pack(anchor="w")
+        _tip("For a severed fiber: the partial program homes X and Y (the mandrel keeps its angle), moves the eye "
+             "to the continue point and pauses there so the fiber can be reattached. Off: the eye must already be "
+             "at the point, with the fiber attached.", rehome)
         self._hint(options, "Only for a severed fiber: homes X and Y (the mandrel stays put), moves the eye to "
                             "the continue point and pauses there to reattach the fiber. Leave it off while the "
                             "fiber is still attached and the eye is at the point.").pack(fill=tk.X, pady=(2, 0))

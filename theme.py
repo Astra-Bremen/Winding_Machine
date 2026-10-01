@@ -47,8 +47,9 @@ PALETTES = {
         # start): ink-dark on a light halo, so they read on any strand color.
         "marker": "#1f2d2a",
         "marker_halo": "#ffffff",
-        # The frame around the speed limit that currently sets the wind's pace.
-        "limit": "#d7263d",
+        # The LIMIT tag on the speed limit that sets the selected layup's pace:
+        # the theme's mint, darkened to read at tag size on a white field (5:1).
+        "limit_tag": "#2b7d66",
     },
     "dark": {
         "canvas_bg": "#22282a",
@@ -65,7 +66,7 @@ PALETTES = {
         "auto_text": "#7f8a8c",
         "marker": "#eef3f1",
         "marker_halo": "#22282a",
-        "limit": "#ff5c5c",
+        "limit_tag": "#93cebd",  # the theme's own mint (7.5:1 on the dark field)
     },
 }
 

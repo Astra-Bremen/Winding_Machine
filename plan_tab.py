@@ -20,7 +20,7 @@ MACHINE_FIELDS = [
     ("Eye Width (mm)", "eye_width"),
     ("Min Spacing (Safety) (mm)", "min_spacing"),
     ("Max Rotation Speed (mm/s)", "max_surface_speed"),
-    ("Max Feedrate (mm/s)", "max_feedrate"),
+    ("Max Filament Speed (mm/s)", "max_filament_speed"),
     ("Max Move Time (s)", "max_move_time"),
 ]
 TANK_FIELDS = [("Tank Length (mm)", "tank_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
@@ -32,20 +32,79 @@ LAYUP_FIELDS = [
     ("Turnaround / Dwell Angle (Deg)", "turnaround_angle"),
 ]
 START_X_FIELD = ("Start Wind at X (mm)", "start_x")
-# The two speed limits. Every move runs at Max Rotation Speed unless that
-# would exceed Max Feedrate (see winding.calc_move); a red frame marks the one
-# that sets the selected layup's pace in the middle of the tank.
-SPEED_LIMIT_TIPS = {
-    "max_surface_speed": "The fastest the mandrel may turn, given as the speed of the tank's surface.",
-    "max_feedrate": "The fastest any move may run: the G-code feed rate F ÷ 60, measured along the whole move "
-                    "the way the controller does (set it to Klipper's max_velocity). At low winding angles this "
-                    "is practically the carriage's X speed.",
-}
+# The two speed limits. Every move runs as fast as both allow -- whichever it
+# reaches first sets its pace (see winding.calc_move) -- and a LIMIT tag marks
+# the one that sets the selected layup's pace in the middle of the tank.
+SPEED_LIMIT_KEYS = ("max_surface_speed", "max_filament_speed")
 FIELD_LABELS = {key: label for label, key in MACHINE_FIELDS + [START_X_FIELD] + TANK_FIELDS + WINDING_FIELDS + LAYUP_FIELDS}
-HOOP_TIP = ("One pass along the straight section only, never over the domes, each turn laid one band width on "
+# What every input in the settings panel does, shown when hovering over it
+# (its label or the field itself). Where the meaning depends on the current
+# settings, a live note is added below (see PlanTab._update_field_notes).
+FIELD_TIPS = {
+    # Machine
+    "chuck_offset": "Where the tank begins on the machine: the distance (mm) from X0, where homing leaves the "
+                    "carriage, to the tank's chuck-side end. Every X in the program is measured from X0.",
+    "eye_arm_length": "Length of the delivery eye's arm (mm). With the Y axis' 180 mm of travel, it sets how close "
+                      "to and how far from the tank axis the eye can get: Eye Reach in the estimates, and the dashed "
+                      "lines in the end view.",
+    "eye_width": "Width of the eye along the tank (mm). The safety gap is kept across its full width, so the eye's "
+                 "edges stay clear of the domes too, not just its center.",
+    "min_spacing": "Gap the eye keeps from the tank surface (mm). The Y axis follows the tank's profile, domes "
+                   "included, at this distance.",
+    "max_surface_speed": "The fastest the mandrel may turn, given as the speed of the tank's surface. It sets the "
+                         "pace of steep layups.",
+    "max_filament_speed": "The fastest the fiber may leave the eye: the tow laid per second. It sets the pace of "
+                          "shallow layups, where the carriage covers far more ground than the mandrel turns. Every "
+                          f"move also stays below a fixed F{winding.MAX_FEED:.0f} failsafe.",
+    "max_move_time": "Longest any single G-code move may take (s). After a PAUSE, Klipper still finishes every move "
+                     "it has queued, so longer moves are split into equal pieces along the same path: the machine "
+                     f"then stops within about 2 s plus this. At least {winding.MIN_MOVE_TIME:g} s.",
+    "home_before_wind": "Starts the program by homing (G28): the eye pulls back, travels to Start Wind at X and "
+                        "moves in, and the machine pauses so the fiber can be attached. Off: no homing; wherever the "
+                        "machine stands is the start, and the wind begins at the tank's chuck-side end.",
+    "start_x": "Machine X (mm) where the wind begins after homing; it winds toward +X from there. Auto (grey): "
+               "where the chuck-side dome ends and the tank turns straight, or where a 90° first layup begins. "
+               "Type a value to fix it; clear the field to go back to auto.",
+    # Tank
+    "end_cap_type": "Round: spherical domes that close down to the End Cap Diameter; the helical layers wind over "
+                    "them. Flat: flat ends, no domes.",
+    "tank_length": "Overall length of the tank (mm), end to end, domes included.",
+    "tank_diameter": "Outer diameter of the straight section (mm). It also turns Max Rotation Speed, a surface "
+                     "speed, into the mandrel's turning speed.",
+    "end_cap_diameter": "Diameter (mm) of the polar opening at each dome's tip, where the dome ends and the boss "
+                        "begins. The helical passes turn around there.",
+    # Winding
+    "bandwidth": "Width (mm) of the tow band as it lies on the tank. It decides how many cycles cover the tank "
+                 "completely, and how far a 90° wind advances per turn.",
+    "turnaround_zone": "Length (mm) at each end over which the carriage turns around: it runs in on the helix, "
+                       "slows smoothly to a stop at the very end while the mandrel keeps turning, and runs back "
+                       "out -- one smooth curve, so the machine never has to brake for a corner. The turnaround's "
+                       "rotation is spread over the zone, so no fiber piles up in a ring at the end. Auto (grey): "
+                       f"the dome, so the fiber turns around beyond the straight section ({winding.FLAT_TURNAROUND_ZONE:g} "
+                       "mm with flat end caps). Type a value to fix it; clear the field to go back to auto. "
+                       "0 = turn on the spot at the end (the machine stops there).",
+    "pause_after_layup": "Pauses (PAUSE) after every layup but the last, so the fiber can be checked, e.g. for "
+                         "slipping, before the pattern changes. Resume on the machine to continue.",
+    # Layup
+    "hoop": "One pass along the straight section only, never over the domes, each turn laid one band width on "
             "from the last so the bands lie edge to edge (just short of 90°). No pattern and no turnarounds, so the "
             "fields below don't apply.\n\nIt ends at the other end of the tank: the next layup starts from there "
-            f"and winds the other way. A Winding Angle above {winding.HOOP_ANGLE_THRESHOLD:g}° switches this on.")
+            f"and winds the other way. A Winding Angle above {winding.HOOP_ANGLE_THRESHOLD:g}° switches this on.",
+    "passes": "How many cycles this layup winds. Each cycle lays one band per strand (Pattern Number), evenly "
+              "around the tank, then moves the pattern on. Auto (grey): the fewest cycles that cover the tank "
+              "completely, following every change. Type a number to fix it; clear the field to go back to auto.",
+    "pattern_number": "Strands per cycle: how many evenly spaced bands each cycle lays around the tank before the "
+                      "pattern moves on. More strands give a finer diamond pattern.",
+    "wind_angle": "Angle between the fiber and the tank's axis (degrees). Low angles run along the tank and cover "
+                  f"the domes; high ones run around it. Above {winding.HOOP_ANGLE_THRESHOLD:g}° the layup becomes "
+                  "a 90° wind.",
+    "turnaround_angle": "Least rotation (degrees) at each end of the tank while the fiber turns around. A little "
+                        "more is added where needed, so every circuit lands exactly on the pattern (Extra Rotation "
+                        "in the estimates).",
+    # Preview
+    "show_all": "Draws the first cycle of every layup on the tank at once, each in its own color, with a legend "
+                "below; click a legend entry to select that layup. Off: only the selected layup.",
+}
 
 # Entry fields use the same compact size as their labels (a ttk style can't
 # set an entry's font; it has to be given to the widget itself).
@@ -248,56 +307,6 @@ class AutoEntry:
         self._mode_at_focus = auto if self.has_focus() else None
 
 
-class _LimitFrame:
-    """A frame around one row of a settings grid -- its label and its entry --
-    marking the setting that currently limits something. Laid over the grid
-    with place() rather than gridded into it, so showing, moving or hiding it
-    never shifts a single widget; the row needs a few pixels of padding above
-    and below for it (see setup_ui)."""
-    THICKNESS = 2
-    OUTSET = 5  # how far it reaches into the section's side padding
-
-    def __init__(self, master):
-        self._master = master
-        # Plain Tk frames as the four sides. ttkbootstrap's theme switch repaints
-        # them in the panel color; show() colors them again on every redraw.
-        self._sides = [tk.Frame(master, bd=0, highlightthickness=0) for _ in range(4)]
-        self.row = None
-        self._pending = None
-        # Grid lays its rows out at idle time, so on a resize their final
-        # positions are only known once that has run.
-        master.bind("<Configure>", lambda e: self._place_when_idle(), add="+")
-
-    def _place_when_idle(self):
-        if self._pending is None:
-            self._pending = self._master.after_idle(self._place)
-
-    def show(self, row, color):
-        for side in self._sides:
-            side.configure(bg=color)
-        if row != self.row:
-            self.row = row
-            self._place()
-
-    def hide(self):
-        self.row = None
-        for side in self._sides:
-            side.place_forget()
-
-    def _place(self):
-        self._pending = None
-        if self.row is None:
-            return
-        x, y, w, h = self._master.grid_bbox(0, self.row, 1, self.row)
-        if w <= 1:
-            return  # not laid out yet: <Configure> places it once it is
-        t, x0, x1 = self.THICKNESS, x - self.OUTSET, x + w + self.OUTSET
-        top, bottom, left, right = self._sides
-        for side, sx, sy, sw, sh in ((top, x0, y, x1 - x0, t), (bottom, x0, y + h - t, x1 - x0, t),
-                                     (left, x0, y, t, h), (right, x1 - t, y, t, h)):
-            side.place(x=sx, y=sy, width=sw, height=sh, bordermode="outside")
-
-
 class PlanTab:
     def __init__(self, settings_parent, viz_parent, app):
         self.settings_parent = settings_parent
@@ -389,35 +398,37 @@ class PlanTab:
 
         def add_fields(frame, fields, first_row=0, store=None):
             for i, (label_text, key) in enumerate(fields):
-                # The speed limits' rows get room above and below for the frame
-                # that marks the limiting one (see _LimitFrame).
-                pady = 3 if key in SPEED_LIMIT_TIPS else 1
                 label = ttk.Label(frame, text=label_text, style=LBL)
-                label.grid(row=first_row + i, column=0, sticky="w", pady=pady, padx=(0, 10))
+                label.grid(row=first_row + i, column=0, sticky="w", pady=1, padx=(0, 10))
                 # Layup entries are bound to a variable later (on_layups_changed),
                 # since which layup's variables they edit changes on every switch.
                 var = self.app.params.get(key)
                 entry = ttk.Entry(frame, width=12, style=ENT, font=FIELD_FONT, **({"textvariable": var} if var is not None else {}))
-                entry.grid(row=first_row + i, column=1, sticky="e", pady=pady)
+                entry.grid(row=first_row + i, column=1, sticky="e", pady=1)
                 if store is not None: store[key] = entry
-                if key in SPEED_LIMIT_TIPS:
-                    self._limit_tips[key] = [ToolTip(widget, text=SPEED_LIMIT_TIPS[key], wraplength=280, delay=400)
-                                             for widget in (label, entry)]
+                self._add_tip(key, label, entry)
             frame.columnconfigure(0, weight=1)
 
         # 1. Machine Settings
         machine_frame = ttk.LabelFrame(left_panel, text="Machine Settings", padding=FRAME_PAD, style=FRM)
         machine_frame.pack(fill=tk.X, pady=FRAME_GAP)
-        self._limit_tips = {}
+        self._tips = {}
         add_fields(machine_frame, MACHINE_FIELDS, store=self.machine_entries)
-        # Marks which speed limit sets the selected layup's pace (see
-        # _update_speed_limit).
-        self._limit_frame = _LimitFrame(machine_frame)
-        # A plain ttk.Checkbutton, same as "Optimize Trajectory" in Winding
+        # Which speed limit sets the selected layup's pace: a small LIMIT tag
+        # inside that field, made like the AUTO tags (see AutoEntry) and shown
+        # by _update_speed_limit. A click on it reaches the field.
+        self._limit_tags = {}
+        for key in SPEED_LIMIT_KEYS:
+            entry = self.machine_entries[key]
+            tag = tk.Label(entry, text="LIMIT", font=("TkDefaultFont", 7, "bold"), bd=0, padx=0, pady=0, cursor="xterm")
+            tag.bind("<Button-1>", lambda e, field=entry: (field.focus_set(), "break")[1])
+            self._limit_tags[key] = tag
+        # A plain ttk.Checkbutton, same as "Pause After Each Layup" in Winding
         # Settings -- just the compact Settings font, no color/Toolbutton style.
-        ttk.Checkbutton(machine_frame, text="Home Axes (G28) Before Winding",
-                        variable=self.app.params["home_before_wind"],
-                        style="Settings.TCheckbutton").grid(row=len(MACHINE_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 2))
+        home_check = ttk.Checkbutton(machine_frame, text="Home Axes (G28) Before Winding",
+                                     variable=self.app.params["home_before_wind"], style="Settings.TCheckbutton")
+        home_check.grid(row=len(MACHINE_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 2))
+        self._add_tip("home_before_wind", home_check)
         # Depends on the checkbox above (indented under it, disabled without
         # homing): where the wind starts after homing. Auto: where the dome ends.
         row = len(MACHINE_FIELDS) + 1
@@ -427,36 +438,32 @@ class PlanTab:
         self._start_x_entry.grid(row=row, column=1, sticky="e", pady=1)
         self._start_x_field = AutoEntry(self, self._start_x_entry, lambda: self.app.params["start_x_auto"],
                                         self._start_x_mode_changed)
+        self._add_tip("start_x", self._start_x_label, self._start_x_entry)
 
         # 2. Tank Settings
         tank_frame = ttk.LabelFrame(left_panel, text="Tank Settings", padding=FRAME_PAD, style=FRM)
         tank_frame.pack(fill=tk.X, pady=FRAME_GAP)
-        ttk.Label(tank_frame, text="End-Cap Type", style=LBL).grid(row=0, column=0, sticky="w", pady=1, padx=(0, 10))
+        cap_label = ttk.Label(tank_frame, text="End-Cap Type", style=LBL)
+        cap_label.grid(row=0, column=0, sticky="w", pady=1, padx=(0, 10))
         self.cap_type_combo = ttk.Combobox(tank_frame, textvariable=self.app.params["end_cap_type"], values=["Round", "Flat"], state="readonly", width=10, style=CMB, font=FIELD_FONT)
         self.cap_type_combo.grid(row=0, column=1, sticky="e", pady=1)
+        self._add_tip("end_cap_type", cap_label, self.cap_type_combo)
         self.app.params["end_cap_type"].trace_add("write", self.on_cap_type_change)
         add_fields(tank_frame, TANK_FIELDS, first_row=1, store=self.tank_entries)
 
         # 3. Winding Settings -- shared by every layup of the program.
         winding_frame = ttk.LabelFrame(left_panel, text="Winding Settings", padding=FRAME_PAD, style=FRM)
         winding_frame.pack(fill=tk.X, pady=FRAME_GAP)
-        add_fields(winding_frame, WINDING_FIELDS)
-        # Experimental: eases a small piece of each dwell's rotation into the
-        # traversal steps flanking it instead of one abrupt stop, so Klipper's
-        # motion planner doesn't need to slow to a near-halt at the turnaround.
-        # A plain ttk.Checkbutton (just a font-size tweak via the Settings style,
-        # not a color/Toolbutton style) -- a real checkbox is the most immediately
-        # recognizable widget for a plain on/off setting like this. Greyed out
-        # while a Turnaround Zone is set, which spreads the whole turnaround
-        # rotation out and so supersedes it (see winding.compute_dwell_blend).
-        self._optimize_check = ttk.Checkbutton(winding_frame, text="Optimize Trajectory (experimental)",
-                                               variable=self.app.params["optimize_trajectory"],
-                                               style="Settings.TCheckbutton")
-        self._optimize_check.grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        winding_entries = {}
+        add_fields(winding_frame, WINDING_FIELDS, store=winding_entries)
+        # Auto: the dome (see winding.WindingJob.turnaround_zone).
+        self._zone_field = AutoEntry(self, winding_entries["turnaround_zone"],
+                                     lambda: self.app.params["turnaround_zone_auto"], self._zone_mode_changed)
         # PAUSE between layups, to check the fiber after every pattern change.
-        ttk.Checkbutton(winding_frame, text="Pause After Each Layup", variable=self.app.params["pause_after_layup"],
-                        style="Settings.TCheckbutton").grid(row=len(WINDING_FIELDS) + 1, column=0, columnspan=2,
-                                                            sticky="w", pady=(2, 0))
+        pause_check = ttk.Checkbutton(winding_frame, text="Pause After Each Layup",
+                                      variable=self.app.params["pause_after_layup"], style="Settings.TCheckbutton")
+        pause_check.grid(row=len(WINDING_FIELDS), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._add_tip("pause_after_layup", pause_check)
 
         # 4. Layups -- the switchable per-layup settings. The section's title is
         # itself the switcher: [swatch] Layup 2 of 3 [<] [>] [-] [+], where the
@@ -477,6 +484,11 @@ class PlanTab:
         self._remove_btn.pack(side=tk.LEFT)
         self._add_btn = ttk.Button(nav, text="+", width=2, style=NAV, takefocus=False, command=self._add_layup)
         self._add_btn.pack(side=tk.LEFT, padx=(2, 0))
+        for button, tip in ((self._prev_btn, "Previous layup"), (self._next_btn, "Next layup"),
+                            (self._remove_btn, "Remove this layup"),
+                            (self._add_btn, "Add a layup after the last one, with its settings (its Number of "
+                                            "Cycles starts on auto)")):
+            ToolTip(button, text=tip, wraplength=300, delay=400)
         layup_frame = ttk.LabelFrame(left_panel, labelwidget=nav, padding=FRAME_PAD, style=FRM)
         layup_frame.pack(fill=tk.X, pady=FRAME_GAP)
         nav.lift(layup_frame)  # a labelwidget must stack above its frame to be visible
@@ -485,7 +497,7 @@ class PlanTab:
         self._hoop_check = ttk.Checkbutton(layup_frame, text="90° Wind (Straight Section Only)",
                                            style="Settings.TCheckbutton", command=self._on_hoop_toggled)
         self._hoop_check.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 3))
-        ToolTip(self._hoop_check, text=HOOP_TIP, wraplength=300, delay=400)
+        self._add_tip("hoop", self._hoop_check)
         add_fields(layup_frame, LAYUP_FIELDS, first_row=1, store=self.layup_entries)
         # What a 90° wind's greyed-out fields show instead of its (unused)
         # helical settings: one pass, its actual angle, no pattern or dwell.
@@ -526,8 +538,10 @@ class PlanTab:
         # so the visual order ends up: [arrows][3D canvas][end view][estimates].
         bottom_bar = ttk.Frame(self.viz_parent)
         bottom_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        ttk.Checkbutton(bottom_bar, text="Show All Layups", variable=self.show_all_var,
-                        style="Settings.TCheckbutton", command=self._on_show_all_toggled).pack(side=tk.LEFT, anchor="n")
+        show_all = ttk.Checkbutton(bottom_bar, text="Show All Layups", variable=self.show_all_var,
+                                   style="Settings.TCheckbutton", command=self._on_show_all_toggled)
+        show_all.pack(side=tk.LEFT, anchor="n")
+        self._add_tip("show_all", show_all)
         self.legend_canvas = tk.Canvas(bottom_bar, height=1, highlightthickness=0, bd=0)
         self.legend_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(18, 0))
         self.legend_canvas.bind("<Configure>", lambda e: self._draw_legend())
@@ -565,6 +579,8 @@ class PlanTab:
         down_btn.bind("<Leave>", lambda e: self._set_spin_direction(0))
         ttk.Frame(rotate_frame).grid(row=3, column=0)
         self._rotate_buttons = (up_btn, down_btn)
+        for button in self._rotate_buttons:
+            ToolTip(button, text="Hold to turn the view around the tank's axis.", wraplength=300, delay=400)
 
         self.canvas = tk.Canvas(viz_row, bg=self.app.canvas_palette["canvas_bg"], relief="flat",
                                  borderwidth=1, highlightthickness=1,
@@ -613,8 +629,8 @@ class PlanTab:
         estimate("time", "Time", "Total winding time · cycles in all layups together.")
         estimate("tow", "Tow", "Tow length · its dry fiber mass (set up in Strength & Materials).")
         estimate("resin", "Resin", "Resin mass for that fiber (set up in Strength & Materials).")
-        estimate("rotation", "Rotation", "Top mandrel speed (at the turnarounds): Max Rotation Speed, unless "
-                                         "Max Feedrate holds it lower. Click to change units.",
+        estimate("rotation", "Rotation", "Top mandrel speed (at the turnarounds): Max Rotation Speed, within "
+                                         f"the F{winding.MAX_FEED:.0f} failsafe. Click to change units.",
                  on_click=self._cycle_rotation_speed_unit)
         estimate("reach", "Eye Reach", "How close to and how far from the tank axis the eye can get across its "
                                        "Y travel.", style="warning.TLabel")
@@ -629,8 +645,8 @@ class PlanTab:
         estimate("layup_time", "Time", "This layup's winding time · its average time per cycle.")
         estimate("layup_tow", "Tow", "This layup's tow length · its dry fiber mass.")
         estimate("layup_resin", "Resin", "Resin mass for this layup's fiber.")
-        estimate("xspeed", "X-Speed", "Carriage speed in the middle of the tank, set by the speed limit framed "
-                                       "in red in Machine Settings. Click to change units.",
+        estimate("xspeed", "X-Speed", "Carriage speed in the middle of the tank, set by the speed limit tagged "
+                                       "LIMIT in Machine Settings. Click to change units.",
                  on_click=self._cycle_xspeed_unit)
         estimate("coverage", "Coverage", "How much of the surface the layup's bands cover · the fewest cycles "
                                          "that cover it completely. Orange while gaps remain.")
@@ -646,6 +662,60 @@ class PlanTab:
         self._xspeed_mm_s = 0.0
         self._xspeed_unit_idx = 0
         self.XSPEED_UNITS = ["mm/s", "m/s"]
+
+    # --- Hover explanations ---
+
+    def _add_tip(self, key, *widgets):
+        # The explanation of setting `key` (FIELD_TIPS) on its label and field.
+        self._tips.setdefault(key, []).extend(ToolTip(w, text=FIELD_TIPS[key], wraplength=300, delay=400)
+                                              for w in widgets)
+
+    def _set_note(self, key, note=None):
+        # A live note below a setting's explanation (or none).
+        text = FIELD_TIPS[key] + (f"\n\n{note}" if note else "")
+        for tip in self._tips.get(key, ()):
+            tip.text = text
+
+    def _update_field_notes(self, job, layup):
+        # What the explanations can't know in advance: the current tank's
+        # limits, the auto values, and which fields a 90° wind ignores. Without
+        # a valid job (a field mid-edit) they show the plain explanations.
+        notes = dict.fromkeys(FIELD_TIPS)
+        if job is not None:
+            lo, hi = winding.eye_reach(job.eye_arm_length)
+            notes["eye_arm_length"] = (f"With this arm the eye reaches {lo:.0f}–{hi:.0f} mm from the tank axis; "
+                                       f"the tank's radius is {job.tank_diameter / 2:.0f} mm.")
+            if job.home_before_wind:
+                lo, hi = job.start_x_range
+                auto = f" Auto now: X {job.start_x:.1f}." if job.start_x_auto else ""
+                notes["start_x"] = f"Allowed on this tank: X {lo:.1f} to {hi:.1f} mm.{auto}"
+            else:
+                notes["start_x"] = "Not used while homing is off: the wind then starts at the tank's end."
+            if job.end_cap_type == "Flat":
+                notes["end_cap_diameter"] = "Not used with flat end caps."
+            if job.turnaround_zone_auto:
+                where = "the dome" if job.end_cap_type == "Round" else "flat end caps"
+                notes["turnaround_zone"] = f"Auto now: {job.turnaround_zone:.1f} mm ({where})."
+            notes["turnaround_zone"] = ((notes["turnaround_zone"] + " " if notes["turnaround_zone"] else "")
+                                        + f"At most {job.tank_length / 2:g} mm on this tank (half its length).")
+            if len(job.layups) == 1:
+                notes["pause_after_layup"] = "With a single layup there's nothing to pause between."
+            if layup.hoop:
+                notes["passes"] = "A 90° wind is always exactly one pass."
+                notes["pattern_number"] = notes["turnaround_angle"] = "Not used by a 90° wind."
+                notes["wind_angle"] = f"Not used by a 90° wind: it winds at {job.hoop_angle:.1f}°."
+            else:
+                needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth,
+                                                      layup.pattern_number)
+                if needed is not None:
+                    notes["passes"] = f"Full coverage at these settings: {needed} cycle{'s' if needed != 1 else ''}."
+                if job.tank_length > 0 and job.tank_diameter > 0 and job.bandwidth > 0:
+                    lo, hi = winding.compute_wind_angle_bounds(job.tank_length, job.tank_diameter, job.bandwidth)
+                    hi = min(hi, winding.HOOP_ANGLE_THRESHOLD)
+                    notes["wind_angle"] = f"Possible on this tank with this tow: {lo:.1f}° to {hi:.1f}°."
+        for key, note in notes.items():
+            if key not in SPEED_LIMIT_KEYS:  # those are _update_speed_limit's
+                self._set_note(key, note)
 
     # --- Clickable-unit Estimates readouts ---
 
@@ -685,6 +755,15 @@ class PlanTab:
             self.app.set_status(f"{prefix}Number of Cycles set to {value} and fixed there. "
                                 "Clear the field to put it back on auto (full coverage).")
 
+    def _zone_mode_changed(self, auto):
+        value = self._zone_field.entry.get().strip()
+        if auto:
+            self.app.set_status(f"Turnaround Zone is back on auto -- {value} mm, the dome "
+                                f"({winding.FLAT_TURNAROUND_ZONE:g} mm with flat end caps).")
+        else:
+            self.app.set_status(f"Turnaround Zone set to {value} mm and fixed there. "
+                                "Clear the field to put it back on auto (the dome).")
+
     def _start_x_mode_changed(self, auto):
         value = self._start_x_entry.get().strip()
         if auto:
@@ -709,12 +788,15 @@ class PlanTab:
             _set_if_changed(layup_vars["passes"], layup.passes)
         if job.start_x_auto and not self._start_x_field.editing():
             _set_if_changed(self.app.params["start_x"], round(job.start_x, 1))
+        if job.turnaround_zone_auto and not self._zone_field.editing():
+            _set_if_changed(self.app.params["turnaround_zone"], round(job.turnaround_zone, 1))
         # Start Wind at X only applies when homing first.
         state = ["!disabled"] if job.home_before_wind else ["disabled"]
         self._start_x_entry.state(state)
         self._start_x_label.state(state)
         self._cycles_field.refresh()
         self._start_x_field.refresh()
+        self._zone_field.refresh()
 
     def _redraw_now(self):
         if self.redraw_timer:
@@ -928,14 +1010,15 @@ class PlanTab:
             self._draw_legend()
             self._cycles_field.refresh()
             self._start_x_field.refresh()
+            self._zone_field.refresh()
             self._update_speed_limit(None, None)
+            self._update_field_notes(None, None)
             self._update_indicator()
             return
         self._job = job
         self._sync_auto_values(job)
         layup = job.layups[self.app.active_layup]
         self._update_instant_estimates(job, layup)
-        self._optimize_check.state(["disabled"] if job.turnaround_zone > 0 else ["!disabled"])
 
         geometry_errors = winding.geometry_errors(job)
         errors = winding.validate(job)
@@ -1116,9 +1199,9 @@ class PlanTab:
         self.est["reach"].set(f"{eye_dist_min:.0f}–{eye_dist_max:.0f} mm")
 
         # Rotation: the turnarounds' pure rotation runs at Max Rotation Speed
-        # within Max Feedrate. X-Speed: the selected layup's mid-tank helix,
-        # at whichever of the two limits it reaches first (winding.wind_speed).
-        self._rotation_speed_deg_per_min = min(job.max_a_speed, job.max_feed)
+        # within the failsafe. X-Speed: the selected layup's mid-tank helix, at
+        # whichever limit it reaches first (winding.wind_speed).
+        self._rotation_speed_deg_per_min = min(job.max_a_speed, winding.MAX_FEED)
         self._update_rotation_speed_display()
         angle_ok = 0 < layup.wind_angle < 90
         if layup.hoop:
@@ -1127,6 +1210,7 @@ class PlanTab:
         self._xspeed_mm_s = speed.x_speed if speed else 0.0
         self._update_xspeed_display()
         self._update_speed_limit(job, speed)
+        self._update_field_notes(job, layup)
 
         # Coverage · the fewest cycles for full coverage. Extra Rotation: the
         # pattern-alignment rotation on top of the dwell angle, split between
@@ -1157,29 +1241,37 @@ class PlanTab:
         self._est_values["coverage"].configure(foreground=self.app.canvas_palette["warn_text"] if gaps else "")
 
     def _update_speed_limit(self, job, speed):
-        # Frames the speed limit that sets the selected layup's pace mid-tank
-        # (none while the settings don't define one) and says so in both speed
-        # fields' tooltips, with what that pace is.
+        # Tags the speed limit that sets the selected layup's pace mid-tank
+        # with LIMIT, and says what that pace is in both speed fields'
+        # tooltips. No tag while the settings don't define a pace, nor in the
+        # rare case the MAX_FEED failsafe holds it below both limits. Colored
+        # on every call, so a theme switch (which runs a redraw) is covered.
+        limiting = {"rotation": "max_surface_speed", "filament": "max_filament_speed"}.get(speed.limit) if speed else None
+        for key, tag in self._limit_tags.items():
+            if key == limiting:
+                tag.configure(fg=self.app.canvas_palette["limit_tag"], bg=self.app.root.style.colors.inputbg)
+                tag.place(relx=1.0, rely=0.5, x=-7, anchor="e")
+            else:
+                tag.place_forget()
         if speed is None:
-            self._limit_frame.hide()
-            for key, tips in self._limit_tips.items():
-                for tip in tips: tip.text = SPEED_LIMIT_TIPS[key]
+            for key in SPEED_LIMIT_KEYS:
+                self._set_note(key)
             return
-        limiting = "max_feedrate" if speed.limit == "feed" else "max_surface_speed"
-        row = self.machine_entries[limiting].grid_info()["row"]
-        self._limit_frame.show(row, self.app.canvas_palette["limit"])
         i, n = self.app.active_layup, len(self.app.layups)
         layup = job.layups[i]
         which = f"{f'Layup {i + 1}' if n > 1 else 'the wind'} ({'90° wind' if layup.hoop else f'{layup.wind_angle:g}°'})"
-        limiting_name = FIELD_LABELS[limiting].split(" (")[0]  # without its unit
+        Which = which[:1].upper() + which[1:]
         surface = math.radians(speed.rotation / 60.0) * job.tank_diameter / 2
-        for key, tips in self._limit_tips.items():
+        pace = (f"Mid-tank the carriage runs at {speed.x_speed:.0f} mm/s, the fiber at {speed.fiber:.0f} mm/s "
+                f"and the tank surface at {surface:.0f} mm/s.")
+        for key in SPEED_LIMIT_KEYS:
             if key == limiting:
-                note = (f"Framed in red: this limits {which}. Mid-tank the carriage runs at "
-                        f"{speed.x_speed:.0f} mm/s, the tank surface at {surface:.0f} mm/s.")
+                note = f"LIMIT: this sets the pace of {which}. {pace}"
+            elif limiting is None:
+                note = f"{Which} is held below both speed limits by the F{winding.MAX_FEED:.0f} failsafe. {pace}"
             else:
-                note = f"{which[:1].upper()}{which[1:]} stays below this: {limiting_name} limits it first."
-            for tip in tips: tip.text = f"{SPEED_LIMIT_TIPS[key]}\n\n{note}"
+                note = f"{Which} stays below this: {FIELD_LABELS[limiting].split(' (')[0]} limits it first."
+            self._set_note(key, note)
 
     def _update_sim_estimates(self):
         # Figures that need the full simulation (time, tow, masses, strength).
@@ -1308,6 +1400,13 @@ class PlanTab:
             self.report_progress()
         else:
             self._prog.request(self._progress_key())
+
+    def location_for(self, job, point):
+        """Where `point` is in `job` (a winding.Location), from the last finished
+        progress calculation -- or None if it isn't of exactly these."""
+        if self._progress is None or self._progress[0] != (job, point) or isinstance(self._progress[1], Exception):
+            return None
+        return self._progress[1].location
 
     def _apply_progress_result(self, key, result, error):
         self._progress = (key, result if error is None else error)

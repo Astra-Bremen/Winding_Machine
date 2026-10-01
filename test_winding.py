@@ -75,7 +75,8 @@ MULTI = WindingJob(layups=(
 # 250 mm tank with a 7 mm tow: 1480 mm helical traverse and the sheet's minimum
 # turnaround of 2 x (90 - angle) at each end.
 def excel_layer(angle, pattern, cycles, zone=0.0):
-    return WindingJob(tank_length=1480.0, tank_diameter=250.0, end_cap_type="Flat", bandwidth=7.0, turnaround_zone=zone,
+    return WindingJob(tank_length=1480.0, tank_diameter=250.0, end_cap_type="Flat", bandwidth=7.0,
+                      turnaround_zone=zone, turnaround_zone_auto=False,
                       layups=(Layup(passes=cycles, pattern_number=pattern, wind_angle=angle,
                                     turnaround_angle=2 * (90 - angle)),))
 
@@ -84,29 +85,30 @@ class GoldenMaster(unittest.TestCase):
     """Pins the exact G-code body (everything after the settings header) so an
     unintended change to the motion shows up. Regenerate these deliberately,
     and only together with a change that is meant to alter the output. (Last
-    regenerated for Max Feedrate, which lowers the F of moves that turning at
-    Max Rotation Speed would push past it -- only excel_style_zone's 12 deg
-    layup at the default 300 mm/s; the path itself is unchanged.)"""
+    regenerated for the layer display showing the angle within the cycle:
+    only the SET_PRINT_STATS_INFO lines changed -- without them, every body
+    is exactly the one before.)"""
     CASES = {
-        "default": (WindingJob(), 12018, "acd2c9e7a1f820065a678423382bc51a62ef071f792a1aab23a5ac551257ada2"),
-        "flat_p1_optimized_nohome": (
-            WindingJob(end_cap_type="Flat", optimize_trajectory=True, home_before_wind=False,
+        "default": (WindingJob(), 19244, "cf1cabb300f9de26e94f909550379ffc041e9838582a8e2a193aa7a97588a2fb"),
+        "flat_p1_nohome": (
+            WindingJob(end_cap_type="Flat", home_before_wind=False,
                        layups=(Layup(passes=4, pattern_number=1, wind_angle=60.0, turnaround_angle=180.0),)),
-            1614, "668a2386254849efc181cac5b312bba60c9fc8b2ec70cad83fcad26b61cf3e06"),
-        "round_p5_steep_optimized": (
-            WindingJob(bandwidth=8.0, optimize_trajectory=True,
+            2217, "596e0e10cb90eb4ef9b78768bcf977353269bcbc00b4ba9d826b646e8fb5856b"),
+        "round_p5_steep": (
+            WindingJob(bandwidth=8.0,
                        layups=(Layup(passes=2, pattern_number=5, wind_angle=70.0, turnaround_angle=90.0),)),
-            4000, "6c725086fb2d1fdc4ab4ea0d1f69c4ca089c9b624b188824abefc2f72a2ede48"),
+            5509, "e5bedf007fa8835c6f77956c755e34152a88d634d921b68f3e562c0816488dc3"),
         "round_small_dwell": (
             WindingJob(tank_length=640.0, tank_diameter=160.0, end_cap_diameter=40.0, eye_width=35.0,
                        min_spacing=6.0, max_surface_speed=150.0,
                        layups=(Layup(passes=3, pattern_number=2, wind_angle=30.0, turnaround_angle=10.0),)),
-            1543, "82a8cf44e24e320b9fc981ef91dcf47bdb065f20509e6116702cf864f59bb47d"),
+            2981, "06db23fbb96c4fdb514f4376daed46010ec20aba93c8d36242a0b12569d65051"),
         "excel_style_zone": (
             WindingJob(tank_length=1640.0, tank_diameter=250.0, bandwidth=7.0, turnaround_zone=80.0,
+                       turnaround_zone_auto=False,
                        layups=(Layup(passes=3, pattern_number=5, wind_angle=12.0, turnaround_angle=156.0),
                                Layup(passes=2, pattern_number=7, wind_angle=54.0, turnaround_angle=72.0))),
-            19027, "9e4e4c56a453fccfed8a71929238c3960d746b37e121eb80be5b0a638713f9e1"),
+            28815, "b945d8bb8e56a7cd307814fbf03a177bad3f001f70975f7f024350d33f6985d1"),
         # A 90° wind between two helical layups: the lead-in over the dome, the
         # hoop pass, and the next layup starting from the far end.
         "hoop_between_helicals": (
@@ -114,7 +116,7 @@ class GoldenMaster(unittest.TestCase):
                        layups=(Layup(passes=2, pattern_number=3, wind_angle=40.0, turnaround_angle=200.0),
                                Layup(hoop=True),
                                Layup(passes=1, pattern_number=5, wind_angle=25.0, turnaround_angle=160.0))),
-            5875, "c866ae9ea3506da3e80fdb1450f11f2ff7b31ccdec2586fa39cbc35555a652fd"),
+            9000, "65b32892cd8323a3bc0f276ce61ad6d36b6292bfd6165fa7c69873dbc049ac4e"),
     }
 
     def test_output_unchanged(self):
@@ -265,7 +267,7 @@ def gcode_moves(lines):
 
 
 # Slow rotation and a near-hoop layup: long moves everywhere, before splitting.
-SLOW = WindingJob(max_surface_speed=60.0, turnaround_zone=0.0, layups=(
+SLOW = WindingJob(max_surface_speed=60.0, turnaround_zone=0.0, turnaround_zone_auto=False, layups=(
     Layup(passes=2, pattern_number=3, wind_angle=45.0, turnaround_angle=270.0),
     Layup(passes=1, pattern_number=1, wind_angle=89.0, turnaround_angle=90.0)))
 
@@ -315,17 +317,15 @@ class MoveSplitting(unittest.TestCase):
 class MaxRotationSpeed(unittest.TestCase):
     def test_no_written_move_turns_faster_than_the_limit(self):
         # For every G1 as the machine will run it: rotation rate = F * |da| / length.
-        # Never above Max Rotation Speed, and every rotating move uses (nearly)
-        # all of it -- unless it runs at Max Feedrate instead (the 12 deg layer).
-        for job in (SLOW, MULTI, WindingJob(turnaround_zone=80.0, optimize_trajectory=True),
+        # Never above Max Rotation Speed.
+        for job in (SLOW, MULTI, WindingJob(turnaround_zone=80.0, turnaround_zone_auto=False),
                     excel_layer(12, 5, 4, zone=80.0)):
             with self.subTest(speed=job.max_surface_speed, zone=job.turnaround_zone):
                 limit = job.max_a_speed
                 moves = [(dx, dy, da, f) for dx, dy, da, f in gcode_moves(gcode(job)) if da]
                 rates = [f * abs(da) / math.sqrt(dx * dx + dy * dy + da * da) for dx, dy, da, f in moves]
                 self.assertLessEqual(max(rates), limit)
-                for rate, (_, _, _, f) in zip(rates, moves):
-                    self.assertTrue(rate > 0.99 * limit or f > 0.99 * job.max_feed, (rate, f))
+        # (That every move runs at one of the limits: see MaxFilamentSpeed.)
 
     def test_initial_positioning_move_is_capped_too(self):
         # Its F equals the limit, so any rotation it involves can't exceed it.
@@ -357,69 +357,121 @@ def mid_tank_speeds(job, lines):
     return found
 
 
-class MaxFeedrate(unittest.TestCase):
-    JOBS = (MULTI, excel_layer(12, 5, 4, zone=80.0), SLOW,
-            WindingJob(max_feedrate=120.0, layups=(Layup(passes=2, wind_angle=30.0), Layup(passes=1, wind_angle=75.0))))
+def wind_moves(job, lines):
+    """(dx, dy, da, F, r) of every G1 of the wind itself (from the first layup
+    on), exactly as the machine runs it, with r the tank radius at the move's
+    end -- where the fiber it lays is measured, as the writer does."""
+    radius = winding._tank_geometry(job).radius
+    moves, pos, winding_started = [], [0.0, 0.0, 0.0], False
+    for ln in lines:
+        if ln.startswith("; LAYUP_START"):
+            winding_started = True
+        elif ln.startswith("G92"):
+            pos[2] = float(ln.split("A", 1)[1])
+        elif ln.startswith("G1"):
+            w = {tok[0]: float(tok[1:]) for tok in ln.split()[1:]}
+            new = [w.get("X", pos[0]), w.get("Y", pos[1]), w.get("A", pos[2])]
+            if winding_started:
+                moves.append((new[0] - pos[0], new[1] - pos[1], new[2] - pos[2], w["F"], radius(new[0])))
+            pos = new
+    return moves
 
-    def test_no_written_feed_exceeds_it(self):
-        for job in self.JOBS:
-            with self.subTest(feedrate=job.max_feedrate, layups=len(job.layups)):
-                feeds = [f for *_, f in gcode_moves(gcode(job))]
-                self.assertLessEqual(max(feeds), job.max_feed)
+
+def rates(move):
+    """(rotation deg/min, fiber mm/s) of a written move."""
+    dx, dy, da, f, r = move
+    length = math.sqrt(dx * dx + dy * dy + da * da)
+    tow = math.sqrt(dx * dx + (r * math.radians(da)) ** 2)
+    return f * abs(da) / length, f / 60.0 * tow / length
+
+
+# A tank so thin that Max Rotation Speed alone would exceed the MAX_FEED failsafe.
+THIN = WindingJob(tank_diameter=30.0, end_cap_diameter=10.0, chuck_offset=50.0,
+                  layups=(Layup(passes=1, pattern_number=1, wind_angle=45.0),))
+
+
+class MaxFilamentSpeed(unittest.TestCase):
+    @staticmethod
+    def jobs():
+        return (MULTI, excel_layer(12, 5, 4, zone=80.0), SLOW, HOOPS,
+                WindingJob(max_filament_speed=120.0, layups=(Layup(passes=2, wind_angle=30.0),
+                                                             Layup(passes=1, wind_angle=75.0))))
+
+    def test_no_written_move_lays_fiber_faster_than_the_limit(self):
+        for job in self.jobs():
+            with self.subTest(filament=job.max_filament_speed, layups=len(job.layups)):
+                fiber = [rates(m)[1] for m in wind_moves(job, gcode(job))]
+                self.assertLessEqual(max(fiber), job.max_filament_speed * (1 + 1e-9))
+
+    def test_every_move_runs_at_the_limit_it_reaches_first(self):
+        # Whichever applies to the move: the mandrel at Max Rotation Speed, the
+        # fiber at Max Filament Speed, or F at the failsafe -- within rounding.
+        for job in self.jobs() + (THIN,):
+            with self.subTest(filament=job.max_filament_speed, layups=len(job.layups)):
+                for move in wind_moves(job, gcode(job)):
+                    rotation, fiber = rates(move)
+                    self.assertTrue(rotation > 0.99 * job.max_a_speed or fiber > 0.99 * job.max_filament_speed
+                                    or move[3] > 0.99 * winding.MAX_FEED, move)
+
+    def test_no_feed_above_the_failsafe(self):
+        self.assertGreater(THIN.max_a_speed, winding.MAX_FEED)
+        lines = gcode(THIN)
+        feeds = [f for *_, f in gcode_moves(lines)]
+        self.assertEqual(max(feeds), winding.MAX_FEED)
+        # The travel to the start lays no fiber: Max Rotation Speed's rate, capped.
+        setup = [ln for ln in lines[:lines.index("PAUSE")] if ln.startswith("G1")]
+        self.assertTrue(all(float(ln.rsplit("F", 1)[1]) == winding.MAX_FEED for ln in setup))
 
     def test_it_holds_the_carriage_back_at_low_angles(self):
         # 12 deg on a 250 mm tank: turning at Max Rotation Speed alone would run
-        # the carriage at over 1 m/s. Capped, it runs at (nearly) Max Feedrate.
+        # the carriage at over 1 m/s. Mid-tank the fiber runs at (nearly) Max
+        # Filament Speed instead, the carriage at that times cos(12 deg).
         job = excel_layer(12, 5, 4)
-        x_speed, feed = mid_tank_speeds(job, gcode(job))[0]
+        x_speed, _ = mid_tank_speeds(job, gcode(job))[0]
         self.assertGreater(job.max_surface_speed / math.tan(math.radians(12)), 1000.0)
-        self.assertLessEqual(x_speed, job.max_feedrate)
-        self.assertGreater(x_speed, 0.95 * job.max_feedrate)
-        self.assertEqual(feed, job.max_feed)
+        self.assertAlmostEqual(x_speed, job.max_filament_speed * math.cos(math.radians(12)), delta=0.01 * x_speed)
 
     def test_wind_speed_names_the_limit_the_program_runs_at(self):
-        # wind_speed() predicts the mid-tank speed of every layup -- 20 deg is
-        # held back by Max Feedrate, 45 and 70 deg turn at Max Rotation Speed.
+        # wind_speed() predicts every layup's mid-tank speed and limit: the fiber
+        # limit wherever turning at Max Rotation Speed would lay fiber faster
+        # (220 / sin(angle) > 310 mm/s: 20 and 45 deg), rotation above that.
         speeds = mid_tank_speeds(MULTI, gcode(MULTI))
         for i, layup in enumerate(MULTI.layups):
             ws = winding.wind_speed(MULTI, layup)
+            fiber_at_rotation = MULTI.max_surface_speed / math.sin(math.radians(layup.wind_angle))
             with self.subTest(angle=layup.wind_angle):
-                self.assertEqual(ws.limit, "feed" if layup.wind_angle < 30 else "rotation")
+                self.assertEqual(ws.limit, "filament" if fiber_at_rotation > MULTI.max_filament_speed else "rotation")
                 self.assertAlmostEqual(speeds[i][0], ws.x_speed, delta=0.01 * ws.x_speed)
                 self.assertAlmostEqual(speeds[i][1], ws.feed, delta=0.01 * ws.feed)
-                limit, reached = (MULTI.max_feed, ws.feed) if ws.limit == "feed" else (MULTI.max_a_speed, ws.rotation)
+                self.assertAlmostEqual(ws.fiber, ws.x_speed / math.cos(math.radians(layup.wind_angle)))
+                limit, reached = ((MULTI.max_filament_speed, ws.fiber) if ws.limit == "filament"
+                                  else (MULTI.max_a_speed, ws.rotation))
                 self.assertAlmostEqual(reached, limit, delta=1e-6 * limit)
 
     def test_the_limit_follows_both_settings(self):
         layup = Layup(wind_angle=30.0)
-        self.assertEqual(winding.wind_speed(WindingJob(max_feedrate=300.0), layup).limit, "feed")
-        self.assertEqual(winding.wind_speed(WindingJob(max_feedrate=500.0), layup).limit, "rotation")
-        self.assertEqual(winding.wind_speed(WindingJob(max_feedrate=500.0, max_surface_speed=400.0), layup).limit, "feed")
+        self.assertEqual(winding.wind_speed(WindingJob(), layup).limit, "filament")
+        self.assertEqual(winding.wind_speed(WindingJob(max_filament_speed=500.0), layup).limit, "rotation")
+        self.assertEqual(winding.wind_speed(WindingJob(max_filament_speed=500.0, max_surface_speed=400.0), layup).limit,
+                         "filament")
+        self.assertEqual(winding.wind_speed(THIN, Layup(wind_angle=80.0)).limit, "feed")
         self.assertIsNone(winding.wind_speed(WindingJob(), Layup(wind_angle=90.0)))
 
     def test_estimated_time_is_the_time_the_file_takes(self):
-        # The preview's time comes from the same capped feed rates.
+        # The preview's time comes from the same limited feed rates.
         job = replace(excel_layer(12, 5, 4, zone=80.0), home_before_wind=False)
         wind = gcode_moves(gcode(job))[1:]  # after the move from the origin to the start
         written = sum(math.sqrt(dx * dx + dy * dy + da * da) / f * 60.0 for dx, dy, da, f in wind)
         self.assertAlmostEqual(winding.simulate(job).total_time, written, delta=0.001 * written)
 
-    def test_travel_is_capped_too(self):
-        # On a thin tank Max Rotation Speed is a huge A rate; the travel to the
-        # start must still respect Max Feedrate.
-        job = WindingJob(tank_diameter=40.0, end_cap_diameter=10.0, max_feedrate=50.0,
-                         layups=(Layup(passes=1, wind_angle=45.0),))
-        self.assertGreater(job.max_a_speed, job.max_feed)
-        lines = gcode(job)
-        setup = [ln for ln in lines[:lines.index("PAUSE")] if ln.startswith("G1")]
-        self.assertTrue(all(float(ln.rsplit("F", 1)[1]) == job.max_feed for ln in setup))
-
     def test_validation_and_old_files(self):
-        self.assertIn("Max Feedrate must be at least 1 mm/s.", winding.geometry_errors(WindingJob(max_feedrate=0.5)))
+        self.assertIn("Max Filament Speed must be at least 1 mm/s.",
+                      winding.geometry_errors(WindingJob(max_filament_speed=0.5)))
         # It never changes the path, so a file from before it existed simply
         # restores the default.
-        self.assertNotIn("max_feedrate", winding.LEGACY_VALUES)
-        self.assertIn(("max_feedrate", 300.0), winding.settings_items(WindingJob()))
+        self.assertNotIn("max_filament_speed", winding.LEGACY_VALUES)
+        self.assertIn(("max_filament_speed", 310.0), winding.settings_items(WindingJob()))
+        self.assertNotIn("max_feedrate", winding.GLOBAL_KEYS)
 
 
 class WindStart(unittest.TestCase):
@@ -482,6 +534,19 @@ class WindStart(unittest.TestCase):
 TWO_LAYUPS = WindingJob(layups=(Layup(passes=2, pattern_number=3), Layup(passes=2, pattern_number=5, wind_angle=70.0)))
 
 
+def after_first_move(lines, marker):
+    # The lines after the first G1 that follows `marker`.
+    i = lines.index(marker)
+    return lines[next(j for j in range(i, len(lines)) if lines[j].startswith("G1")) + 1:]
+
+
+def without_angle_updates(lines):
+    # The layer display's angle is updated every second of winding counted
+    # from where a program starts winding the cycle -- so a partial program
+    # updates it on other lines than the complete one; everything else matches.
+    return [ln for ln in lines if not ln.startswith("SET_PRINT_STATS_INFO CURRENT_LAYER=")]
+
+
 def partial(job, point, rehome=False):
     buf = io.StringIO()
     winding.write_gcode(buf, job, resume=winding.Resume(point, rehome))
@@ -493,7 +558,7 @@ class PauseAfterLayup(unittest.TestCase):
         lines = gcode(TWO_LAYUPS)
         i = lines.index("; LAYUP_START:2")
         self.assertEqual(lines[i - 1], "PAUSE")
-        self.assertEqual(lines[i - 3:i - 1][0], "G92 A0")  # after the last cycle's reset
+        self.assertEqual(lines[i - 5], "G92 A0")  # after the last cycle's reset, its comment and the message
         self.assertEqual(sum(ln == "PAUSE" for ln in lines), 2)  # plus the one at the wind start
         self.assertNotEqual(lines[-1], "PAUSE")
 
@@ -518,8 +583,8 @@ class PartialProgram(unittest.TestCase):
         location = winding.locate(TWO_LAYUPS, point)
         self.assertEqual(body[1].split()[1:4], [f"X{location.x:.3f}", f"Y{location.y:.3f}", "A500.000"])
         # From there on, the same lines as the complete program.
-        full = gcode(TWO_LAYUPS)
-        rest = body[body.index("; LAYUP_START:1") + 2:]  # skip the cut-short first move
+        full = without_angle_updates(gcode(TWO_LAYUPS))
+        rest = without_angle_updates(after_first_move(body, "; LAYUP_START:1"))  # skip the cut-short first move
         start = full.index(rest[0])
         self.assertEqual(full[start:start + len(rest)], rest)
         self.assertEqual(full[start:], rest)
@@ -574,34 +639,94 @@ class PartialProgram(unittest.TestCase):
         self.assertGreaterEqual(len(progress.runs[1]), 6)
 
 
-class TurnaroundZone(unittest.TestCase):
-    def test_zone_replaces_the_pure_rotation_dwell(self):
-        # With a zone, the only pure-rotation move left is the program's very
-        # last one (nothing follows it to spread the rest of its rotation into),
-        # and no rotation is lost or added along the way.
-        plain = excel_layer(20, 7, 4)
-        zoned = excel_layer(20, 7, 4, zone=80.0)
-        moves = [ev for ev in winding.iter_program(zoned) if type(ev) is Move]
-        n_dwell = sum(mv.dwell for mv in moves)  # that one move may be split in pieces
-        self.assertGreaterEqual(n_dwell, 1)
-        self.assertTrue(all(mv.dwell for mv in moves[-n_dwell:]))
-        plain_final = [ev for ev in winding.iter_program(plain) if type(ev) is Move][-1].a
-        self.assertAlmostEqual(moves[-1].a, plain_final, places=6)
+def klipper_junctions(job):
+    """Klipper-for-CNC's look-ahead (toolhead.Move.calc_junction) replayed over
+    the written program, at its default square_corner_velocity (5 mm/s) and an
+    acceleration of 3000: [(junction speed allowed, commanded speed, deflection
+    deg)] for every junction between two moves of the same helical layup."""
+    scv, accel = 5.0, 3000.0
+    jd = scv * scv * (math.sqrt(2) - 1) / accel
+    out, prev, layup, pos = [], None, None, [0.0, 0.0, 0.0]
+    for ln in gcode(job):
+        if ln.startswith("; LAYUP_START:"):
+            layup, prev = int(ln.split(":")[1]) - 1, None
+        elif ln.startswith("G92"):
+            pos[2] = float(ln.split("A", 1)[1])
+        elif ln.startswith("G1"):
+            w = {tok[0]: float(tok[1:]) for tok in ln.split()[1:]}
+            new = [w.get("X", pos[0]), w.get("Y", pos[1]), w.get("A", pos[2])]
+            d = [n - p for n, p in zip(new, pos)]
+            pos = new
+            length = math.sqrt(sum(c * c for c in d))
+            if layup is None or job.layups[layup].hoop or length == 0:
+                prev = None
+                continue
+            r, v = [c / length for c in d], w["F"] / 60.0
+            if prev is not None:
+                pr, plength, pv = prev
+                cos_t = -sum(a * b for a, b in zip(r, pr))
+                s, c = math.sqrt(max(.5 * (1 - cos_t), 0.)), math.sqrt(max(.5 * (1 + cos_t), 0.))
+                v2 = min(v, pv) ** 2
+                if 1 - s > 0 and c > 0:
+                    v2 = min(v2, s / (1 - s) * jd * accel, min(length, plength) * accel * .5 * s / c)
+                out.append((math.sqrt(v2), min(v, pv), math.degrees(math.acos(max(-1., min(1., -cos_t))))))
+            prev = (r, length, v)
+    return out
 
-    def test_zone_spreads_rotation_over_its_length(self):
-        # The turnaround rotation happens across the whole zone: every step in
-        # it turns the mandrel by more than the plain helix would.
-        job = excel_layer(20, 7, 2, zone=80.0)
-        plan = winding.plan_layup(job, job.layups[0])
-        helix_step = winding.STEP_SIZE / plan.pitch * 360.0
-        x_end = job.chuck_offset + job.tank_length
-        prev, zone_steps = None, []
-        for ev in winding.iter_program(job):
-            if type(ev) is Move and prev is not None and ev.circuit == 0 and ev.x > prev.x and ev.x > x_end - 80.0 + 1e-9:
-                zone_steps.append(ev.a - prev.a)
-            prev = ev if type(ev) is Move else prev
-        self.assertEqual(len(zone_steps), 16)
-        self.assertTrue(all(step > helix_step + 1.0 for step in zone_steps))
+
+class SmoothTurnaround(unittest.TestCase):
+    def test_auto_zone_is_the_dome(self):
+        job = WindingJob()
+        self.assertAlmostEqual(job.turnaround_zone, job.dome_length)
+        self.assertEqual(WindingJob(end_cap_type="Flat").turnaround_zone, winding.FLAT_TURNAROUND_ZONE)
+        self.assertEqual(WindingJob(turnaround_zone=30.0, turnaround_zone_auto=False).turnaround_zone, 30.0)
+        self.assertEqual(WindingJob(tank_length=150.0).turnaround_zone, 75.0)  # at most half the tank
+        self.assertIs(winding.LEGACY_VALUES["turnaround_zone_auto"], False)  # older files keep their zone
+
+    def test_klipper_takes_every_turnaround_at_speed(self):
+        # The old zone met the helix at a 42 deg kink, where Klipper's junction
+        # deviation braked the carriage to 12 mm/s. The curve turns at most
+        # TURN_MAX_DEFLECTION per move (plus coordinate rounding), so Klipper
+        # never has to slow much below the commanded speed anywhere in a layup.
+        for job in (WindingJob(layups=(Layup(passes=3),)), MULTI, HOOPS, excel_layer(12, 5, 4, zone=50.0),
+                    WindingJob(end_cap_type="Flat", layups=(Layup(passes=2, wind_angle=30.0),))):
+            with self.subTest(layups=len(job.layups), zone=job.turnaround_zone):
+                junctions = klipper_junctions(job)
+                self.assertLess(max(d for *_, d in junctions), winding.TURN_MAX_DEFLECTION + 0.2)
+                self.assertGreater(min(v / commanded for v, commanded, _ in junctions), 0.99)
+        # Without a zone it's the pure rotation at the end: the old full stop.
+        self.assertLess(min(v / c for v, c, _ in klipper_junctions(excel_layer(12, 5, 2))), 0.1)
+
+    def test_reversal_at_the_tank_end_inside_the_zone(self):
+        job = WindingJob(layups=(Layup(passes=2),))
+        x_start, x_end = job.chuck_offset, job.chuck_offset + job.tank_length
+        moves = [ev for ev in winding.iter_program(job) if type(ev) is Move]
+        xs = [m.x for m in moves]
+        self.assertAlmostEqual(max(xs), x_end)
+        self.assertAlmostEqual(min(xs), x_start)
+        # Turning around only inside the zones: between them the carriage keeps going one way.
+        lo, hi = x_start + job.turnaround_zone, x_end - job.turnaround_zone
+        for p, q in zip(moves, moves[1:]):
+            if lo < p.x < hi and lo < q.x < hi:
+                self.assertNotEqual(p.x, q.x)
+        # The only pure rotation is the program's very last move (nothing runs out of it).
+        n_dwell = sum(m.dwell for m in moves)
+        self.assertTrue(all(m.dwell for m in moves[-n_dwell:]) and n_dwell >= 1)
+
+    def test_rotation_per_turnaround_is_unchanged(self):
+        # The curve turns the mandrel by exactly what a turnaround always did
+        # (the helix in and out of the zone plus the dwell), so the pattern and
+        # every point after it are where they were with a pure rotation at the
+        # end -- across layup changes too.
+        on_the_spot = WindingJob(**{k: getattr(MULTI, k) for k in winding.GLOBAL_KEYS
+                                    if k not in ("turnaround_zone", "turnaround_zone_auto")},
+                                 turnaround_zone=0.0, turnaround_zone_auto=False, layups=MULTI.layups)
+        for curved, spot in zip(crossings(MULTI), crossings(on_the_spot)):
+            self.assertEqual(curved.keys(), spot.keys())
+            for key in curved:
+                self.assertAlmostEqual(curved[key], spot[key], places=6)
+        last = lambda job: [ev for ev in winding.iter_program(job) if type(ev) is Move][-1].a
+        self.assertAlmostEqual(last(MULTI), last(on_the_spot), places=6)
 
     def test_zone_validation(self):
         self.assertEqual(winding.geometry_errors(excel_layer(20, 7, 4, zone=740.0)), [])
@@ -635,16 +760,6 @@ class MultiLayupProgram(unittest.TestCase):
             circuits = {mv.circuit for mv in moves if mv.layup == li}
             self.assertEqual(circuits, set(range(layup.passes * layup.pattern_number)))
 
-    def test_optimize_trajectory_conserves_rotation(self):
-        # Blending moves dwell rotation around but never adds or loses any -- also
-        # across layup transitions, where the blend carries into the next layup.
-        plain = [ev for ev in winding.iter_program(MULTI) if type(ev) is Move]
-        eased_job = WindingJob(**{k: getattr(MULTI, k) for k in winding.GLOBAL_KEYS if k != "optimize_trajectory"},
-                               optimize_trajectory=True, layups=MULTI.layups)
-        eased = [ev for ev in winding.iter_program(eased_job) if type(ev) is Move]
-        self.assertEqual(len(plain), len(eased))
-        self.assertAlmostEqual(plain[-1].a, eased[-1].a, places=6)
-
     def test_gcode_markers_and_axis_resets(self):
         lines = gcode(MULTI)
         self.assertEqual([ln for ln in lines if ln.startswith("; LAYUP_START")],
@@ -652,7 +767,8 @@ class MultiLayupProgram(unittest.TestCase):
         # One reset per cycle within the wind (plus the one zeroing A at resume).
         wind = lines[lines.index("; LAYUP_START:1"):]
         self.assertEqual(sum(ln == "G92 A0" for ln in wind), MULTI.total_cycles)
-        self.assertEqual(lines[-2:], [f"; CYCLE_COMPLETE:{MULTI.total_cycles}", "G92 A0"])
+        self.assertEqual(lines[-4:-2], [f"; CYCLE_COMPLETE:{MULTI.total_cycles}", "G92 A0"])
+        self.assertEqual(lines[-2], "M117 Wind complete")
         # A is reset after every cycle, so written values stay near one cycle's worth
         # of rotation rather than growing with the whole program.
         written_a = [float(tok[1:]) for ln in lines if ln.startswith("G1") for tok in ln.split() if tok[0] == "A"]
@@ -768,7 +884,7 @@ class NinetyDegreeWind(unittest.TestCase):
 
     def test_straight_section_too_short(self):
         # Round caps on a 200 mm tank: domes of ~97 mm each leave 6 mm straight.
-        job = WindingJob(tank_length=200.0, bandwidth=8.0, turnaround_zone=0.0, layups=(Layup(), Layup(hoop=True)))
+        job = WindingJob(tank_length=200.0, bandwidth=8.0, layups=(Layup(), Layup(hoop=True)))
         self.assertIn("Layup 2: The straight section is too short for a 90° wind (it must be longer than the band "
                       "is wide).", winding.geometry_errors(job))
 
@@ -797,12 +913,135 @@ class NinetyDegreeWind(unittest.TestCase):
         lead_in_rotation = next(m.a for m in lead_in if abs(m.x - first) < 1e-9) - location.a_offset
         self.assertAlmostEqual(location.x, first + (20000.0 - lead_in_rotation) / 360.0 * HOOPS.bandwidth, places=6)
         part = partial(HOOPS, point)
-        full = gcode(HOOPS)
-        rest = part[part.index("; LAYUP_START:2") + 2:]
+        full = without_angle_updates(gcode(HOOPS))
+        rest = without_angle_updates(after_first_move(part, "; LAYUP_START:2"))
         self.assertEqual(full[full.index(rest[0]):], rest)
         progress = winding.progress(HOOPS, winding.ProgramPoint(2, 0, 0.0))
         self.assertNotIn(1, progress.covered)  # drawn band by band, not as a solid tank
         self.assertIn(1, progress.runs)
+
+
+STATUS = ("SET_PRINT_STATS_INFO", "M117 ", "RESPOND ")
+
+
+def mainsail_layer(lines):
+    """What Mainsail's "Layer x of y" shows while the file runs: Klipper-for-CNC's
+    print_stats.cmd_SET_PRINT_STATS_INFO replayed over every SET_PRINT_STATS_INFO
+    line. [(current, total, A of the move before it, cycle or None)] per line --
+    the cycle from the last CYCLE_COMPLETE marker."""
+    total = current = None
+    a, shown = 0.0, []
+    for ln in lines:
+        if ln.startswith("G92"):
+            a = float(ln.split("A", 1)[1])
+        elif ln.startswith("G1"):
+            a = next((float(t[1:]) for t in ln.split()[1:] if t[0] == "A"), a)
+        elif ln.startswith("SET_PRINT_STATS_INFO"):
+            v = {k: int(x) for k, x in (tok.split("=") for tok in ln.split()[1:])}
+            new_total, new_current = v.get("TOTAL_LAYER", total), v.get("CURRENT_LAYER", current)
+            if new_total == 0:
+                total = current = None
+            elif new_total != total:
+                total, current = new_total, 0
+            if total is not None and new_current is not None and new_current != current:
+                current = min(new_current, total)
+            shown.append((current, total, a))
+    return shown
+
+
+class StatusMessages(unittest.TestCase):
+    def test_layer_display_shows_the_angle_within_the_cycle(self):
+        # "Layer 1234 of 5760": the mandrel angle A (it restarts at 0 with every
+        # cycle) out of the angle the cycle ends at, in whole degrees.
+        for job in (MULTI, HOOPS):
+            with self.subTest(layups=len(job.layups)):
+                lines = gcode(job)
+                # Each cycle's total is where its A ends, just before CYCLE_COMPLETE.
+                totals, ends, a, total = [], [], 0.0, None
+                for ln in lines:
+                    if ln.startswith("SET_PRINT_STATS_INFO TOTAL_LAYER="):
+                        totals.append(int(ln.split()[1].split("=")[1]))
+                    elif ln.startswith("G1"):
+                        a = next((float(t[1:]) for t in ln.split()[1:] if t[0] == "A"), a)
+                    elif ln.startswith("; CYCLE_COMPLETE"):
+                        ends.append(a)
+                self.assertEqual(len(totals), job.total_cycles)
+                for t, end in zip(totals, ends):
+                    self.assertLessEqual(abs(t - end), 0.5)
+                # What Mainsail shows: always the angle Klipper has just read, up to the total.
+                shown = mainsail_layer(lines)
+                for current, shown_total, a in shown:
+                    self.assertLessEqual(current, shown_total)
+                    self.assertLessEqual(abs(current - a), 0.5 if current < shown_total else shown_total)
+
+    def test_the_angle_is_updated_about_every_second(self):
+        lines = gcode(MULTI)
+        since, gaps = 0.0, []
+        pos = [0.0, 0.0, 0.0]
+        started = False
+        for ln in lines:
+            if ln.startswith("; LAYUP_START"):
+                started = True
+            elif ln.startswith("G92"):
+                pos[2] = float(ln.split("A", 1)[1])
+            elif ln.startswith("G1"):
+                w = {t[0]: float(t[1:]) for t in ln.split()[1:]}
+                new = [w.get("X", pos[0]), w.get("Y", pos[1]), w.get("A", pos[2])]
+                if started:
+                    since += math.dist(new, pos) / w["F"] * 60.0
+                pos = new
+            elif ln.startswith("SET_PRINT_STATS_INFO") or ln.startswith("; CYCLE_COMPLETE"):
+                gaps.append(since)
+                since = 0.0
+        # Never longer than the update interval plus one move (at most Max Move Time).
+        self.assertLess(max(gaps), winding.LAYER_UPDATE_SECONDS + MULTI.max_move_time + 1e-6)
+
+    def test_each_cycle_start_is_announced(self):
+        lines = gcode(HOOPS)
+        i = lines.index("; LAYUP_START:2")
+        self.assertRegex(lines[i + 1], r"^SET_PRINT_STATS_INFO TOTAL_LAYER=\d+ CURRENT_LAYER=0$")
+        self.assertEqual(lines[i + 2:i + 4], [
+            "M117 Layup 2/5 - Cycle 1/1 - 90 deg wind",
+            'RESPOND MSG="Starting cycle 1/1 of layup 2/5 (90 deg wind, straight section)"'])
+        # ...including after every cycle reset within a layup: the cycle number
+        # is in the status line.
+        j = lines.index("; CYCLE_COMPLETE:1")
+        self.assertEqual(lines[j + 1], "G92 A0")
+        self.assertRegex(lines[j + 2], r"^SET_PRINT_STATS_INFO TOTAL_LAYER=\d+ CURRENT_LAYER=0$")
+        self.assertEqual(lines[j + 3], "M117 Layup 1/5 - Cycle 2/2 - 45 deg")
+        self.assertEqual(lines[-2:], ["M117 Wind complete", f'RESPOND MSG="Wind complete: 5 layups, {HOOPS.total_cycles} cycles"'])
+
+    def test_pauses_say_what_to_do(self):
+        lines = gcode(HOOPS)
+        pauses = [i for i, ln in enumerate(lines) if ln == "PAUSE"]
+        self.assertEqual(len(pauses), len(HOOPS.layups))  # the wind start, then one between each pair of layups
+        self.assertEqual(lines[pauses[0] - 2], "M117 Attach the fiber, then resume")
+        for i in pauses[1:]:
+            self.assertRegex(lines[i - 2], r"^M117 Layup \d/5 done - check the fiber, then resume$")
+            self.assertTrue(lines[i - 1].startswith('RESPOND MSG="Layup ') and "Next: layup" in lines[i - 1])
+
+    def test_partial_program_starts_with_its_cycle(self):
+        part = partial(HOOPS, winding.ProgramPoint(2, 1, 300.0))
+        i = part.index("; LAYUP_START:3")
+        # The layer display continues at the point's angle, out of the angle
+        # that cycle ends at -- the same total as in the complete program.
+        full_totals = [ln for ln in gcode(HOOPS) if ln.startswith("SET_PRINT_STATS_INFO TOTAL_LAYER=")]
+        cycle_index = sum(l.passes for l in HOOPS.layups[:2]) + 1
+        self.assertEqual(part[i + 1], full_totals[cycle_index].replace("CURRENT_LAYER=0", "CURRENT_LAYER=300"))
+        self.assertEqual(part[i + 2], "M117 Layup 3/5 - Cycle 2/2 - 30 deg")
+        self.assertEqual(mainsail_layer(part)[0][0], 300)
+        rehomed = partial(HOOPS, winding.ProgramPoint(2, 1, 300.0), rehome=True)
+        self.assertEqual(rehomed[rehomed.index("PAUSE") - 2], "M117 Reattach the fiber, then resume")
+
+    def test_messages_are_safe_for_klipper(self):
+        # Klipper-for-CNC aborts on anything it can't parse: plain ASCII, no ';'
+        # (a comment), no '#'/'*' (end of arguments), one quoted RESPOND MSG.
+        for ln in gcode(HOOPS) + gcode(WindingJob(layups=(Layup(wind_angle=37.5),))):
+            if ln.startswith(STATUS):
+                self.assertTrue(ln.isascii() and not any(c in ln for c in ";#*'"), ln)
+                if ln.startswith("RESPOND"):
+                    self.assertRegex(ln, r'^RESPOND MSG="[^"]+"$')
+        self.assertEqual(winding._machine_text('45° "x"; #1 * it\'s'), "45 deg x 1 its")
 
 
 class Validation(unittest.TestCase):

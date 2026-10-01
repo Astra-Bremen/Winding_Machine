@@ -9,7 +9,22 @@ import theme
 import winding
 from plan_tab import PlanTab
 from partial_page import PartialPage
-from view_tab import ViewTab
+from progress_dialog import Cancelled, ProgressTask
+from view_tab import ViewTab, read_gcode
+
+# Of a "Generate G-Code" run's progress bar: the share for writing the file;
+# the rest is for loading it into the G-Code Preview, which takes about as long.
+WRITE_SHARE = 0.5
+
+
+def _estimate_header(job, material, result):
+    # The material estimate's inputs (a strength.Material, or None while they
+    # don't hold numbers) and its results for `job`, recorded in the file.
+    if material is None:
+        return []
+    if strength.errors(material):
+        return strength.header_items(material)
+    return strength.header_items(material, strength.estimate(job, result, material))
 
 
 def _is_set(var):
@@ -328,16 +343,6 @@ class CFRPWinderApp:
 
     # --- G-code generation ---
 
-    def _estimate_header(self, job):
-        # The material estimate's inputs and results, recorded in the file.
-        try:
-            material = self.build_material()
-        except winding.SettingsError:
-            return []
-        if strength.errors(material):
-            return strength.header_items(material)
-        result = self.plan_tab.simulation_for(job) or winding.simulate(job)
-        return strength.header_items(material, strength.estimate(job, result, material))
 
     def generate(self, resume=None):
         """Writes the program to a file the user picks. With a winding.Resume,
@@ -365,7 +370,8 @@ class CFRPWinderApp:
         partial_code = ""
         if resume is not None:
             try:
-                location = winding.locate(job, resume.point)
+                # The partial page has usually worked it out already.
+                location = self.plan_tab.location_for(job, resume.point) or winding.locate(job, resume.point)
             except winding.PointError as e:
                 messagebox.showerror("Error", f"Can't continue from there:\n{e}")
                 return
@@ -376,31 +382,65 @@ class CFRPWinderApp:
                           f"{h:02d}_{m:02d}_{s:02d}.gcode")
         filepath = filedialog.asksaveasfilename(defaultextension=".gcode", filetypes=[("G-Code Files", "*.gcode")], initialfile=suggested_name)
         if not filepath: return
-        # Written to a temporary file next to the target and only moved into
-        # place once complete: the machine must never be handed a truncated
-        # program (e.g. one missing its END_GCODE) because writing failed halfway.
-        tmp_path = filepath + ".part"
+        # A long program takes a while to write (and as long again to load into
+        # the G-Code Preview): that runs on a worker thread behind a progress
+        # window. Everything it needs from the app is gathered here, on the GUI
+        # thread -- Tk variables and the preview's cache aren't the worker's to read.
         try:
-            with open(tmp_path, "w") as f:
-                winding.write_gcode(f, job, self.START_GCODE, self.END_GCODE, resume=resume,
-                                    extra_header=self._estimate_header(job))
-            os.replace(tmp_path, filepath)
-        except Exception as e:
-            messagebox.showerror("Error", f"G-code generation failed:\n{e}")
-            return
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        if resume is not None:
-            p = resume.point
-            self.set_status(f"Partial G-code generated (continues from Layup {p.layup + 1}, Cycle {p.cycle + 1}, "
-                            f"A {p.angle:.1f}°): {filepath}")
-        else:
-            layup_note = f" ({len(job.layups)} layups, {job.total_cycles} cycles)" if len(job.layups) > 1 else ""
-            self.set_status(f"G-code generated{layup_note}: {filepath}")
+            material = self.build_material()
+        except winding.SettingsError:
+            material = None
+        cached = self.plan_tab.simulation_for(job)
+        skipped = location.elapsed if resume is not None else 0.0  # wound before a partial program begins
+        start_gcode, end_gcode = self.START_GCODE, self.END_GCODE
         kind = "Partial G-Code" if resume is not None else "G-Code"
-        messagebox.showinfo("Success", f"{kind} generated!\nSaved to: {filepath}")
-        self.view_tab.open_gcode_view(filepath)
+
+        def work(progress):
+            result = cached
+            if result is None:
+                progress(None, "Working out the wind…")
+                result = winding.simulate(job)
+            # Progress is the winding time written so far, out of the total.
+            total = max(1e-9, result.total_time - skipped)
+            progress(0.0, "Writing the G-code…")
+            # Written to a temporary file next to the target and only moved
+            # into place once complete: the machine must never be handed a
+            # truncated program (e.g. one missing its END_GCODE) because writing
+            # failed -- or was cancelled -- halfway.
+            tmp_path = filepath + ".part"
+            try:
+                with open(tmp_path, "w") as f:
+                    winding.write_gcode(f, job, start_gcode, end_gcode, resume=resume,
+                                        extra_header=_estimate_header(job, material, result),
+                                        on_progress=lambda written: progress(WRITE_SHARE * min(1.0, written / total)))
+                os.replace(tmp_path, filepath)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            # Saved. Cancelling (or failing) from here on only skips the preview.
+            try:
+                return read_gcode(filepath, lambda f: progress(WRITE_SHARE + (1 - WRITE_SHARE) * f,
+                                                               "Loading it into the G-Code Preview…"))
+            except (Cancelled, OSError, UnicodeDecodeError, ValueError):
+                return None
+
+        def done(data):
+            if data is not None:
+                self.view_tab.show_file(filepath, data)
+            if resume is not None:
+                p = resume.point
+                self.set_status(f"Partial G-code generated (continues from Layup {p.layup + 1}, Cycle {p.cycle + 1}, "
+                                f"A {p.angle:.1f}°): {filepath}")
+            else:
+                layup_note = f" ({len(job.layups)} layups, {job.total_cycles} cycles)" if len(job.layups) > 1 else ""
+                self.set_status(f"G-code generated{layup_note}: {filepath}")
+            note = "" if data is not None else "\n(Not loaded into the G-Code Preview -- use Open G-Code.)"
+            # The file's name, then its folder: a path has no spaces to wrap at.
+            return f"{kind} saved", f"{os.path.basename(filepath)}\nin {os.path.dirname(filepath)}{note}"
+
+        ProgressTask(self, f"Generating {kind}", work, on_done=done, finishing="Drawing the preview…",
+                     on_error=lambda e: messagebox.showerror("Error", f"G-code generation failed:\n{e}"),
+                     on_cancel=lambda: self.set_status("G-code generation cancelled. Nothing was saved."))
 
 
 if __name__ == "__main__":

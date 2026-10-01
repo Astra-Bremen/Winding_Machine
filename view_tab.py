@@ -1,10 +1,131 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import math
+import os
+from typing import NamedTuple
 import strength
 import theme
 import winding
+from ttkbootstrap.widgets.tooltip import ToolTip
 from theme import VIEWPORT_PALETTE as VP
+from progress_dialog import ProgressTask
+
+# Which layup a command belongs to before the first "; LAYUP_START" marker:
+# homing and the move to the wind start are setup, not fiber.
+SETUP = -1
+# Files at least this big are read on a worker thread behind a progress window
+# (around a second's worth of reading); smaller ones open on the spot.
+BACKGROUND_LOAD_BYTES = 1_000_000
+
+
+class GcodeData(NamedTuple):
+    """A G-code file as the viewer shows it (see read_gcode)."""
+    commands: list      # (x, y, true continuous A, A as written) per move
+    times: list         # elapsed seconds at the end of each move
+    cycles: list        # cycle number (across the program) per move
+    cycle_starts: dict  # cycle number -> index of its first move
+    layups: list        # layup index (or SETUP) per move
+    settings: dict      # the settings header, {key: raw string}
+    resume: object      # how a partial program continues (winding.Resume), or None
+    total_cycles: int
+    layup_count: int
+
+
+def _first_cycle_number(settings):
+    # The number of the file's first cycle, counted across the whole program:
+    # 1, except in a partial program, which continues mid-program.
+    layups = winding.layups_from_header(settings)
+    resume = winding.resume_from_header(settings)
+    if resume is None or not layups:
+        return 1
+    return sum(l.passes for l in layups[:resume.point.layup]) + resume.point.cycle + 1
+
+
+def read_gcode(filepath, on_progress=None):
+    """Reads a G-code file for the viewer: pure, without Tk, so a large file can
+    be read on a worker thread. `on_progress`, if given, gets the share of the
+    file read so far (0-1) every few thousand lines. Raises OSError,
+    UnicodeDecodeError or ValueError for a file it can't read."""
+    commands, times, cycles, cycle_starts, cmd_layups, settings = [], [], [], {}, [], {}
+    size, read = max(1, os.path.getsize(filepath)), 0
+    with open(filepath, 'r') as f:
+        cx, cy, ca = 0.0, 0.0, 0.0
+        a_offset = 0.0
+        cycle_num = None  # known once the settings header has been read
+        layup, saw_layup_marker = SETUP, False
+        feed = 0.0  # G-code F persists across lines that don't repeat it
+        elapsed = 0.0
+        prev_x, prev_y, prev_a = None, None, None
+        for n_line, line in enumerate(f, 1):
+            read += len(line)
+            if on_progress is not None and n_line % 5000 == 0:
+                on_progress(min(1.0, read / size))
+            line = line.strip()
+            if line.startswith(";"):
+                if line.startswith("; CYCLE_COMPLETE:"):
+                    try: cycle_num = int(line.split(":", 1)[1].strip()) + 1
+                    except ValueError: pass
+                elif line.startswith("; LAYUP_START:"):
+                    try: layup, saw_layup_marker = max(0, int(line.split(":", 1)[1].strip()) - 1), True
+                    except ValueError: pass
+                elif ":" in line:
+                    p = line[1:].split(":", 1)
+                    settings[p[0].strip()] = p[1].strip()
+                continue
+            if line.startswith("G92"):
+                # Redefines the current position without moving: subsequent A
+                # values are relative to this new reference. Track the offset
+                # so the true, physically-continuous rotation is reconstructed
+                # for visualization instead of restarting near zero each reset.
+                reset_to = None
+                for p in line.split():
+                    if p.startswith("A"):
+                        try: reset_to = float(p[1:])
+                        except ValueError: pass
+                if reset_to is not None: a_offset = ca - reset_to
+                continue
+            if line.startswith("G1") or line.startswith("G0"):
+                ca_raw = ca - a_offset
+                for p in line.split():
+                    if p.startswith("X"): cx = float(p[1:])
+                    if p.startswith("Y"): cy = float(p[1:])
+                    if p.startswith("A"): ca_raw = float(p[1:])
+                    if p.startswith("F"):
+                        try: feed = float(p[1:])
+                        except ValueError: pass
+                ca = ca_raw + a_offset
+                # Elapsed time up to and including this command, from the
+                # combined (X, Y, true-A) move distance and this move's feed
+                # rate -- the same "distance / feed * 60" relationship the
+                # generator itself uses, so this matches the machine's actual
+                # timing rather than re-simulating the whole wind.
+                if prev_x is not None:
+                    dist = math.sqrt((cx - prev_x)**2 + (cy - prev_y)**2 + (ca - prev_a)**2)
+                    if feed > 0: elapsed += (dist / feed) * 60.0
+                prev_x, prev_y, prev_a = cx, cy, ca
+                # Store both: `ca` (true, physically-continuous angle) drives
+                # the path/front-back rendering math; `ca_raw` is the value
+                # literally written on this line, shown in the readout so it
+                # matches what the machine actually receives at this line.
+                commands.append((cx, cy, ca, ca_raw))
+                times.append(elapsed)
+                if cycle_num is None:
+                    cycle_num = _first_cycle_number(settings)
+                if cycle_num not in cycle_starts:
+                    cycle_starts[cycle_num] = len(commands) - 1
+                cycles.append(cycle_num)
+                cmd_layups.append(layup)
+    if not saw_layup_marker:
+        # Written before layups existed: every move is part of the wind.
+        cmd_layups = [0] * len(cmd_layups)
+    header_layups = winding.layups_from_header(settings)
+    total_cycles = sum(l.passes for l in header_layups) if header_layups else (cycle_num or 1)
+    layup_count = max(len(header_layups) if header_layups else 1, max(cmd_layups, default=0) + 1)
+    if on_progress is not None:
+        on_progress(1.0)
+    return GcodeData(commands, times, cycles, cycle_starts, cmd_layups, settings,
+                     winding.resume_from_header(settings), total_cycles, layup_count)
+
 
 class ViewTab:
     def __init__(self, parent, app):
@@ -77,13 +198,16 @@ class ViewTab:
         self._update_3d_button()
         self.play_button = ttk.Button(controls_frame, text="▶ Play", width=8, command=self.toggle_play, style="success.TButton")
         self.play_button.pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Label(controls_frame, text="Speed:").pack(side=tk.LEFT)
-        ttk.Entry(controls_frame, textvariable=self.play_speed_var, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        speed_label = ttk.Label(controls_frame, text="Speed:")
+        speed_label.pack(side=tk.LEFT)
+        speed_entry = ttk.Entry(controls_frame, textvariable=self.play_speed_var, width=5)
+        speed_entry.pack(side=tk.LEFT, padx=(0, 15))
 
         self.timeline_slider = ttk.Scale(controls_frame, from_=0, to=100, length=400, orient=tk.HORIZONTAL, variable=self.timeline_var, command=lambda s: self.redraw_view())
         self.timeline_slider.pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(controls_frame, text="Line:").pack(side=tk.LEFT)
+        line_label = ttk.Label(controls_frame, text="Line:")
+        line_label.pack(side=tk.LEFT)
         self.line_entry = ttk.Entry(controls_frame, textvariable=self.line_var, width=8)
         self.line_entry.pack(side=tk.LEFT)
         self.line_entry.bind("<Return>", self.jump_to_line)
@@ -92,12 +216,28 @@ class ViewTab:
 
         ttk.Label(controls_frame, text="|").pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(controls_frame, text="Cycle:").pack(side=tk.LEFT)
+        cycle_label = ttk.Label(controls_frame, text="Cycle:")
+        cycle_label.pack(side=tk.LEFT)
         self.cycle_entry = ttk.Entry(controls_frame, textvariable=self.cycle_var, width=6)
         self.cycle_entry.pack(side=tk.LEFT)
         self.cycle_entry.bind("<Return>", self.jump_to_cycle)
         self.cycle_entry.bind("<FocusOut>", self.jump_to_cycle)
         ttk.Label(controls_frame, textvariable=self.cycle_total_var).pack(side=tk.LEFT, padx=(0, 15))
+        # Hover explanations, as on the settings page.
+        for widgets, tip in (
+                ([self.rotate_toggle_btn], "Switches between the flat side view and a 3D view that spins with the "
+                                           "mandrel."),
+                ([self.play_button], "Plays the program from the current position (from the start once it's at "
+                                     "the end)."),
+                ([speed_label, speed_entry], "Playback speed: how many G-code moves each frame advances (10 frames "
+                                             "a second)."),
+                ([self.timeline_slider], "Drag to scrub through the program."),
+                ([line_label, self.line_entry], "Jumps to a G-code move: its number, counted from 0 over the moves only (not "
+                                    "the file's line number). Press Enter."),
+                ([cycle_label, self.cycle_entry], "Jumps to the start of a cycle, numbered across the whole program as in the "
+                                     "file's CYCLE_COMPLETE markers. Press Enter.")):
+            for widget in widgets:
+                ToolTip(widget, text=tip, wraplength=300, delay=400)
 
         # A monospace font keeps every digit (and the spaces used to pad shorter
         # numbers) the same width, so the readout doesn't visibly jitter left/right
@@ -133,12 +273,26 @@ class ViewTab:
     def open_gcode_view(self, filepath=None):
         if not filepath: filepath = filedialog.askopenfilename(filetypes=[("G-Code Files", "*.gcode")])
         if not filepath: return
-        self.stop_play()
-        self.gcode_path_var.set(filepath)
-        self.parse_gcode(filepath)
-        self._sync_settings_to_app_params()
-        self.redraw_view()
-        if hasattr(self.app, "set_status"): self.app.set_status(f"Loaded: {filepath}")
+        fail = lambda e: messagebox.showerror("Error", f"Couldn't read the G-code file:\n{e}")
+        try:
+            big = os.path.getsize(filepath) >= BACKGROUND_LOAD_BYTES
+        except OSError as e:
+            fail(e)
+            return
+        if big:
+            # Reading a long program takes a while: on a worker thread, with
+            # the progress shown (see progress_dialog).
+            ProgressTask(self.app, "Opening G-Code",
+                         lambda progress: read_gcode(filepath, lambda f: progress(f, "Reading the file…")),
+                         on_done=lambda data: self.show_file(filepath, data), on_error=fail,
+                         finishing="Drawing the preview…")
+            return
+        try:
+            data = read_gcode(filepath)
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            fail(e)
+            return
+        self.show_file(filepath, data)
 
     def toggle_play(self):
         self.stop_play() if self.is_playing else self.start_play()
@@ -170,102 +324,36 @@ class ViewTab:
         self.play_job = self.app.root.after(100, self._play_step)
 
     def parse_gcode(self, filepath):
-        self.gcode_commands, self.view_settings = [], {}
-        self._path_static, self._path_substeps, self._cache_key = [], [], None
-        self.cmd_cycles, self.cycle_starts = [], {}
-        self.cmd_times = []
-        self.cmd_layups, self.layup_count = [], 1
-        self.resume = None
+        """Reads a G-code file into the viewer, on the spot. Returns whether it
+        could be read."""
         try:
-            with open(filepath, 'r') as f:
-                cx, cy, ca = 0.0, 0.0, 0.0
-                a_offset = 0.0
-                cycle_num = None  # known once the settings header has been read
-                # Moves before the first "; LAYUP_START" marker (homing, the
-                # move to the wind start) are setup, not fiber: layup SETUP.
-                layup, saw_layup_marker = self.SETUP, False
-                feed = 0.0  # G-code F persists across lines that don't repeat it
-                elapsed = 0.0
-                prev_x, prev_y, prev_a = None, None, None
-                for line in f:
-                    line = line.strip()
-                    if line.startswith(";"):
-                        if line.startswith("; CYCLE_COMPLETE:"):
-                            try: cycle_num = int(line.split(":", 1)[1].strip()) + 1
-                            except ValueError: pass
-                        elif line.startswith("; LAYUP_START:"):
-                            try: layup, saw_layup_marker = max(0, int(line.split(":", 1)[1].strip()) - 1), True
-                            except ValueError: pass
-                        elif ":" in line:
-                            p = line[1:].split(":", 1)
-                            self.view_settings[p[0].strip()] = p[1].strip()
-                        continue
-                    if line.startswith("G92"):
-                        # Redefines the current position without moving: subsequent A
-                        # values are relative to this new reference. Track the offset
-                        # so the true, physically-continuous rotation is reconstructed
-                        # for visualization instead of restarting near zero each reset.
-                        reset_to = None
-                        for p in line.split():
-                            if p.startswith("A"):
-                                try: reset_to = float(p[1:])
-                                except ValueError: pass
-                        if reset_to is not None: a_offset = ca - reset_to
-                        continue
-                    if line.startswith("G1") or line.startswith("G0"):
-                        ca_raw = ca - a_offset
-                        for p in line.split():
-                            if p.startswith("X"): cx = float(p[1:])
-                            if p.startswith("Y"): cy = float(p[1:])
-                            if p.startswith("A"): ca_raw = float(p[1:])
-                            if p.startswith("F"):
-                                try: feed = float(p[1:])
-                                except ValueError: pass
-                        ca = ca_raw + a_offset
-                        # Elapsed time up to and including this command, from the
-                        # combined (X, Y, true-A) move distance and this move's feed
-                        # rate -- the same "distance / feed * 60" relationship the
-                        # generator itself uses, so this matches the machine's actual
-                        # timing rather than re-simulating the whole wind.
-                        if prev_x is not None:
-                            dist = math.sqrt((cx - prev_x)**2 + (cy - prev_y)**2 + (ca - prev_a)**2)
-                            if feed > 0: elapsed += (dist / feed) * 60.0
-                        prev_x, prev_y, prev_a = cx, cy, ca
-                        # Store both: `ca` (true, physically-continuous angle) drives
-                        # the path/front-back rendering math; `ca_raw` is the value
-                        # literally written on this line, shown in the readout so it
-                        # matches what the machine actually receives at this line.
-                        self.gcode_commands.append((cx, cy, ca, ca_raw))
-                        self.cmd_times.append(elapsed)
-                        if cycle_num is None:
-                            cycle_num = self._first_cycle_number()
-                        if cycle_num not in self.cycle_starts:
-                            self.cycle_starts[cycle_num] = len(self.gcode_commands) - 1
-                        self.cmd_cycles.append(cycle_num)
-                        self.cmd_layups.append(layup)
+            data = read_gcode(filepath)
         except (OSError, UnicodeDecodeError, ValueError) as e:
             messagebox.showerror("Error", f"Couldn't read the G-code file:\n{e}")
-            return
-        if not saw_layup_marker:
-            # Written before layups existed: every move is part of the wind.
-            self.cmd_layups = [0] * len(self.cmd_layups)
-        self.resume = winding.resume_from_header(self.view_settings)
-        header_layups = winding.layups_from_header(self.view_settings)
-        self.total_cycles = sum(l.passes for l in header_layups) if header_layups else (cycle_num or 1)
-        self.layup_count = max(len(header_layups) if header_layups else 1, max(self.cmd_layups, default=0) + 1)
+            return False
+        self._load(data)
+        return True
+
+    def show_file(self, filepath, data):
+        """Shows a file read by read_gcode() and restores the settings it was
+        made with."""
+        self.stop_play()
+        self.gcode_path_var.set(filepath)
+        self._load(data)
+        self._sync_settings_to_app_params()
+        self.redraw_view()
+        if hasattr(self.app, "set_status"): self.app.set_status(f"Loaded: {filepath}")
+
+    def _load(self, data):
+        self.gcode_commands, self.view_settings = data.commands, data.settings
+        self._path_static, self._path_substeps, self._cache_key = [], [], None
+        self.cmd_cycles, self.cycle_starts, self.cmd_times = data.cycles, data.cycle_starts, data.times
+        self.cmd_layups, self.layup_count = data.layups, data.layup_count
+        self.resume, self.total_cycles = data.resume, data.total_cycles
         self.timeline_slider.config(to=max(0, len(self.gcode_commands)-1))
         self.timeline_var.set(0)
         self.line_total_var.set(f"/ {len(self.gcode_commands)}")
         self.cycle_total_var.set(f"/ {self.total_cycles}")
-
-    def _first_cycle_number(self):
-        # The number of the file's first cycle, counted across the whole
-        # program: 1, except in a partial program, which continues mid-program.
-        layups = winding.layups_from_header(self.view_settings)
-        resume = winding.resume_from_header(self.view_settings)
-        if resume is None or not layups:
-            return 1
-        return sum(l.passes for l in layups[:resume.point.layup]) + resume.point.cycle + 1
 
     def current_point(self):
         """The program point at the timeline position, as a winding.ProgramPoint
@@ -344,7 +432,7 @@ class ViewTab:
     EYE_REF_ANGLE_DEG = 180.0
 
     # cmd_layups value of setup moves (homing, travel to the wind start).
-    SETUP = -1
+    SETUP = SETUP
 
     def _build_path_cache(self, co, lt, rt, rc, ld, cap_type, scale, ox, oy):
         # Caches only what never changes once computed: a point's X-projection and

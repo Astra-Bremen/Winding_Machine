@@ -37,8 +37,8 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   other on the same tank. Each layup has its own number of cycles, pattern
   number, winding angle and turnaround dwell angle, so one program can combine,
   for example, a 45° helical layup with a near-hoop layup. The tow width, the
-  turnaround zone, the Optimize Trajectory setting and all machine and tank
-  settings apply to the whole program. Each layup keeps its own pattern
+  turnaround zone and all machine and tank settings apply to the whole
+  program. Each layup keeps its own pattern
   alignment, and two identical layups in a row wind exactly on top of each
   other, like repeated layers.
 - **90° wind (hoop layups):** check *90° Wind (Straight Section Only)* in a
@@ -84,30 +84,58 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   dwell angle. The app adds a small extra rotation so that every circuit
   starts exactly on the pattern, and gives both tank ends the same turnaround
   on every circuit.
-- **Turnaround zone:** optionally spreads each turnaround over the last few
-  centimetres of travel at each end instead of one pure rotation at the very
-  end. This is the old Excel generator's "bulkhead height compensation", and
-  it keeps fiber from building up in a ring at the turnaround.
+- **Smooth turnarounds (Turnaround Zone):** at each end the carriage runs
+  into the zone on the helix, slows smoothly to a stop at the very end while
+  the mandrel keeps turning, and runs back out on the next helix. It's one
+  smooth curve, so the machine never brakes for a corner. The turnaround's
+  rotation is spread over the zone, so no fiber builds up in a ring at the end
+  (the old Excel generator's "bulkhead height compensation").
+  - **Auto** (grey, **AUTO**): the zone is the dome, so the fiber turns around
+    beyond the straight section. With flat end caps it is 50 mm. Type a value
+    to fix it; clear the field to go back to auto. 0 turns on the spot at the
+    end, which stops the machine there.
+  - **Why a curve:** Klipper plans each junction between two G-code moves from
+    the angle between their directions in (X, Y, A) space, with A in degrees
+    counting like mm. It caps the speed there by its junction deviation
+    (`square_corner_velocity`, 5 mm/s by default). The former zone added a
+    fixed extra rotation to every 5 mm step in it, so its moves met the helix
+    at a 42° kink. Klipper braked from 250 mm/s to 12 mm/s there, so the
+    machine seemed to stop where the zone began. It braked again at the end
+    and where the zone ended. The curve leaves and rejoins each helix along its
+    own direction, with matching (zero) curvature, and is cut into moves that
+    each turn by at most 1.5°. Replayed through Klipper's own junction math,
+    no junction anywhere in a layup needs to slow below the commanded speed.
+    Winding time stays the same; the files get about 20–70 % more lines.
+  - **Where the machine still slows down:** starting from rest at the wind
+    start, at layup changes (which pause anyway), and into and out of a 90°
+    wind.
 - **Eye clearance:** the Y position follows the tank profile plus a safety
   gap. It uses the largest radius under the full width of the eye, so the eye
   cannot hit the tank at the domes.
 - **Two speed limits:** every move runs as fast as the two limits in
-  Machine Settings allow:
+  Machine Settings allow. Each move takes the feed rate of whichever limit it
+  reaches first:
   - *Max Rotation Speed* is a surface speed in mm/s, converted to an A-axis
-    rate for the current diameter.
-  - *Max Feedrate* (default 300 mm/s) caps the G-code feed rate itself (F ÷ 60),
-    measured along the whole move with A in degrees, as Klipper measures it.
-    Set it to Klipper's `max_velocity`. At low winding angles the carriage
-    covers far more millimetres than the mandrel turns degrees, so the feed
-    rate is practically the carriage's X speed. Without this cap, a 12° layer
-    on a 250 mm tank would drive the carriage at over 1 m/s.
+    rate for the current diameter. It sets the pace of steep layups.
+  - *Max Filament Speed* (default 310 mm/s) is how fast the fiber may leave
+    the eye, i.e. the tow laid per second. It sets the pace of shallow layups,
+    where the carriage covers far more ground than the mandrel turns. Without
+    it, a 12° layer on a 250 mm tank would drive the carriage at over 1 m/s.
+    The default matches the speeds the former 300 mm/s *Max Feedrate* gave
+    the low-angle layers (303–316 mm/s of fiber at 10–20°). The two limits
+    cross over at about 45°.
+  - A fixed failsafe, `MAX_FEED` = F40000 (667 mm/s) at the top of
+    `winding.py`, caps the G-code feed rate of every move, including travel.
+    It is measured along the whole move with A in degrees, as Klipper measures
+    it.
 
   Every feed rate is computed from the coordinates exactly as written to the
-  file, and rounded down. No move ever exceeds either limit, and each still
-  runs within a fraction of a percent of the one that governs it. The limit
-  that sets the selected layup's speed in the middle of the tank is framed in
-  red. It updates as you switch layups or change a setting, and hovering over
-  either speed field shows the resulting carriage and surface speed.
+  file, and rounded down. No move ever exceeds any limit, and each still runs
+  within a fraction of a percent of the one that governs it. The limit that
+  sets the selected layup's speed in the middle of the tank carries a small
+  **LIMIT** tag inside its field, like the AUTO tags. It updates as you switch
+  layups or change a setting, and hovering over either speed field shows the
+  resulting carriage, fiber and surface speed.
 - **Responsive pause (Max Move Time):** Klipper can't interrupt a move it has
   already queued. It keeps about 2 s of motion queued, and each queued move
   always runs to its end. So after a pause, the machine keeps going for up to
@@ -129,11 +157,6 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   wrong, cancel the program on the machine, adjust the settings if needed, and
   export a partial program that continues from where the wind stopped. See
   [Continuing an interrupted wind](#continuing-an-interrupted-wind).
-- **Optimize Trajectory (experimental):** moves part of each dwell rotation
-  into the X steps just before and after it. The motion planner then does not
-  have to slow almost to a stop at the turnaround, and the winding pattern
-  stays exactly the same. It has no effect while a turnaround zone is set,
-  because the zone already spreads out the whole turnaround.
 - **Live Settings Preview:** a pseudo-3D tank view that you can rotate, drawn
   as large as the preview allows, and an end-on view showing the eye reach. A
   slim estimates sidebar sits beside them, with two groups:
@@ -141,8 +164,8 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
     top rotation speed, eye reach (orange, like the reach lines in the end
     view) and the safety factor at the operating pressure (orange below 1).
   - **Selected layup:** time · average time per cycle, tow length · dry fiber
-    mass, resin mass, X speed in the middle of the tank (set by the red-framed
-    speed limit), coverage · the fewest cycles for full coverage (orange while
+    mass, resin mass, X speed in the middle of the tank (set by the speed
+    limit tagged LIMIT), coverage · the fewest cycles for full coverage (orange while
     gaps would remain), and extra turnaround rotation at the far end / chuck
     side. A 90° wind shows full coverage of the straight section and no extra
     rotation.
@@ -157,12 +180,24 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   select that layup. The simulation runs on a background thread, so the
   interface stays responsive. Switching layups redraws instantly from the
   cached result without re-simulating.
+- **Progress on the machine:** while the wind runs, Mainsail shows where it
+  is: the mandrel angle within the cycle in its Layer field ("Layer 1234 of
+  5760"), the layup and cycle in its status line, and a console line at every
+  cycle. See [Progress on the machine](#progress-on-the-machine).
 - **G-Code Preview:** load any generated file and play or scrub through it.
   You can jump to a line or cycle and see the coordinates, elapsed time and
   current layup. Each layup is drawn in its own color. There is an optional 3D
   mode that spins with the mandrel. Loading a file also restores its settings,
   including every layup, into the settings panel. Files from before
   multi-layup support load as a single layup.
+- **Progress window:** generating a file runs in the background behind a small
+  window that shows what's happening, a progress bar and the time left:
+  writing the file, then loading it into the G-Code Preview. A 1.5-hour wind
+  (about 290,000 lines) takes roughly 20 s. The app stays responsive, and
+  **Cancel** stops cleanly: the file is only written under its real name once
+  it is complete, so a cancelled run leaves nothing behind. Once a run
+  finishes, the window shows where the file was saved. Opening a large file
+  (over 1 MB) uses the same window.
 - Light and dark themes (View menu).
 
 ## Generated G-code
@@ -174,10 +209,10 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; start_x: 146.82458365518542
 ; start_x_auto: True
 ; ...
-; max_feedrate: 300.0
+; max_filament_speed: 310.0
 ; max_move_time: 0.5
-; turnaround_zone: 80.0
-; optimize_trajectory: False
+; turnaround_zone: 96.82458365518542
+; turnaround_zone_auto: True
 ; layups: 2
 ; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False
 ; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True
@@ -192,21 +227,35 @@ G1 Y0.000 F...                <- pull the eye fully back first
 G1 X48.942 F...               <- travel to Start Wind at X (in pieces, see Max Move Time)
 ...
 G1 Y70.000 F...               <- then move in to winding distance
+M117 Attach the fiber, then resume     <- what to do, on Mainsail's status line...
+RESPOND MSG="Attach the fiber here, ..."  <- ...and in the console
 PAUSE                         <- attach the fiber, resume on the machine
 G92 A0                        <- the mandrel's angle at resume is the wind's zero
 G1 X146.825 Y70.000 A0.000 F...   <- the start position
 ; LAYUP_START:1
+SET_PRINT_STATS_INFO TOTAL_LAYER=5513 CURRENT_LAYER=0  <- Mainsail: "Layer 0 of 5513", A of where the cycle ends
+M117 Layup 1/2 - Cycle 1/30 - 45 deg
+RESPOND MSG="Starting cycle 1/30 of layup 1/2 (45 deg, pattern 3)"
 G1 X151.825 Y... A... F...    <- traversal in 5 mm X steps, toward +X
 ...
-G1 X... Y... A... F...        <- turnaround: extra rotation on the steps of the zone
-...                              (or one A-only move at the end without a zone)
+SET_PRINT_STATS_INFO CURRENT_LAYER=212   <- the angle, about every second of winding
+...
+G1 X... Y... A... F...        <- turnaround: a smooth curve over the zone, in short moves
+...                              (or one A-only move at the end with a zone of 0)
 ; CYCLE_COMPLETE:1            <- cycles are numbered across the whole program
 G92 A0                        <- reset A after each cycle so the value never grows too large
+SET_PRINT_STATS_INFO TOTAL_LAYER=5764 CURRENT_LAYER=0  <- the next cycle starts (A is 0 again)
+M117 Layup 1/2 - Cycle 2/30 - 45 deg
 ...
 ; Layup 1 complete - check the fiber, then resume on the machine
+M117 Layup 1/2 done - check the fiber, then resume
+RESPOND MSG="Layup 1/2 complete - ... Next: layup 2/2 (90 deg wind, straight section)"
 PAUSE                         <- with "Pause After Each Layup" (not after the last)
 ; LAYUP_START:2
+SET_PRINT_STATS_INFO TOTAL_LAYER=57754 CURRENT_LAYER=0 <- a 90 deg layup: one pass, one long cycle
 ...
+M117 Wind complete
+RESPOND MSG="Wind complete: 2 layups, 31 cycles"
 ```
 
 `test_winding.py` pins the exact output of several reference programs, so an
@@ -214,6 +263,42 @@ unintended change to the motion shows up in the tests.
 
 The suggested file name records the time of generation, the end-cap type and
 the estimated duration, for example `17_09_14_32-RND-00_07_26.gcode`.
+
+## Progress on the machine
+
+Every generated file tells the machine where the wind is, using commands that
+Klipper and Mainsail's standard configuration already provide:
+
+| Command | What it shows | Needs |
+|---------|---------------|-------|
+| `SET_PRINT_STATS_INFO TOTAL_LAYER=5764 CURRENT_LAYER=1234` | Mainsail's **Layer** field: "1234 of 5764", the mandrel angle A within the cycle out of the angle the cycle ends at (A restarts at 0 with every cycle). Whole degrees, updated about every second of winding | Nothing: built into Klipper |
+| `M117 Layup 2/3 - Cycle 5/30 - 45 deg` | Mainsail's status line | `[display_status]` |
+| `RESPOND MSG="Starting cycle 5/30 of layup 2/3 (45 deg, pattern 3)"` | A console line ("echo: ...") | `[respond]` |
+
+These lines are written at every cycle start, before every `PAUSE` (saying
+what to do: attach the fiber, or check it before the next layup, which the
+console line names), and at the end ("Wind complete"). The angle is updated
+about every second of winding in between. A partial program starts with the
+cycle it continues in, at the angle it continues from. The cycle's final
+angle is only known once the cycle has been generated, so the writer holds
+each cycle's lines until it's complete, then writes them after its status.
+
+- **Requirements:** `[display_status]` and `[respond]` are both enabled by
+  Mainsail's standard `mainsail.cfg`. Klipper-for-CNC stops the file on any
+  command it doesn't know (upstream Klipper only warns), so a machine without
+  them needs those two sections added to `printer.cfg`. Messages are plain
+  ASCII ("45 deg"), without characters Klipper would read as a comment or the
+  end of a command.
+- **Mainsail's layer pauses:** `mainsail.cfg` builds *Pause at layer* and
+  *Pause next layer* on `SET_PRINT_STATS_INFO`. Since the Layer field now
+  carries the angle, *Pause next layer* pauses at the next angle update (within
+  about a second). *Pause at layer N* only fires if an update lands exactly on
+  N degrees, so don't rely on it.
+- **Timing:** Klipper reads a few moves ahead of the machine, so each message,
+  and the angle in the Layer field, runs up to about 2 s ahead of the actual
+  motion. To continue an interrupted wind, take A from the machine's position
+  readout.
+- The app's own G-Code Preview ignores these lines.
 
 ## Strength and material estimate
 
@@ -315,7 +400,8 @@ same skip: its *degrees per cycle* is the next multiple of the *cycle width*
 360°/*p* above the minimum circuit rotation. It also used a turnaround zone:
 its two *bulkhead height compensation* moves run 80 mm out over the bulkhead
 and back, each with a quarter of the circuit's turnaround rotation. The app
-adopts both. It differs in two ways:
+adopts both; its turnaround zone turns the same total rotation, but as one
+smooth curve (see Smooth turnarounds above). It differs in two more ways:
 
 - **The cycle shift is applied once per cycle.** The spreadsheet spread it as
   a small constant subtraction from every circuit. That gives each pattern slot
@@ -362,8 +448,9 @@ python main.py
    selected layup needs to cover the tank completely, and *Coverage* shows how
    much its current number of cycles covers. Check **Show All Layups** to see
    every layup on the tank at once.
-4. Click **Generate G-Code** and choose where to save the file. The file
-   opens in the G-Code Preview automatically.
+4. Click **Generate G-Code** and choose where to save the file. A progress
+   window shows how far it has got, and the file then opens in the G-Code
+   Preview automatically.
 5. Run it on the machine. With homing on, it homes, moves the eye to the wind
    start and pauses: attach the fiber there, then resume on the machine.
 6. Use **Open G-Code** to inspect a file generated earlier, and **Export
@@ -382,10 +469,11 @@ python -m unittest -v
 | File | Purpose |
 |------|---------|
 | `main.py` | App entry point and `CFRPWinderApp`: window layout and menus, the settings model (global settings plus one set of variables per layup), and G-code file output. |
-| `winding.py` | All winding math, with no GUI dependency: the `WindingJob`/`Layup` settings, validation, geometry, dwell/pattern alignment, trajectory blending, the motion generator (`iter_program`), the preview simulation (`simulate`), and the G-code writer and header parser. |
+| `winding.py` | All winding math, with no GUI dependency: the `WindingJob`/`Layup` settings, validation, geometry, dwell/pattern alignment, the turnaround curves, the motion generator (`iter_program`), the preview simulation (`simulate`), and the G-code writer and header parser. |
 | `plan_tab.py` | `PlanTab`: settings form with the layup switcher, live Settings Preview (3D tank, end view, estimates, Show All Layups legend, the tank's progress while continuing a wind), wind-angle validation and the background calculations. |
 | `partial_page.py` | `PartialPage`: the Export Partial G-Code page that replaces the settings while continuing an interrupted wind. |
-| `view_tab.py` | `ViewTab`: G-code parser and playback viewer. |
+| `view_tab.py` | `ViewTab`: G-code parser (`read_gcode`) and playback viewer. |
+| `progress_dialog.py` | `ProgressTask`: runs a long task on a worker thread behind a progress window, with Cancel. |
 | `theme.py` | ttkbootstrap theme setup, canvas color palettes (including the layup colors) and the generated app icon. |
 | `strength.py` | The material and strength estimate (after the Excel sheet), its inputs, and their record in the G-code header. |
 | `strength_dialog.py` | `StrengthDialog`: the Strength & Materials window. |
@@ -396,10 +484,13 @@ python -m unittest -v
 - **Pattern and turnaround math:** `plan_layup()` derives each layup's skip,
   cycle shift and extra rotations (`compute_pattern_skip`,
   `compute_dwell_extras`), and `compute_turnaround_balance_offset` splits the
-  extra between the two ends. `compute_dwell_blend` decides where a turnaround's
-  rotation happens: at the end, eased by Optimize Trajectory, or spread over
-  the turnaround zone. The tests in `PatternAlignment` check the tiling and the
-  balance between the two ends directly from the generated motion.
+  extra between the two ends. `turnaround_curve()` shapes each turnaround over
+  the zone, and `iter_program()` winds its first half at the end of a pass and
+  its second half at the start of the next one. `TURN_MAX_DEFLECTION` and
+  `FLAT_TURNAROUND_ZONE` are constants at the top of `winding.py`. The tests in
+  `PatternAlignment` check the tiling and the balance between the two ends
+  directly from the generated motion; `SmoothTurnaround` replays the written
+  file through Klipper's junction math.
 - **One motion generator:** `winding.iter_program()` produces every move of
   the program. The G-code writer and the preview simulation both use it, so a
   change to the motion only has to be made there, and the preview always
@@ -423,13 +514,18 @@ python -m unittest -v
   0–180 mm Y range (`Y_TRAVEL`), the 5 mm traversal step (`STEP_SIZE`) and the
   lowest allowed Max Move Time (`MIN_MOVE_TIME`) are named constants at the top
   of `winding.py`.
+- **Progress messages:** `_cycle_status()` and `_say()` near the end of
+  `winding.py` write them, `_write_events()` places them, and `_machine_text()`
+  keeps them safe for Klipper. The `StatusMessages` tests check the sequence
+  and the characters used.
 - **Move splitting and feed rates:** `iter_program()` splits long moves (its
   inner `moves()` helper), so the preview, estimates and G-code all see the
   same pieces. `write_gcode()` computes each F from the written coordinates via
-  `_limited_feed()`. `wind_speed()` works out a layup's mid-tank speed and which
-  limit sets it, for the red frame and the X speed estimate. The
-  `MoveSplitting`, `MaxRotationSpeed` and `MaxFeedrate` tests check all of this
-  on the written file.
+  `_limited_feed()`, the same three-way minimum `calc_move()` uses for the
+  estimates. `wind_speed()` works out a layup's mid-tank speed and which limit
+  sets it, for the LIMIT tag and the X speed estimate. The `MoveSplitting`,
+  `MaxRotationSpeed` and `MaxFilamentSpeed` tests check all of this on the
+  written file.
 - **Homing position:** the move to the wind start assumes `G28` leaves the
   carriage at X0 Y0, with Y0 the eye's fully retracted end (farthest from the
   tank), as in the app's machine model. It is written by `_write_move_to_start()`
@@ -446,15 +542,23 @@ python -m unittest -v
   the GIL switch interval is lowered to 0.5 ms. Otherwise every Tk call would
   wait for the busy worker, and a settings change would stall the GUI for up
   to half a second.
+- **Long tasks with a progress window:** `progress_dialog.ProgressTask` runs a
+  function on a worker thread and shows what it reports through
+  `progress(fraction, phase)`; a cancel raises `Cancelled` at the next report.
+  The function must not touch Tk, so `generate()` in `main.py` gathers
+  everything it needs from the app first. `write_gcode(..., on_progress=...)`
+  reports the winding time written so far, and `view_tab.read_gcode(...,
+  on_progress=...)` the share of the file read.
 - **Auto/custom fields:** `AutoEntry` in `plan_tab.py` gives *Number of Cycles*
   and *Start Wind at X* their shared auto/custom behavior. A new auto setting
   needs a flag in the model (see `winding.AUTO_FLAGS`) and one `AutoEntry`.
 - **Feed rate and Klipper:** feed rates assume the controller applies F to the
   combined X/Y/A move length, with A in degrees, as the original generator did.
-  Set *Max Feedrate* to Klipper's `max_velocity`. If Klipper's limits
-  (`max_velocity`, `max_accel`) are lower than what the file asks for, moves
-  run slower than estimated: the wind takes longer than the app's *Time*
-  estimate, and pieces can outlast Max Move Time.
+  Klipper's `max_velocity` should be at least 667 mm/s (the `MAX_FEED`
+  failsafe of F40000); otherwise lower `MAX_FEED` to match it. If Klipper's
+  limits (`max_velocity`, `max_accel`) are lower than what the file asks for,
+  moves run slower than estimated: the wind takes longer than the app's
+  *Time* estimate, and pieces can outlast Max Move Time.
 - **Layup colors:** the palettes in `theme.py` were checked for contrast
   against the mint tank and between every pair of colors, including for
   red-green color-blind viewers. From the 7th layup on, the colors repeat with

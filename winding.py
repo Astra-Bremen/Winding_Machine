@@ -24,8 +24,17 @@ Y_REFERENCE = 550.0   # eye distance from the tank centerline at Y=0, before sub
 Y_TRAVEL = 180.0      # Y-axis travel; commanded Y is clamped to [0, Y_TRAVEL] (mm)
 STEP_SIZE = 5.0       # X distance covered by one traversal G-code move (mm)
 MIN_MOVE_TIME = 0.1   # lowest allowed Max Move Time (s); shorter moves only load the controller
+# Failsafe: the highest G-code feed rate (F, mm/min) any move may use, whatever
+# the speed settings allow -- measured like F, along the whole move with A in
+# degrees. Keep it at or below the controller's max_velocity (mm/s) x 60.
+MAX_FEED = 40000.0
 HOOP_ANGLE_THRESHOLD = 85.0  # a Winding Angle entered above this makes the layup a 90° wind (the app's rule)
 LEAD_IN_ANGLE = 45.0  # angle of the run onto a 90° wind's start when no helical layup precedes it
+FLAT_TURNAROUND_ZONE = 50.0  # Auto turnaround zone with flat end caps (no dome to turn on), mm
+# Most a turnaround's direction may change from one G-code move to the next,
+# in (X, Y, A) space (deg). Klipper takes such a junction at full speed: at its
+# default square_corner_velocity (5 mm/s) it allows about 350 mm/s.
+TURN_MAX_DEFLECTION = 1.5
 
 # --- VISUALIZATION-ONLY RENDERING RESOLUTION ---
 # Caps how many degrees of rotation may separate two consecutive strand-path
@@ -87,14 +96,13 @@ class WindingJob:
     eye_width: float = 20.0
     min_spacing: float = 10.0
     max_surface_speed: float = 220.0
-    # Highest feed rate (mm/s) any G-code move may use -- the controller's own
-    # top speed (Klipper's max_velocity), measured like the G-code F: along
-    # the whole move, with A in degrees. Every move runs at Max Rotation Speed
-    # unless that would take it past this; at low winding angles, where the
-    # carriage covers far more millimeters than the mandrel turns degrees, the
-    # feed rate is practically the carriage's X speed, so this is what keeps
-    # the carriage in check there. See wind_speed().
-    max_feedrate: float = 300.0
+    # The fastest the fiber may leave the eye (mm/s): the tow laid per second.
+    # Every move runs as fast as both this and Max Rotation Speed allow (see
+    # calc_move) -- at low winding angles, where the carriage covers far more
+    # ground than the mandrel turns, this is what holds the carriage back. The
+    # default matches the speeds the former 300 mm/s Max Feedrate gave the
+    # low-angle layers it limited (see wind_speed).
+    max_filament_speed: float = 310.0
     # Longest time (s) any single G-code move may take; longer ones are split
     # into equal pieces. Klipper can't interrupt a move it has queued, so this
     # bounds how long the machine keeps going after a pause (see iter_program).
@@ -104,11 +112,13 @@ class WindingJob:
     tank_diameter: float = 200.0
     end_cap_diameter: float = 50.0
     bandwidth: float = 5.0
-    # Length (mm) at each tank end over which the turnaround rotation is spread
-    # while the carriage runs out to the end and back, instead of one pure
-    # rotation at the end. 0 = pure rotation at the end. See compute_dwell_blend.
-    turnaround_zone: float = 80.0
-    optimize_trajectory: bool = False
+    # Length (mm) at each tank end over which the carriage turns around: it runs
+    # into the zone on the helix, slows smoothly to a stop at the very end while
+    # the mandrel keeps turning, and runs back out (see turnaround_curve).
+    # Auto: the dome, so the fiber turns around beyond the straight section
+    # (FLAT_TURNAROUND_ZONE with flat end caps). 0 = turn on the spot.
+    turnaround_zone: float = 0.0
+    turnaround_zone_auto: bool = True
     # PAUSE between layups, so the fiber can be checked after every pattern change.
     pause_after_layup: bool = True
     layups: tuple = field(default=(Layup(),))
@@ -119,6 +129,10 @@ class WindingJob:
         # this job's own tank and tow -- so every consumer (motion, estimates,
         # settings header, cache key) sees the same, never-stale number.
         object.__setattr__(self, "layups", tuple(self._resolve_cycles(layup) for layup in self.layups))
+        # Same for an auto turnaround zone: the dome, at most half the tank.
+        if self.turnaround_zone_auto:
+            zone = self.dome_length if self.end_cap_type == "Round" else FLAT_TURNAROUND_ZONE
+            object.__setattr__(self, "turnaround_zone", max(0.0, min(zone, self.tank_length / 2)))
         # Same for an auto start position: where the dome ends and the tank
         # turns straight -- or, for a 90° first layup, right where it starts.
         if self.start_x_auto:
@@ -135,10 +149,9 @@ class WindingJob:
     @property
     def start_x_range(self):
         # From the tank's chuck-side end up to where the first pass still has
-        # room for the far end's full turnaround zone (or Optimize Trajectory's
-        # easing) before it turns around.
+        # room for the far end's whole turnaround zone before it turns around.
         x_end = self.chuck_offset + self.tank_length
-        return self.chuck_offset, x_end - STEP_SIZE * max(self.turnaround_zone_steps, 3)
+        return self.chuck_offset, x_end - max(self.turnaround_zone, 3 * STEP_SIZE)
 
     def _resolve_cycles(self, layup):
         if layup.hoop:
@@ -180,25 +193,9 @@ class WindingJob:
         return surface_speed_to_deg_per_min(self.max_surface_speed, self.tank_diameter)
 
     @property
-    def max_feed(self):
-        # Max Feedrate as a G-code F (mm/min).
-        return self.max_feedrate * 60.0
-
-    @property
     def total_cycles(self):
         return sum(layup.passes for layup in self.layups)
 
-    @property
-    def turnaround_zone_steps(self):
-        # The zone is covered by whole traversal steps, so it rounds up to a
-        # multiple of STEP_SIZE.
-        return max(0, math.ceil(self.turnaround_zone / STEP_SIZE - 1e-9))
-
-
-def _traversal_step_count(length):
-    # Number of moves traversal_steps() makes over `length` (the last may be short).
-    n_full = int(length // STEP_SIZE)
-    return n_full + (1 if length - n_full * STEP_SIZE > 1e-9 else 0)
 
 
 GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
@@ -208,15 +205,18 @@ HOOP_IGNORED = ("passes", "pattern_number", "wind_angle", "turnaround_angle")
 
 # Settings the WindingJob can compute itself: value key -> the flag that, while
 # set, makes it do so (the value given is then ignored).
-AUTO_FLAGS = {"passes": "auto_cycles", "start_x": "start_x_auto"}
+AUTO_FLAGS = {"passes": "auto_cycles", "start_x": "start_x_auto", "turnaround_zone": "turnaround_zone_auto"}
 
 # How files written before a setting existed were actually wound, where that
 # differs from the setting's current default: restoring such a file uses these
 # values (or calls them with the file's settings header), so it regenerates
-# the motion it was made with. (Max Move Time and Max Feedrate need no entry:
-# neither ever changes the path, only how fast it is run.)
+# the motion it was made with. (Max Move Time and Max Filament Speed need no
+# entry: neither ever changes the path, only how fast it is run.) Turnarounds
+# are smooth curves since files of 2026-10; older files keep their zone length,
+# but their turnarounds are now wound as curves too.
 LEGACY_VALUES = {
     "turnaround_zone": 0.0,
+    "turnaround_zone_auto": False,
     "pause_after_layup": False,
     # Those winds started at the tank's chuck-side end.
     "start_x_auto": False,
@@ -253,8 +253,8 @@ def geometry_errors(job):
         # G-code feed rates are whole numbers of at least 1 (per minute), which
         # would already rotate faster than a limit this low.
         errors.append("Max Rotation Speed is too low for this tank diameter.")
-    if job.max_feedrate < 1.0:
-        errors.append("Max Feedrate must be at least 1 mm/s.")
+    if job.max_filament_speed < 1.0:
+        errors.append("Max Filament Speed must be at least 1 mm/s.")
     if job.max_move_time < MIN_MOVE_TIME:
         errors.append(f"Max Move Time must be at least {MIN_MOVE_TIME:g} s.")
     if job.home_before_wind and job.tank_length > 0:
@@ -264,9 +264,8 @@ def geometry_errors(job):
                           "(on the tank, clear of the far end's turnaround).")
     if job.turnaround_zone < 0:
         errors.append("Turnaround Zone can't be negative.")
-    elif job.tank_length > 0 and 2 * job.turnaround_zone_steps > _traversal_step_count(job.tank_length):
-        # The zones at both ends would overlap, and part of the turnaround
-        # rotation would have nowhere to go.
+    elif job.tank_length > 0 and 2 * job.turnaround_zone > job.tank_length + 1e-9:
+        # The zones at both ends would overlap.
         errors.append("Turnaround Zone must be at most half the Tank Length.")
     if not job.layups:
         errors.append("At least one layup is required.")
@@ -344,18 +343,23 @@ def calc_R_eye_footprint(x, x_start, x_end, r_tank, r_cap, l_dome, cap_type, eye
     return r_max
 
 
-def calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_next, max_feed=math.inf):
-    # The combined (X,Y,A) feed rate is set so the A axis turns at exactly
-    # max_a_speed (deg/min), capped at max_feed (Max Feedrate, mm/min): at a
-    # low winding angle the rotation limit alone would drive the carriage far
-    # faster than it can go. A move without rotation runs at max_a_speed's
-    # rate along its length, within the same cap.
+def calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_next, max_filament=math.inf):
+    # The combined (X,Y,A) feed rate (G-code F, mm/min) is the fastest that
+    # keeps every limit, whichever is reached first on this move: the mandrel
+    # turning at max_a_speed (deg/min), the fiber leaving the eye at
+    # max_filament (mm/min of tow, laid at radius r_next), and the MAX_FEED
+    # failsafe. At low winding angles the fiber limit sets the pace -- the
+    # rotation limit alone would drive the carriage far faster than it can
+    # go -- and toward 90 deg the rotation limit does. A move without rotation
+    # runs at max_a_speed's rate along its length, within the same limits.
     dx, dy, da = abs(x1 - x0), abs(y1 - y0), abs(a1 - a0)
     dist_klip = math.sqrt(dx**2 + dy**2 + da**2)
-    act_f = max_a_speed * dist_klip / da if da > 0 and dist_klip > 0 else max_a_speed
-    act_f = min(act_f, max_feed)
-    time_sec = (dist_klip / act_f) * 60.0 if act_f > 0 else 0
     tow_len = math.sqrt(dx**2 + (r_next * math.radians(da))**2)
+    act_f = max_a_speed * dist_klip / da if da > 0 and dist_klip > 0 else max_a_speed
+    if tow_len > 0:
+        act_f = min(act_f, max_filament * dist_klip / tow_len)
+    act_f = min(act_f, MAX_FEED)
+    time_sec = (dist_klip / act_f) * 60.0 if act_f > 0 else 0
     return act_f, time_sec, tow_len
 
 
@@ -443,78 +447,11 @@ def compute_turnaround_balance_offset(total_circuits, n_strands, dwell, extra_wi
     return max(0.0, min(k_ideal, dwell + min_extra))
 
 
-def compute_dwell_blend(dwell_amount, optimize, zone_steps=0, n_steps=3, max_fraction=0.3, max_deg=20.0):
-    # Turnaround zone (zone_steps > 0): the old Excel generator's turnaround.
-    # There is no pure-rotation move at all: the whole turnaround rotation is
-    # spread evenly over the last `zone_steps` traversal steps running out to
-    # the tank end (half of it) and the first `zone_steps` running back (the
-    # other half), on top of their normal helix rotation. The Excel sheet did
-    # exactly this over the bulkhead -- its two 80 mm "bulkhead height
-    # compensation" moves out and back, each with a quarter of the circuit's
-    # turnaround rotation. The fiber then turns around across the whole zone
-    # instead of wrapping on top of itself as a ring at one X position, which
-    # builds up over hundreds of circuits. Takes precedence over Optimize
-    # Trajectory, which only eases a small part of a pure-rotation dwell.
-    #
-    # "Optimize Trajectory": at a turnaround, the machine otherwise goes from
-    # "X moving, A rotating a little (the helix)" straight into "X frozen, A
-    # rotating a lot (the dwell)" in one abrupt move. Klipper's look-ahead
-    # planner treats consecutive moves as one combined (X,Y,A) vector, and a
-    # move that stops X dead while A keeps going is a very sharp corner in
-    # that vector space -- its cross-corner velocity limiter forces the speed
-    # at that junction down near zero, which is the "stops for a bit" the
-    # dwell is felt as.
-    #
-    # The fix borrows a standard G-code post-processing trick (corner easing):
-    # instead of one sharp corner, spend a small piece of the SAME total dwell
-    # rotation gradually, blended into the last few traversal steps before the
-    # dwell (ramping up) and the first few traversal steps after it (ramping
-    # down), while the dwell move itself only has to cover what's left. Each
-    # individual junction's direction change is then smaller, so the planner
-    # doesn't need to slow nearly as much at any single one of them.
-    #
-    # Conservation is exact: sum(tail) + sum(head) + core == dwell_amount, so
-    # the cumulative A angle at any shared checkpoint (e.g. the start of the
-    # next circuit) comes out bit-for-bit identical to the unoptimized case --
-    # only the local motion profile right around each turnaround changes, not
-    # the winding pattern itself.
-    #
-    # Returns (head_blend, tail_blend, core_dwell):
-    #   tail_blend: length-n_steps list, ramping UP, to add on top of the
-    #               normal helix rotation for the LAST n_steps of the
-    #               traversal leading INTO this dwell.
-    #   head_blend: length-n_steps list, ramping DOWN, to add on top of the
-    #               normal helix rotation for the FIRST n_steps of the
-    #               traversal leading OUT of this dwell.
-    #   core_dwell: the remaining rotation for the dwell move itself.
-    if dwell_amount <= 0:
-        return [], [], dwell_amount
-    if zone_steps > 0:
-        per_step = dwell_amount / (2 * zone_steps)
-        tail_blend = [per_step] * zone_steps
-        head_blend = [per_step] * zone_steps
-        return head_blend, tail_blend, dwell_amount - sum(tail_blend) - sum(head_blend)
-    if not optimize:
-        return [], [], dwell_amount
-    blend_each_side = min(max_deg, dwell_amount * max_fraction)
-    weights = list(range(1, n_steps + 1))
-    wsum = float(sum(weights))
-    tail_blend = [blend_each_side * w / wsum for w in weights]
-    head_blend = [blend_each_side * w / wsum for w in reversed(weights)]
-    core_dwell = dwell_amount - sum(tail_blend) - sum(head_blend)
-    return head_blend, tail_blend, core_dwell
-
-
-def traversal_steps(x_start, x_end, step_size, pitch, head_blend, tail_blend):
-    # Yields (x_next, a_delta) for one X traversal from x_start to x_end (the
-    # sign of x_end - x_start picks the direction), stepping by step_size (the
-    # last step may be shorter, to land exactly on x_end). a_delta is that
-    # step's rotation in degrees: the plain helix amount, plus any blended-in
-    # dwell rotation from head_blend (applied to the first len(head_blend)
-    # steps) or tail_blend (applied to the last len(tail_blend) steps). Pass
-    # [] for both to get the original, unblended per-step rotation exactly as
-    # before -- this generator is a strict generalization, not a behavior
-    # change, when there's nothing to blend.
+def traversal_steps(x_start, x_end, step_size, pitch):
+    # Yields (x_next, a_delta) for one straight helix run from x_start to x_end
+    # (the sign of x_end - x_start picks the direction), stepping by step_size
+    # (the last step may be shorter, to land exactly on x_end). a_delta is that
+    # step's rotation in degrees.
     direction = 1.0 if x_end >= x_start else -1.0
     total_dist = abs(x_end - x_start)
     if total_dist <= 1e-9:
@@ -524,20 +461,98 @@ def traversal_steps(x_start, x_end, step_size, pitch, head_blend, tail_blend):
     dists = [step_size] * n_full
     if remainder > 1e-9:
         dists.append(remainder)
-    n = len(dists)
-    # Clamp the blend windows so they never overlap on a very short traversal.
-    n_head = min(len(head_blend), n)
-    n_tail = min(len(tail_blend), max(0, n - n_head))
     x = x_start
-    for idx, d in enumerate(dists):
+    for d in dists:
         x_next = x + direction * d
-        a_delta = (d / pitch) * 360.0
-        if idx < n_head:
-            a_delta += head_blend[idx]
-        elif idx >= n - n_tail:
-            a_delta += tail_blend[idx - (n - n_tail)]
-        yield x_next, a_delta
+        yield x_next, (d / pitch) * 360.0
         x = x_next
+
+
+def turnaround_curve(x_turn, direction, zone, k_in, k_out, dwell, eye_y):
+    """One turnaround at the tank end x_turn, reached moving in `direction`
+    (+1/-1): the eye runs into the zone (the last `zone` mm) on the incoming
+    helix (k_in deg of rotation per mm of X), slows smoothly to a stop at
+    x_turn while the mandrel keeps turning, and runs back out on the outgoing
+    helix (k_out deg/mm) -- turning the mandrel by exactly what the old
+    turnaround did: the helix over the zone, in and out, plus `dwell`.
+
+    Why a curve: Klipper plans every junction between two G1 moves from the
+    angle between their directions in (X, Y, A) space, A in degrees counting
+    like mm, and caps the speed there by its junction deviation
+    (square_corner_velocity, 5 mm/s by default). The former turnaround zone
+    added a fixed extra rotation to every step in it, so its moves met the
+    helix at a 42 deg kink, and Klipper braked from 250 mm/s to 12 mm/s there:
+    the machine seemed to stop where the zone began. This curve leaves the
+    helix along its own direction, turns gradually, and rejoins the next
+    helix along its direction; it's cut into moves that each turn by at most
+    TURN_MAX_DEFLECTION, which Klipper takes at full speed.
+
+    Shape, for theta from 0 to pi (the reversal at pi/2):
+        X(theta) = x_turn - direction * zone * (1 - sin theta)
+        A'(theta) = zone * c(theta) * (1 + gamma * sin^2 theta)
+    with c running smoothly from k_in to k_out. A'/X' then matches the incoming
+    helix at theta = 0 and the outgoing one at pi -- and so does the
+    curvature, zero like the helix's: the curve doesn't demand a sudden
+    sideways acceleration where it begins either. gamma sets the total
+    rotation, most of the dwell being turned near the reversal, where the
+    carriage is slow; 1 + gamma * sin^2 theta stays positive (gamma >= -1/2
+    for any dwell >= 0), so the mandrel never turns backwards.
+
+    Returns (tail, head): the (x, y, a) points of the run in -- the reversal is
+    the last one, a measured from where the curve begins -- and of the run back
+    out, a measured from the reversal. Without a zone, the tail is a pure
+    rotation by `dwell` at the end, and the head is empty."""
+    if zone <= 0:
+        return [(x_turn, eye_y(x_turn), dwell)], []
+    gamma = 2.0 * (2.0 / math.pi * (1.0 + dwell / (zone * (k_in + k_out))) - 1.0)
+    dk = k_out - k_in
+
+    known = {}
+
+    def point(t):
+        if t in known:
+            return known[t]
+        x = x_turn - direction * zone * (1.0 - math.sin(t))
+        sin_t = math.sin(t)
+        c_int = k_in * t + dk * (t - sin_t) / 2                       # integral of c
+        sin2_int = t / 2 - math.sin(2 * t) / 4                         # integral of sin^2
+        cs2_int = k_in * sin2_int + dk / 2 * (sin2_int - sin_t ** 3 / 3)  # integral of c * sin^2
+        known[t] = x, eye_y(x), zone * (c_int + gamma * cs2_int)
+        return known[t]
+
+    # Split theta until every junction -- including where the curve meets the
+    # straight helix at either end -- turns by at most TURN_MAX_DEFLECTION.
+    lead = (x_turn - direction * (zone + STEP_SIZE), None, -k_in * STEP_SIZE)
+    thetas = [math.pi * i / 16 for i in range(17)]
+    for _ in range(20):
+        pts = [point(t) for t in thetas]
+        a_end = pts[-1][2]
+        ends = ([(lead[0], eye_y(lead[0]), lead[2])] + pts +
+                [(pts[-1][0] - direction * STEP_SIZE, eye_y(pts[-1][0] - direction * STEP_SIZE), a_end + k_out * STEP_SIZE)])
+        bad = {i - 1 for i in range(1, len(ends) - 1) if _deflection(ends[i - 1], ends[i], ends[i + 1]) > TURN_MAX_DEFLECTION}
+        if not bad:
+            break
+        refined = [thetas[0]]
+        for i in range(1, len(thetas)):
+            if i in bad or i - 1 in bad:
+                refined.append((thetas[i - 1] + thetas[i]) / 2)
+            refined.append(thetas[i])
+        thetas = refined
+    pts = [point(t) for t in thetas]
+    mid = thetas.index(math.pi / 2)
+    a_mid = pts[mid][2]
+    return pts[1:mid + 1], [(x, y, a - a_mid) for x, y, a in pts[mid + 1:]]
+
+
+def _deflection(p, q, r):
+    # Angle (deg) between moves p->q and q->r in (X, Y, A) space, as Klipper
+    # sees the junction at q.
+    u = [q[i] - p[i] for i in range(3)]
+    v = [r[i] - q[i] for i in range(3)]
+    nu, nv = math.sqrt(sum(c * c for c in u)), math.sqrt(sum(c * c for c in v))
+    if nu <= 1e-12 or nv <= 1e-12:
+        return 0.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, sum(a * b for a, b in zip(u, v)) / (nu * nv)))))
 
 
 def compute_wind_angle_bounds(tank_length, tank_diameter, bandwidth):
@@ -673,32 +688,38 @@ def start_sides(job):
 
 class WindSpeed(NamedTuple):
     """How fast a layup winds the middle of the tank -- its plain helix, clear
-    of the turnarounds -- and which of the two speed limits sets that pace."""
+    of the turnarounds -- and which speed limit sets that pace."""
     x_speed: float    # carriage speed (mm/s)
     rotation: float   # mandrel speed (deg/min)
+    fiber: float      # fiber leaving the eye (mm/s)
     feed: float       # G-code F (mm/min)
-    limit: str        # "rotation" (Max Rotation Speed) or "feed" (Max Feedrate)
+    # "rotation" (Max Rotation Speed), "filament" (Max Filament Speed) or
+    # "feed" (the MAX_FEED failsafe, before either of them)
+    limit: str
 
 
 def wind_speed(job, layup):
     """The layup's WindSpeed, or None while its speed isn't defined (an angle
     outside 0-90 deg, no tank diameter, or a speed limit not above 0)."""
     if not ((layup.hoop or 0 < layup.wind_angle < 90) and job.tank_diameter > 0 and job.bandwidth > 0
-            and job.max_a_speed > 0 and job.max_feed > 0):
+            and job.max_a_speed > 0 and job.max_filament_speed > 0):
         return None
     # Mid-tank the eye holds its distance (no Y motion) and the mandrel turns
-    # 360/pitch degrees per mm of X, so -- measured the way F is, with A in
-    # degrees -- a move is sqrt(1 + (deg/mm)^2) long per mm of X. Turning at
-    # Max Rotation Speed takes the feed below; wherever that exceeds Max
-    # Feedrate (low angles, where the carriage covers far more millimeters
-    # than the mandrel turns degrees), Max Feedrate sets the pace instead,
-    # exactly as calc_move() does for every move.
+    # 360/pitch degrees per mm of X. Per mm of X, a move is then
+    # sqrt(1 + (deg/mm)^2) long measured the way F is (A in degrees), and lays
+    # sqrt(1 + (r * rad(deg/mm))^2) mm of fiber on the tank. Each limit allows
+    # a feed; the lowest sets the pace, exactly as calc_move() decides it for
+    # every move.
     deg_per_mm = 360.0 / layup_pitch(job, layup)
     length_per_mm = math.sqrt(1.0 + deg_per_mm * deg_per_mm)
-    rotation_feed = job.max_a_speed * length_per_mm / deg_per_mm
-    feed = min(rotation_feed, job.max_feed)
-    return WindSpeed(feed / 60.0 / length_per_mm, feed * deg_per_mm / length_per_mm, feed,
-                     "feed" if rotation_feed > job.max_feed else "rotation")
+    tow_per_mm = math.sqrt(1.0 + (job.tank_diameter / 2 * math.radians(deg_per_mm)) ** 2)
+    feeds = {"rotation": job.max_a_speed * length_per_mm / deg_per_mm,
+             "filament": job.max_filament_speed * 60.0 * length_per_mm / tow_per_mm,
+             "feed": MAX_FEED}
+    limit = min(feeds, key=lambda name: (feeds[name], name != "rotation"))
+    feed = feeds[limit]
+    x_speed = feed / 60.0 / length_per_mm
+    return WindSpeed(x_speed, feed * deg_per_mm / length_per_mm, x_speed * tow_per_mm, feed, limit)
 
 
 # --- The motion generator ---
@@ -769,9 +790,8 @@ def iter_program(job):
     geom = _tank_geometry(job)
     x_start, x_end = geom.x_start, geom.x_end
     eye_y = _eye_y_function(job, geom)
-    max_a_speed, max_feed = job.max_a_speed, job.max_feed
+    max_a_speed, max_filament = job.max_a_speed, job.max_filament_speed * 60.0
     n_layups = len(job.layups)
-    zone_steps = job.turnaround_zone_steps
     max_move_time = job.max_move_time
 
     def moves(x0, y0, a0, x1, y1, a1, layup_index, circuit, dwell):
@@ -784,8 +804,11 @@ def iter_program(job):
         # move's duration is what bounds the stop. A G1 moves all axes linearly
         # together, so the pieces trace exactly the same path at the same speed:
         # no corners for the planner to slow down at, and the pattern, time and
-        # tow are unchanged.
-        _, duration, _ = calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, 0.0, max_feed)
+        # tow are unchanged. The fiber the move lays grows with the radius, so
+        # it's estimated at the larger end (a 5 mm step's largest radius is at
+        # one of its ends): no piece then runs longer than the estimate allows.
+        r_max = max(geom.radius(x0), geom.radius(x1))
+        _, duration, _ = calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_max, max_filament)
         n = max(1, math.ceil(duration / max_move_time - 1e-9))
         px, py, pa = x0, y0, a0
         for k in range(1, n + 1):
@@ -795,16 +818,35 @@ def iter_program(job):
                 f = k / n
                 qx, qy, qa = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, a0 + (a1 - a0) * f
             qr = geom.radius(qx)
-            feed, piece_duration, tow = calc_move(px, py, pa, qx, qy, qa, max_a_speed, qr, max_feed)
+            feed, piece_duration, tow = calc_move(px, py, pa, qx, qy, qa, max_a_speed, qr, max_filament)
             yield Move(qx, qy, qa, feed, piece_duration, tow, qr, layup_index, circuit, dwell)
             px, py, pa = qx, qy, qa
 
-    def traverse(x, y, a, target_x, pitch, head_blend, tail_blend, layup_index, circuit):
-        # One X traversal (see traversal_steps), the eye following the tank.
-        for x_next, a_delta in traversal_steps(x, target_x, STEP_SIZE, pitch, head_blend, tail_blend):
+    def traverse(x, y, a, target_x, pitch, layup_index, circuit):
+        # One straight helix run (see traversal_steps), the eye following the tank.
+        for x_next, a_delta in traversal_steps(x, target_x, STEP_SIZE, pitch):
             y_next, a_next = eye_y(x_next), a + a_delta
             yield from moves(x, y, a, x_next, y_next, a_next, layup_index, circuit, False)
             x, y, a = x_next, y_next, a_next
+
+    def curve(x, y, a, points, layup_index, circuit):
+        # Part of a turnaround curve: (x, y, a relative to `a`) points.
+        a0 = a
+        for qx, qy, qa in points:
+            yield from moves(x, y, a, qx, qy, a0 + qa, layup_index, circuit, False)
+            x, y, a = qx, qy, a0 + qa
+
+    def slope(layup):
+        return 360.0 / plan_layup(job, layup).pitch  # deg of rotation per mm of X
+
+    # A layup turns around the same way, at each end, again and again (its
+    # dwells take only a few distinct values): each curve is worked out once.
+    curves = {}
+
+    def turnaround(*args):
+        if args not in curves:
+            curves[args] = turnaround_curve(*args, eye_y)
+        return curves[args]
 
     # The wind starts at wind_start_x, so its very first pass runs from there
     # (not from the tank's end) toward +X. Every circuit still turns the mandrel
@@ -816,7 +858,7 @@ def iter_program(job):
     x, a = job.wind_start_x, 0.0
     y = eye_y(x)
     cycle_number = 0
-    pending_head_blend = []  # blend carried from the previous dwell into this traversal's first steps
+    pending_head = []  # the run back out of the last turnaround: the next pass begins with it
     lead_in_pitch = helix_pitch(job.tank_diameter, LEAD_IN_ANGLE)  # replaced by each helical layup's own
     for li, (layup, side) in enumerate(zip(job.layups, start_sides(job))):
         yield LayupStart(li)
@@ -828,10 +870,10 @@ def iter_program(job):
             # helical layup precedes it).
             first, last = job.hoop_span
             start, end = (first, last) if side == 1 else (last, first)
-            for ev in traverse(x, y, a, start, lead_in_pitch, [], [], li, 0):
+            for ev in traverse(x, y, a, start, lead_in_pitch, li, 0):
                 yield ev
                 x, y, a = ev.x, ev.y, ev.a
-            for ev in traverse(x, y, a, end, job.bandwidth, [], [], li, 0):
+            for ev in traverse(x, y, a, end, job.bandwidth, li, 0):
                 yield ev
                 x, y, a = ev.x, ev.y, ev.a
             cycle_number += 1
@@ -839,11 +881,13 @@ def iter_program(job):
             continue
         plan = plan_layup(job, layup)
         lead_in_pitch = plan.pitch
+        k = 360.0 / plan.pitch
         n_strands = layup.pattern_number
-        # Whether this layup's last dwell is handed on to the next traversal:
-        # not at the end of the program, and not before a 90° wind, whose run
-        # onto the straight section isn't one of this layup's passes.
-        hands_on = li < n_layups - 1 and not job.layups[li + 1].hoop
+        # The next layup's helix, which this layup's last turnaround runs out
+        # onto -- none at the end of the program, nor before a 90° wind, whose
+        # run onto the straight section isn't a helical pass.
+        following = job.layups[li + 1] if li < n_layups - 1 else None
+        k_next = slope(following) if following is not None and not following.hoop else None
         for i in range(plan.total_circuits):
             extra = plan.extra_after(i, n_strands)
             # Each circuit goes out from the layup's starting end and back
@@ -856,27 +900,41 @@ def iter_program(job):
             # `extra`, exactly as it always has to for the outbound traversal's
             # pattern to land correctly next circuit.
             for direction in (side, -side):
-                target_x = x_end if direction == 1 else x_start
+                x_turn = x_end if direction == 1 else x_start
                 dwell_amount = layup.turnaround_angle + (plan.right_offset if direction == side else (extra - plan.right_offset))
-                head_blend, tail_blend, core_dwell = compute_dwell_blend(dwell_amount, job.optimize_trajectory, zone_steps)
-                if not hands_on and i == plan.total_circuits - 1 and direction == -side:
-                    # Nothing follows to absorb a head blend into, so fold it
-                    # back into the dwell move itself instead of losing that
-                    # rotation. Between helical layups the blend simply carries
-                    # over into the next layup's first traversal, just like it
-                    # does between circuits.
-                    core_dwell += sum(head_blend)
-                    head_blend = []
-                for ev in traverse(x, y, a, target_x, plan.pitch, pending_head_blend, tail_blend, li, i):
+                # The run back out of the previous turnaround, then the helix
+                # up to this end's turnaround zone.
+                for ev in curve(x, y, a, pending_head, li, i):
                     yield ev
                     x, y, a = ev.x, ev.y, ev.a
-                pending_head_blend = head_blend
-                # A turnaround zone spreads all of the rotation over the steps,
-                # leaving nothing (but float dust) for a pure-rotation move.
-                if abs(core_dwell) > 1e-6:
-                    a_next = a + core_dwell
+                # A pass that starts closer to the end than the zone (after a
+                # 90° wind) turns around over what's left.
+                zone = min(job.turnaround_zone, abs(x_turn - x))
+                for ev in traverse(x, y, a, x_turn - direction * zone, plan.pitch, li, i):
+                    yield ev
+                    x, y, a = ev.x, ev.y, ev.a
+                last_pass = i == plan.total_circuits - 1 and direction == -side
+                k_out = (k_next if last_pass else k) if zone > 0 else None
+                tail, head = turnaround(x_turn, direction, zone, k, k_out if k_out is not None else k, dwell_amount)
+                if zone <= 0:
+                    # No zone: the whole turnaround is one rotation at the end.
+                    a_next = a + tail[0][2]
                     yield from moves(x, y, a, x, y, a_next, li, i, True)
                     a = a_next
+                else:
+                    for ev in curve(x, y, a, tail, li, i):
+                        yield ev
+                        x, y, a = ev.x, ev.y, ev.a
+                    if k_out is None:
+                        # Nothing runs out of this turnaround: the dwell share of
+                        # its second half is turned at the end instead, along
+                        # the curve's own direction there (pure rotation), so
+                        # without a kink. (Its helix share, winding back out of
+                        # the zone, has nowhere to go.)
+                        a_next = a + head[-1][2] - zone * k
+                        yield from moves(x, y, a, x, y, a_next, li, i, True)
+                        a, head = a_next, []
+                pending_head = head
             if (i + 1) % n_strands == 0:
                 cycle_number += 1
                 yield CycleComplete(cycle_number, li, a)
@@ -1180,24 +1238,28 @@ def _set_a(angle):
     return "G92 A0" if abs(angle) < 5e-4 else f"G92 A{angle:.3f}"
 
 
-def _limited_feed(dx, dy, da, max_a_speed, max_feed):
+def _limited_feed(dx, dy, da, r, max_a_speed, max_filament):
     # G-code F is the speed along the whole (X, Y, A) move, so the mandrel
-    # turns at F * |da| / length. The largest whole F that keeps that at or
-    # below Max Rotation Speed is floor(max * length / |da|), and F itself
-    # stays at or below Max Feedrate: both rounded down, so no move -- however
-    # it was split or rounded -- ever exceeds either limit, and each still
-    # runs within a hair of the one that governs it. A move without rotation
-    # runs at Max Rotation Speed's rate along its length, within Max Feedrate.
+    # turns at F * |da| / length and the fiber leaves the eye at F * tow /
+    # length (tow laid at radius r). The largest whole F that keeps both at or
+    # below their limits, and F itself at or below MAX_FEED: rounded down, so
+    # no move -- however it was split or rounded -- ever exceeds any of them,
+    # and each still runs within a hair of the one that governs it. A move
+    # without rotation runs at Max Rotation Speed's rate along its length.
     da = abs(da)
-    feed = max_a_speed if da <= 0 else max_a_speed * math.sqrt(dx * dx + dy * dy + da * da) / da
-    return max(1, math.floor(min(feed, max_feed)))
+    length = math.sqrt(dx * dx + dy * dy + da * da)
+    feed = max_a_speed if da <= 0 else max_a_speed * length / da
+    tow = math.sqrt(dx * dx + (r * math.radians(da)) ** 2)
+    if tow > 0:
+        feed = min(feed, max_filament * length / tow)
+    return max(1, math.floor(min(feed, MAX_FEED)))
 
 
 def _travel_feed(job):
-    # Moves that aren't part of the wind (getting to its start): Max Rotation
-    # Speed's rate, within Max Feedrate -- so any rotation they do involve
-    # can't exceed the limit either.
-    return _limited_feed(0.0, 0.0, 0.0, job.max_a_speed, job.max_feed)
+    # Moves that aren't part of the wind (getting to its start) lay no fiber:
+    # Max Rotation Speed's rate, within MAX_FEED -- so any rotation they do
+    # involve can't exceed the limit either.
+    return _limited_feed(0.0, 0.0, 0.0, 0.0, job.max_a_speed, math.inf)
 
 
 def _split_travel(start, end, max_distance):
@@ -1207,7 +1269,7 @@ def _split_travel(start, end, max_distance):
     return [start + (end - start) * k / n for k in range(1, n + 1)]
 
 
-def _write_move_to_start(out, job, x, y, message, angle=0.0):
+def _write_move_to_start(out, job, x, y, status, message, angle=0.0):
     # After homing, bring the eye to (x, y) without crossing the tank: pull it
     # fully back first (Y0 is the far end of its travel, away from the tank;
     # G28 normally leaves it there already), travel along X, and only then
@@ -1225,6 +1287,7 @@ def _write_move_to_start(out, job, x, y, message, angle=0.0):
     for yi in _split_travel(0.0, y, max_distance):
         out.write(f"G1 Y{yi:.3f} F{feed}\n")
     out.write(f"; {message}\n")
+    out.write(_say(status, message))
     out.write("PAUSE\n")
     # The mandrel may have been turned by hand while attaching the fiber: its
     # angle at resume is declared to be `angle` (the wind's zero, or the A of
@@ -1233,13 +1296,16 @@ def _write_move_to_start(out, job, x, y, message, angle=0.0):
     out.write(_set_a(angle) + "\n")
 
 
-def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_header=()):
+def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_header=(), on_progress=None):
     """Writes the program for `job` to the text stream `out`; the job must pass
     validate(). With a Resume, writes a partial program instead: the same
     moves as the complete one from resume.point on, in the same A frame, so it
     continues an interrupted wind seamlessly (raises PointError for a point
     that doesn't exist). `extra_header` adds (key, value) pairs to the settings
-    header, e.g. the material estimate the file was made with."""
+    header, e.g. the material estimate the file was made with. `on_progress`,
+    if given, is called every few thousand moves (and at the end) with the
+    winding time written so far, in seconds -- to show how far a long file
+    has got; anything it raises stops the writing."""
     out.write("; --- WINDER SETTINGS ---\n")
     for key, value in settings_items(job) + (resume_items(resume) if resume else []) + list(extra_header):
         out.write(f"; {key}: {value}\n")
@@ -1250,7 +1316,8 @@ def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_heade
         events = iter_program(job)
         if job.home_before_wind:
             out.write("G28\n")
-            _write_move_to_start(out, job, x, y, "Attach the fiber here, then resume on the machine to start winding")
+            _write_move_to_start(out, job, x, y, "Attach the fiber, then resume",
+                                 "Attach the fiber here, then resume on the machine to start winding")
         else:
             # Skip homing: just define wherever the carriage/mandrel currently
             # is as the zero reference for this wind, without moving.
@@ -1263,8 +1330,8 @@ def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_heade
             # X and Y only: the mandrel keeps its angle, so the fiber already
             # wound stays lined up with the rest of the program.
             out.write("G28 X Y\n")
-            _write_move_to_start(out, job, x, y, "Reattach the fiber here, then resume on the machine to continue winding",
-                                 angle)
+            _write_move_to_start(out, job, x, y, "Reattach the fiber, then resume",
+                                 "Reattach the fiber here, then resume on the machine to continue winding", angle)
         else:
             # The eye is already at the point; the mandrel's angle there is
             # declared to be the program's A at the point.
@@ -1274,34 +1341,133 @@ def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_heade
     # machine does need (e.g. an A axis not homed to 0) can't be faster.
     out.write(f"G1 X{x:.3f} Y{y:.3f} A{angle:.3f} F{_travel_feed(job)}\n")
     if resume is not None:
+        # That layup's start has been walked past; announce the cycle it
+        # continues in instead.
         out.write(f"; LAYUP_START:{resume.point.layup + 1}\n")
-    _write_events(out, job, events, x, y, angle, a_offset)
+    _write_events(out, job, events, x, y, angle, a_offset, on_progress,
+                  first_cycle=(resume.point.layup, resume.point.cycle + 1) if resume is not None else None)
     if end_gcode: out.write(end_gcode + "\n")
 
 
-def _write_events(out, job, events, x, y, angle, a_offset):
+PROGRESS_EVERY = 2000  # moves between write_gcode's progress reports
+LAYER_UPDATE_SECONDS = 1.0  # winding time between updates of the machine's layer display (the angle)
+
+
+def _write_events(out, job, events, x, y, angle, a_offset, on_progress=None, first_cycle=None):
     # The machine executes the coordinates as written (3 decimals), so feed
     # rates are computed from those -- relative to the previous written
     # position -- not from the unrounded ones.
+    #
+    # Each cycle is held back until it's complete: its status lines come
+    # first, and the layer display's total among them is the angle the cycle
+    # ends at (see _cycle_status) -- known only once it has been wound. A
+    # partial program starts inside `first_cycle` (layup index, cycle number
+    # within the layup).
     wx, wy, wa = float(f"{x:.3f}"), float(f"{y:.3f}"), float(f"{angle:.3f}")
-    max_a_speed, max_feed = job.max_a_speed, job.max_feed
+    max_a_speed, max_filament = job.max_a_speed, job.max_filament_speed * 60.0
+    radius = _tank_geometry(job).radius
+    n_layups = len(job.layups)
+    # The program-wide cycle count before each layup: a CycleComplete's number
+    # minus this is the cycle's number within its layup.
+    layup_starts = list(itertools.accumulate((layup.passes for layup in job.layups), initial=0))
+    written, n_moves = 0.0, 0
+    held = []  # lines of the cycle being wound
+    cycle = (*first_cycle, wa) if first_cycle else None  # (layup, number, angle it starts at)
+    since_update = 0.0
     for ev in events:
         if type(ev) is Move:
+            written += ev.duration
+            n_moves += 1
+            if on_progress is not None and n_moves % PROGRESS_EVERY == 0:
+                on_progress(written)
             gx, gy, ga = f"{ev.x:.3f}", f"{ev.y:.3f}", f"{(ev.a - a_offset):.3f}"
             nx, ny, na = float(gx), float(gy), float(ga)
-            out.write(f"G1 X{gx} Y{gy} A{ga} F{_limited_feed(nx - wx, ny - wy, na - wa, max_a_speed, max_feed)}\n")
+            # The fiber is laid at the radius where the written move ends.
+            feed = _limited_feed(nx - wx, ny - wy, na - wa, radius(nx), max_a_speed, max_filament)
+            line = f"G1 X{gx} Y{gy} A{ga} F{feed}\n"
+            if cycle is None:
+                out.write(line)
+            else:
+                held.append(line)
+                since_update += ev.duration
+                if since_update >= LAYER_UPDATE_SECONDS:
+                    held.append(f"SET_PRINT_STATS_INFO CURRENT_LAYER={round(na)}\n")
+                    since_update = 0.0
             wx, wy, wa = nx, ny, na
         elif type(ev) is CycleComplete:
+            if cycle is not None:
+                out.write(_cycle_status(job, cycle[0], cycle[1], ev.a - a_offset, cycle[2]))
+                out.writelines(held)
+                held, cycle = [], None
             out.write(f"; CYCLE_COMPLETE:{ev.number}\n")
             # Reset the firmware's A-axis position to 0 without moving, so the
             # accumulated rotation over a long wind never approaches the axis's
             # +/-9999999 limit. Subsequent A values are written relative to this.
             out.write("G92 A0\n")
             a_offset, wa = ev.a, 0.0
+            number = ev.number - layup_starts[ev.layup]
+            if number < job.layups[ev.layup].passes:
+                cycle, since_update = (ev.layup, number + 1, 0.0), 0.0
+            elif ev.layup == n_layups - 1:
+                layups = f"{n_layups} layup{'s' if n_layups != 1 else ''}"
+                out.write(_say("Wind complete", f"Wind complete: {layups}, {job.total_cycles} cycles"))
         else:
             if ev.index > 0 and job.pause_after_layup:
                 # The pattern changes here: stop so the fiber can be checked
                 # (e.g. for slipping) before the next layup starts.
                 out.write(f"; Layup {ev.index} complete - check the fiber, then resume on the machine\n")
+                out.write(_say(f"Layup {ev.index}/{n_layups} done - check the fiber, then resume",
+                               f"Layup {ev.index}/{n_layups} complete - check the fiber, then resume. "
+                               f"Next: layup {ev.index + 1}/{n_layups} ({_layup_description(job.layups[ev.index])})"))
                 out.write("PAUSE\n")
             out.write(f"; LAYUP_START:{ev.index + 1}\n")
+            cycle, since_update = (ev.index, 1, 0.0), 0.0
+    if cycle is not None:  # not ended by a CycleComplete (every program's cycles are)
+        out.write(_cycle_status(job, cycle[0], cycle[1], wa, cycle[2]))
+        out.writelines(held)
+    if on_progress is not None:
+        on_progress(written)
+
+
+# --- Progress on the machine ---
+# The program tells the machine where the wind is, with commands Klipper and
+# Mainsail's standard config (mainsail.cfg) provide. SET_PRINT_STATS_INFO,
+# built into Klipper, drives Mainsail's "Layer x of y", here the mandrel angle
+# A within the cycle out of the angle the cycle ends at (A restarts at 0 with
+# every cycle). M117 sets the status line -- layup and cycle -- ([display_status])
+# and RESPOND prints to the console ([respond]). Klipper-for-CNC aborts the file on any
+# command it doesn't know, so these three are the only ones used. Klipper
+# reads a little ahead of the motion, so each message shows up to ~2 s before
+# the machine gets there.
+
+def _machine_text(text):
+    # Plain printable ASCII, without what would end a message early: ';' starts
+    # a comment, '#' and '*' end a command's arguments, and the quotes would
+    # end RESPOND's MSG.
+    text = text.replace("°", " deg")
+    return " ".join("".join(c for c in text if " " <= c <= "~" and c not in ";#*\"'").split())
+
+
+def _say(status, console=None):
+    # A message on Mainsail's status line, and (in full) in the console.
+    return f"M117 {_machine_text(status)}\nRESPOND MSG=\"{_machine_text(console or status)}\"\n"
+
+
+def _layup_description(layup):
+    return "90 deg wind, straight section" if layup.hoop else f"{layup.wind_angle:g} deg, pattern {layup.pattern_number}"
+
+
+def _cycle_status(job, layup_index, cycle, final_angle, start_angle=0.0):
+    # Written where a cycle starts (or a partial program continues inside
+    # it). The layer display shows the mandrel angle in whole degrees: from
+    # start_angle -- updated every LAYER_UPDATE_SECONDS of winding -- out of
+    # final_angle, where the cycle ends. Klipper only accepts whole numbers
+    # there, and a changed total restarts the count before the current value
+    # applies.
+    layup, n = job.layups[layup_index], len(job.layups)
+    angle = "90 deg wind" if layup.hoop else f"{layup.wind_angle:g} deg"
+    total = max(1, round(final_angle))
+    return (f"SET_PRINT_STATS_INFO TOTAL_LAYER={total} CURRENT_LAYER={min(total, round(start_angle))}\n"
+            + _say(f"Layup {layup_index + 1}/{n} - Cycle {cycle}/{layup.passes} - {angle}",
+                   f"Starting cycle {cycle}/{layup.passes} of layup {layup_index + 1}/{n} "
+                   f"({_layup_description(layup)})"))
