@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkfont
 import math
+import sys
 import threading
 import queue
 import time
@@ -19,6 +20,7 @@ MACHINE_FIELDS = [
     ("Eye Width (mm)", "eye_width"),
     ("Min Spacing (Safety) (mm)", "min_spacing"),
     ("Max Rotation Speed (mm/s)", "max_surface_speed"),
+    ("Max Feedrate (mm/s)", "max_feedrate"),
     ("Max Move Time (s)", "max_move_time"),
 ]
 TANK_FIELDS = [("Tank Length (mm)", "tank_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
@@ -30,7 +32,20 @@ LAYUP_FIELDS = [
     ("Turnaround / Dwell Angle (Deg)", "turnaround_angle"),
 ]
 START_X_FIELD = ("Start Wind at X (mm)", "start_x")
+# The two speed limits. Every move runs at Max Rotation Speed unless that
+# would exceed Max Feedrate (see winding.calc_move); a red frame marks the one
+# that sets the selected layup's pace in the middle of the tank.
+SPEED_LIMIT_TIPS = {
+    "max_surface_speed": "The fastest the mandrel may turn, given as the speed of the tank's surface.",
+    "max_feedrate": "The fastest any move may run: the G-code feed rate F ÷ 60, measured along the whole move "
+                    "the way the controller does (set it to Klipper's max_velocity). At low winding angles this "
+                    "is practically the carriage's X speed.",
+}
 FIELD_LABELS = {key: label for label, key in MACHINE_FIELDS + [START_X_FIELD] + TANK_FIELDS + WINDING_FIELDS + LAYUP_FIELDS}
+HOOP_TIP = ("One pass along the straight section only, never over the domes, each turn laid one band width on "
+            "from the last so the bands lie edge to edge (just short of 90°). No pattern and no turnarounds, so the "
+            "fields below don't apply.\n\nIt ends at the other end of the tank: the next layup starts from there "
+            f"and winds the other way. A Winding Angle above {winding.HOOP_ANGLE_THRESHOLD:g}° switches this on.")
 
 # Entry fields use the same compact size as their labels (a ttk style can't
 # set an entry's font; it has to be given to the widget itself).
@@ -40,6 +55,13 @@ LEGEND_FONT = ("TkDefaultFont", 8)
 ESTIMATE_FONT = ("TkDefaultFont", 9)
 LEGEND_FONT_ACTIVE = ("TkDefaultFont", 8, "bold")
 SWATCH_W, SWATCH_H = 24, 12
+
+
+def layup_caption(layup, sep=" · "):
+    """What a layup winds, in short: "45° · 30 cycles", or "90° wind"."""
+    if layup.hoop:
+        return "90° wind"
+    return f"{layup.wind_angle:g}°{sep}{layup.passes} cycle{'s' if layup.passes != 1 else ''}"
 
 
 def format_hms(seconds):
@@ -72,8 +94,16 @@ class _BackgroundCalc:
     starts. Each request gets a unique token, and only the newest request's
     outcome is delivered; anything else that arrives is stale and discarded."""
 
-    def __init__(self, fn, on_result):
+    def __init__(self, fn, on_result, defer):
         self._fn, self._on_result = fn, on_result
+        # The worker is started through `defer` (Tk's after_idle): once the GUI
+        # has finished the redraw that asked for it. Started mid-redraw, it
+        # would contend for the GIL with every Tk call still to come -- each one
+        # hands the GIL over, and getting it back can take a whole switch
+        # interval -- which made a settings change freeze the GUI for up to
+        # half a second.
+        self._defer = defer
+        self._launch_scheduled = False
         self._queue = queue.Queue()
         self._thread = None
         self._next_token = 0
@@ -96,11 +126,13 @@ class _BackgroundCalc:
         self._next_token += 1
         self._wanted = self._next_token
         self.pending = (self._next_token, key)
-        if not self.busy:
-            self._launch()
+        if not self.busy and not self._launch_scheduled:
+            self._launch_scheduled = True
+            self._defer(self._launch)
 
     def _launch(self):
-        if self.pending is None:
+        self._launch_scheduled = False
+        if self.pending is None or self.busy:
             return
         self.inflight, self.pending = self.pending, None
         self._thread = threading.Thread(target=self._work, args=self.inflight, daemon=True)
@@ -216,6 +248,56 @@ class AutoEntry:
         self._mode_at_focus = auto if self.has_focus() else None
 
 
+class _LimitFrame:
+    """A frame around one row of a settings grid -- its label and its entry --
+    marking the setting that currently limits something. Laid over the grid
+    with place() rather than gridded into it, so showing, moving or hiding it
+    never shifts a single widget; the row needs a few pixels of padding above
+    and below for it (see setup_ui)."""
+    THICKNESS = 2
+    OUTSET = 5  # how far it reaches into the section's side padding
+
+    def __init__(self, master):
+        self._master = master
+        # Plain Tk frames as the four sides. ttkbootstrap's theme switch repaints
+        # them in the panel color; show() colors them again on every redraw.
+        self._sides = [tk.Frame(master, bd=0, highlightthickness=0) for _ in range(4)]
+        self.row = None
+        self._pending = None
+        # Grid lays its rows out at idle time, so on a resize their final
+        # positions are only known once that has run.
+        master.bind("<Configure>", lambda e: self._place_when_idle(), add="+")
+
+    def _place_when_idle(self):
+        if self._pending is None:
+            self._pending = self._master.after_idle(self._place)
+
+    def show(self, row, color):
+        for side in self._sides:
+            side.configure(bg=color)
+        if row != self.row:
+            self.row = row
+            self._place()
+
+    def hide(self):
+        self.row = None
+        for side in self._sides:
+            side.place_forget()
+
+    def _place(self):
+        self._pending = None
+        if self.row is None:
+            return
+        x, y, w, h = self._master.grid_bbox(0, self.row, 1, self.row)
+        if w <= 1:
+            return  # not laid out yet: <Configure> places it once it is
+        t, x0, x1 = self.THICKNESS, x - self.OUTSET, x + w + self.OUTSET
+        top, bottom, left, right = self._sides
+        for side, sx, sy, sw, sh in ((top, x0, y, x1 - x0, t), (bottom, x0, y + h - t, x1 - x0, t),
+                                     (left, x0, y, t, h), (right, x1 - t, y, t, h)):
+            side.place(x=sx, y=sy, width=sw, height=sh, bordermode="outside")
+
+
 class PlanTab:
     def __init__(self, settings_parent, viz_parent, app):
         self.settings_parent = settings_parent
@@ -225,6 +307,7 @@ class PlanTab:
         self.redraw_timer = None
         self.tank_entries = {}
         self.layup_entries = {}
+        self.machine_entries = {}
 
         # --- Background calculation state ---
         # The strand-path simulation (and, while continuing a wind, the tank's
@@ -237,8 +320,13 @@ class PlanTab:
         # resizing, rotating the view -- redraws straight from that cache without
         # re-running the simulation, which is what keeps layup switching instant.
         # Progress is keyed and cached the same way, by (job, continue point).
-        self._sim = _BackgroundCalc(winding.simulate, self._apply_calc_result)
-        self._prog = _BackgroundCalc(lambda key: winding.progress(*key), self._apply_progress_result)
+        defer = self.app.root.after_idle
+        self._sim = _BackgroundCalc(winding.simulate, self._apply_calc_result, defer)
+        self._prog = _BackgroundCalc(lambda key: winding.progress(*key), self._apply_progress_result, defer)
+        # While a calculation runs, the GUI thread gets the GIL back after at
+        # most this long (Python's default is 5 ms) -- and it gives it up on
+        # every Tk call, so a redraw with a hundred of them stays quick.
+        sys.setswitchinterval(0.0005)
         self._result = None        # (job, winding.SimulationResult) of the last finished simulation
         self._progress = None      # ((job, point), winding.Progress) of the last finished progress
         self.estimate = None       # (job, strength.Material, strength.Estimate) shown in the estimates
@@ -301,19 +389,30 @@ class PlanTab:
 
         def add_fields(frame, fields, first_row=0, store=None):
             for i, (label_text, key) in enumerate(fields):
-                ttk.Label(frame, text=label_text, style=LBL).grid(row=first_row + i, column=0, sticky="w", pady=1, padx=(0, 10))
+                # The speed limits' rows get room above and below for the frame
+                # that marks the limiting one (see _LimitFrame).
+                pady = 3 if key in SPEED_LIMIT_TIPS else 1
+                label = ttk.Label(frame, text=label_text, style=LBL)
+                label.grid(row=first_row + i, column=0, sticky="w", pady=pady, padx=(0, 10))
                 # Layup entries are bound to a variable later (on_layups_changed),
                 # since which layup's variables they edit changes on every switch.
                 var = self.app.params.get(key)
                 entry = ttk.Entry(frame, width=12, style=ENT, font=FIELD_FONT, **({"textvariable": var} if var is not None else {}))
-                entry.grid(row=first_row + i, column=1, sticky="e", pady=1)
+                entry.grid(row=first_row + i, column=1, sticky="e", pady=pady)
                 if store is not None: store[key] = entry
+                if key in SPEED_LIMIT_TIPS:
+                    self._limit_tips[key] = [ToolTip(widget, text=SPEED_LIMIT_TIPS[key], wraplength=280, delay=400)
+                                             for widget in (label, entry)]
             frame.columnconfigure(0, weight=1)
 
         # 1. Machine Settings
         machine_frame = ttk.LabelFrame(left_panel, text="Machine Settings", padding=FRAME_PAD, style=FRM)
         machine_frame.pack(fill=tk.X, pady=FRAME_GAP)
-        add_fields(machine_frame, MACHINE_FIELDS)
+        self._limit_tips = {}
+        add_fields(machine_frame, MACHINE_FIELDS, store=self.machine_entries)
+        # Marks which speed limit sets the selected layup's pace (see
+        # _update_speed_limit).
+        self._limit_frame = _LimitFrame(machine_frame)
         # A plain ttk.Checkbutton, same as "Optimize Trajectory" in Winding
         # Settings -- just the compact Settings font, no color/Toolbutton style.
         ttk.Checkbutton(machine_frame, text="Home Axes (G28) Before Winding",
@@ -381,7 +480,19 @@ class PlanTab:
         layup_frame = ttk.LabelFrame(left_panel, labelwidget=nav, padding=FRAME_PAD, style=FRM)
         layup_frame.pack(fill=tk.X, pady=FRAME_GAP)
         nav.lift(layup_frame)  # a labelwidget must stack above its frame to be visible
-        add_fields(layup_frame, LAYUP_FIELDS, store=self.layup_entries)
+        # The 90° switch heads the section: it decides whether the fields below
+        # apply. Its variable is the selected layup's (see _apply_layup_mode).
+        self._hoop_check = ttk.Checkbutton(layup_frame, text="90° Wind (Straight Section Only)",
+                                           style="Settings.TCheckbutton", command=self._on_hoop_toggled)
+        self._hoop_check.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 3))
+        ToolTip(self._hoop_check, text=HOOP_TIP, wraplength=300, delay=400)
+        add_fields(layup_frame, LAYUP_FIELDS, first_row=1, store=self.layup_entries)
+        # What a 90° wind's greyed-out fields show instead of its (unused)
+        # helical settings: one pass, its actual angle, no pattern or dwell.
+        self._hoop_display = {key: tk.StringVar(value="—") for key in self.layup_entries}
+        self._hoop_display["passes"].set("1")
+        self._angle_before_edit = None
+        self.layup_entries["wind_angle"].bind("<FocusIn>", self._remember_angle, add="+")
         # Angles too close to 0/90 deg aren't physically realizable for the
         # current tank size/tow width (see compute_wind_angle_bounds) and are
         # what caused the "calculates forever" symptom. Only auto-correct once
@@ -502,7 +613,8 @@ class PlanTab:
         estimate("time", "Time", "Total winding time · cycles in all layups together.")
         estimate("tow", "Tow", "Tow length · its dry fiber mass (set up in Strength & Materials).")
         estimate("resin", "Resin", "Resin mass for that fiber (set up in Strength & Materials).")
-        estimate("rotation", "Rotation", "Mandrel speed at Max Rotation Speed. Click to change units.",
+        estimate("rotation", "Rotation", "Top mandrel speed (at the turnarounds): Max Rotation Speed, unless "
+                                         "Max Feedrate holds it lower. Click to change units.",
                  on_click=self._cycle_rotation_speed_unit)
         estimate("reach", "Eye Reach", "How close to and how far from the tank axis the eye can get across its "
                                        "Y travel.", style="warning.TLabel")
@@ -517,7 +629,8 @@ class PlanTab:
         estimate("layup_time", "Time", "This layup's winding time · its average time per cycle.")
         estimate("layup_tow", "Tow", "This layup's tow length · its dry fiber mass.")
         estimate("layup_resin", "Resin", "Resin mass for this layup's fiber.")
-        estimate("xspeed", "X-Speed", "Carriage speed along the straight section. Click to change units.",
+        estimate("xspeed", "X-Speed", "Carriage speed in the middle of the tank, set by the speed limit framed "
+                                       "in red in Machine Settings. Click to change units.",
                  on_click=self._cycle_xspeed_unit)
         estimate("coverage", "Coverage", "How much of the surface the layup's bands cover · the fewest cycles "
                                          "that cover it completely. Orange while gaps remain.")
@@ -525,9 +638,8 @@ class PlanTab:
                                             "(first circuit), on top of the dwell angle.")
 
         # Raw values cached in their base unit so clicking just re-formats them,
-        # with no recalculation needed -- rotation speed is always exactly Max
-        # Rotation Speed (see winding.calc_move), and X-speed follows from that
-        # and the selected layup's winding angle.
+        # with no recalculation needed (both are closed-form: see
+        # _update_instant_estimates).
         self._rotation_speed_deg_per_min = 0.0
         self._rotation_speed_unit_idx = 0
         self.ROTATION_SPEED_UNITS = ["rpm", "°/s", "°/min"]
@@ -576,7 +688,9 @@ class PlanTab:
     def _start_x_mode_changed(self, auto):
         value = self._start_x_entry.get().strip()
         if auto:
-            self.app.set_status(f"Start Wind at X is back on auto -- {value} mm, where the dome ends and the tank turns straight.")
+            where = ("where Layup 1's 90° wind begins" if self._job is not None and self._job.layups[0].hoop
+                     else "where the dome ends and the tank turns straight")
+            self.app.set_status(f"Start Wind at X is back on auto -- {value} mm, {where}.")
         else:
             self.app.set_status(f"Start Wind at X set to {value} mm and fixed there. "
                                 "Clear the field to put it back on auto (where the dome ends).")
@@ -588,7 +702,7 @@ class PlanTab:
         # cleared field isn't refilled under their cursor.
         editing = self._cycles_field.editing()
         for i, (layup_vars, layup) in enumerate(zip(self.app.layups, job.layups)):
-            if not layup.auto_cycles or (editing and i == self.app.active_layup):
+            if not layup.auto_cycles or layup.hoop or (editing and i == self.app.active_layup):
                 continue
             if winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number) is None:
                 continue  # not computable right now; geometry_errors() explains why
@@ -616,15 +730,13 @@ class PlanTab:
         # keeps its values -- even half-typed ones -- in its own variables, so
         # switching never has to copy or re-parse anything), then redraws.
         n, i = len(self.app.layups), self.app.active_layup
-        for key, entry in self.layup_entries.items():
-            entry.configure(textvariable=self.app.layups[i][key])
+        self._apply_layup_mode()
         self.layup_title_var.set(f"Layup {i + 1} of {n}")
         self.layup_heading_var.set(f"Layup {i + 1}" if n > 1 else "Layup")
         self._prev_btn.configure(state="normal" if i > 0 else "disabled")
         self._next_btn.configure(state="normal" if i < n - 1 else "disabled")
         self._remove_btn.configure(state="normal" if n > 1 else "disabled")
         self._draw_layup_swatch()
-        self._cycles_field.refresh()
         self._cycles_field.rebind()
         # Redraw right away rather than debounced: nothing here is slow (a
         # switch that doesn't change any setting redraws from the cached
@@ -633,6 +745,74 @@ class PlanTab:
             self.app.root.after_cancel(self.redraw_timer)
             self.redraw_timer = None
         self.draw_visualization()
+
+    def _apply_layup_mode(self):
+        # Points the layup section at the selected layup: its 90° checkbox, and
+        # its entry fields -- or, for a 90° wind, greyed-out fields showing what
+        # it winds instead. Its own helical values stay untouched underneath, so
+        # unchecking the box brings them straight back.
+        layup_vars = self.app.layups[self.app.active_layup]
+        self._hoop_check.configure(variable=layup_vars["hoop"])
+        hoop = self._is_hoop(layup_vars)
+        for key, entry in self.layup_entries.items():
+            entry.configure(textvariable=self._hoop_display[key] if hoop else layup_vars[key])
+            entry.state(["disabled"] if hoop else ["!disabled"])
+        self._cycles_field.refresh()
+
+    @staticmethod
+    def _is_hoop(layup_vars):
+        try:
+            return bool(layup_vars["hoop"].get())
+        except tk.TclError:
+            return False
+
+    def _on_hoop_toggled(self):
+        # The checkbox itself was clicked.
+        layup_vars = self.app.layups[self.app.active_layup]
+        if self._is_hoop(layup_vars):
+            self._settle_helical_angle(layup_vars)
+            self._announce_hoop(True, "90° wind: one pass over the straight section, each turn one band width on "
+                                      "from the last.")
+        else:
+            angle = self._settle_helical_angle(layup_vars)
+            back = f" at {angle:g}°" if angle is not None else ""
+            self._announce_hoop(False, f"wound helically again{back}.")
+        self._apply_layup_mode()
+        self._redraw_now()
+
+    def _announce_hoop(self, hoop, text):
+        i, n = self.app.active_layup, len(self.app.layups)
+        prefix = f"Layup {i + 1}: " if n > 1 else ""
+        text = prefix + (text if prefix else text[:1].upper() + text[1:])
+        if i < n - 1:
+            text += f" The layup{'s' if i < n - 2 else ''} after it now start{'' if i < n - 2 else 's'} from the other end."
+        self.app.set_status(text)
+
+    def _remember_angle(self, event=None):
+        # The angle before this edit: what a layup keeps as its helical angle if
+        # the edit turns it into a 90° wind.
+        try:
+            self._angle_before_edit = (self.app.active_layup,
+                                       float(self.app.layups[self.app.active_layup]["wind_angle"].get()))
+        except (tk.TclError, ValueError):
+            self._angle_before_edit = None
+
+    def _settle_helical_angle(self, layup_vars):
+        # A 90° wind keeps its layup's helical angle for when it's unchecked;
+        # an angle above the 90° threshold can't be that, so it goes back to the
+        # angle from before the edit (or the threshold). Returns the angle, or
+        # None while the field doesn't hold a number.
+        limit = winding.HOOP_ANGLE_THRESHOLD
+        try:
+            angle = float(layup_vars["wind_angle"].get())
+        except (tk.TclError, ValueError):
+            return None
+        if angle <= limit:
+            return angle
+        before = self._angle_before_edit
+        keep = before[1] if before and before[0] == self.app.active_layup and 0 < before[1] <= limit else limit
+        layup_vars["wind_angle"].set(keep)
+        return keep
 
     def _draw_layup_swatch(self):
         c = self._layup_swatch
@@ -668,6 +848,8 @@ class PlanTab:
 
     def _validate_wind_angle(self, event=None):
         layup_vars = self.app.layups[self.app.active_layup]
+        if self._is_hoop(layup_vars):
+            return  # its angle field isn't in use
         try:
             lt = float(self.app.params["tank_length"].get())
             dt = float(self.app.params["tank_diameter"].get())
@@ -675,6 +857,15 @@ class PlanTab:
             angle = float(layup_vars["wind_angle"].get())
         except (tk.TclError, ValueError):
             return  # field is mid-edit / not a valid number yet -- leave it alone
+        if angle > winding.HOOP_ANGLE_THRESHOLD:
+            # Steeper than that is a 90° wind: switch the layup over.
+            keep = self._settle_helical_angle(layup_vars)
+            layup_vars["hoop"].set(True)
+            self._announce_hoop(True, f"a Winding Angle above {winding.HOOP_ANGLE_THRESHOLD:g}° is wound as a 90° "
+                                      f"wind over the straight section. Uncheck it to wind helically again (at {keep:g}°).")
+            self._apply_layup_mode()
+            self._redraw_now()
+            return
         angle_min, angle_max = winding.compute_wind_angle_bounds(lt, dt, bandwidth)
         which = f" for Layup {self.app.active_layup + 1}" if len(self.app.layups) > 1 else ""
         if angle < angle_min:
@@ -737,6 +928,7 @@ class PlanTab:
             self._draw_legend()
             self._cycles_field.refresh()
             self._start_x_field.refresh()
+            self._update_speed_limit(None, None)
             self._update_indicator()
             return
         self._job = job
@@ -871,7 +1063,11 @@ class PlanTab:
         elif self.show_all_var.get():
             text = f"All {n} layups · first cycle of each"
         else:
-            text = f"Layup {self.app.active_layup + 1} of {n} · first cycle"
+            i = self.app.active_layup
+            hoop = i < len(self._job.layups) and self._job.layups[i].hoop
+            text = f"Layup {i + 1} of {n} · " + ("90° wind over the straight section" if hoop else "first cycle")
+            if i < len(self._job.layups) and winding.start_sides(self._job)[i] == -1:
+                text += " · from the far end"
         self.canvas.create_text(10, c_h - 8, text=text, anchor="sw", fill=self.app.canvas_palette["muted"],
                                 font=("TkDefaultFont", 9), tags="caption")
 
@@ -892,8 +1088,7 @@ class PlanTab:
         x = y = 0
         for i, layup in enumerate(job.layups):
             font = self._legend_fonts[1] if i == self.app.active_layup else self._legend_fonts[0]
-            cycles = f"{layup.passes} cycle{'s' if layup.passes != 1 else ''}"
-            text = f"Layup {i + 1}  ·  {layup.wind_angle:g}°  ·  {cycles}"
+            text = f"Layup {i + 1}  ·  {layup_caption(layup, '  ·  ')}"
             item_w = SWATCH_W + pad + font.measure(text)
             if x > 0 and x + item_w > width:
                 x, y = 0, y + row_h
@@ -920,26 +1115,37 @@ class PlanTab:
         eye_dist_min, eye_dist_max = winding.eye_reach(job.eye_arm_length)
         self.est["reach"].set(f"{eye_dist_min:.0f}–{eye_dist_max:.0f} mm")
 
-        # Rotation Speed and X-Speed both follow directly from Max Rotation
-        # Speed (the machine's rotation is always governed by it exactly, see
-        # winding.calc_move) plus the tank diameter / winding angle.
-        self._rotation_speed_deg_per_min = job.max_a_speed
+        # Rotation: the turnarounds' pure rotation runs at Max Rotation Speed
+        # within Max Feedrate. X-Speed: the selected layup's mid-tank helix,
+        # at whichever of the two limits it reaches first (winding.wind_speed).
+        self._rotation_speed_deg_per_min = min(job.max_a_speed, job.max_feed)
         self._update_rotation_speed_display()
         angle_ok = 0 < layup.wind_angle < 90
-        self._xspeed_mm_s = job.max_surface_speed / math.tan(math.radians(layup.wind_angle)) if angle_ok else 0.0
+        if layup.hoop:
+            self._hoop_display["wind_angle"].set(f"{job.hoop_angle:.1f}" if job.bandwidth > 0 else "—")
+        speed = winding.wind_speed(job, layup)
+        self._xspeed_mm_s = speed.x_speed if speed else 0.0
         self._update_xspeed_display()
+        self._update_speed_limit(job, speed)
 
         # Coverage · the fewest cycles for full coverage. Extra Rotation: the
         # pattern-alignment rotation on top of the dwell angle, split between
         # the far-end (return) turnaround -- the same fixed share every circuit
         # -- and the chuck-end turnaround, which absorbs the rest (see
-        # compute_turnaround_balance_offset). Shown for the first circuit.
+        # compute_turnaround_balance_offset) -- the other way round for a
+        # layup that starts from the far end. Shown for the first circuit. A
+        # 90° wind lays its bands edge to edge, with no turnarounds at all.
         cycles_needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number)
         gaps = False
-        if angle_ok and layup.passes >= 1 and layup.pattern_number >= 1 and job.tank_diameter > 0 and job.bandwidth > 0:
+        if layup.hoop:
+            self.est["extra"].set("none")
+            self.est["coverage"].set("100 % · straight section")
+        elif angle_ok and layup.passes >= 1 and layup.pattern_number >= 1 and job.tank_diameter > 0 and job.bandwidth > 0:
             plan = winding.plan_layup(job, layup)
-            left_offset = plan.extra_after(0, layup.pattern_number) - plan.right_offset
-            self.est["extra"].set(f"{plan.right_offset:.1f}° / {left_offset:.1f}°")
+            outbound = plan.right_offset
+            inbound = plan.extra_after(0, layup.pattern_number) - outbound
+            far, chuck = (outbound, inbound) if winding.start_sides(job)[self.app.active_layup] == 1 else (inbound, outbound)
+            self.est["extra"].set(f"{far:.1f}° / {chuck:.1f}°")
             percent = round(plan.coverage * 100)
             self.est["coverage"].set(f"{percent} %" + (f" · min {cycles_needed} cyc" if cycles_needed else ""))
             # Compared as shown (rounded): "100 %" never turns orange over a
@@ -949,6 +1155,31 @@ class PlanTab:
             self.est["extra"].set("-- / --")
             self.est["coverage"].set("--")
         self._est_values["coverage"].configure(foreground=self.app.canvas_palette["warn_text"] if gaps else "")
+
+    def _update_speed_limit(self, job, speed):
+        # Frames the speed limit that sets the selected layup's pace mid-tank
+        # (none while the settings don't define one) and says so in both speed
+        # fields' tooltips, with what that pace is.
+        if speed is None:
+            self._limit_frame.hide()
+            for key, tips in self._limit_tips.items():
+                for tip in tips: tip.text = SPEED_LIMIT_TIPS[key]
+            return
+        limiting = "max_feedrate" if speed.limit == "feed" else "max_surface_speed"
+        row = self.machine_entries[limiting].grid_info()["row"]
+        self._limit_frame.show(row, self.app.canvas_palette["limit"])
+        i, n = self.app.active_layup, len(self.app.layups)
+        layup = job.layups[i]
+        which = f"{f'Layup {i + 1}' if n > 1 else 'the wind'} ({'90° wind' if layup.hoop else f'{layup.wind_angle:g}°'})"
+        limiting_name = FIELD_LABELS[limiting].split(" (")[0]  # without its unit
+        surface = math.radians(speed.rotation / 60.0) * job.tank_diameter / 2
+        for key, tips in self._limit_tips.items():
+            if key == limiting:
+                note = (f"Framed in red: this limits {which}. Mid-tank the carriage runs at "
+                        f"{speed.x_speed:.0f} mm/s, the tank surface at {surface:.0f} mm/s.")
+            else:
+                note = f"{which[:1].upper()}{which[1:]} stays below this: {limiting_name} limits it first."
+            for tip in tips: tip.text = f"{SPEED_LIMIT_TIPS[key]}\n\n{note}"
 
     def _update_sim_estimates(self):
         # Figures that need the full simulation (time, tow, masses, strength).
@@ -1128,8 +1359,10 @@ class PlanTab:
         scale, ox, oy = self._view_geom
         pal = self.app.canvas_palette
         color, dash = theme.layup_style(pal, layup_index)
-        style = dict(fill=color, width=max(1, int(self._job.bandwidth * scale)), capstyle=tk.ROUND, dash=dash or "",
-                     tags="strand_path")
+        # The band's width on screen, rounded up: bands laid edge to edge (a 90°
+        # wind, full coverage) then close up instead of showing slivers of tank.
+        style = dict(fill=color, width=max(1, math.ceil(self._job.bandwidth * scale)), capstyle=tk.ROUND,
+                     dash=dash or "", tags="strand_path")
         az = math.radians(self._view_azimuth)
         for run in runs:
             poly = []

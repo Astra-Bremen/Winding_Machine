@@ -41,6 +41,28 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   settings apply to the whole program. Each layup keeps its own pattern
   alignment, and two identical layups in a row wind exactly on top of each
   other, like repeated layers.
+- **90° wind (hoop layups):** check *90° Wind (Straight Section Only)* in a
+  layup to wind the straight section only, never the domes. It is a single
+  pass from one end of the straight section to the other. Each turn advances
+  exactly one band width, so the bands lie edge to edge at just under 90°
+  (89.5° for a 200 mm tank and 5 mm tow). The band's edges are flush with the
+  ends of the straight section. There is no pattern and no turnaround, so the
+  layup's cycles, pattern number, winding angle and dwell are greyed out. The
+  fields show what it winds instead: one pass at its actual angle. The layup's
+  helical values are kept, and unchecking the box brings them back.
+  - **Getting there:** a helical layup ends at the tank's end, so the eye first
+    runs over the dome to the start of the straight section, at that previous
+    layup's winding angle. As the first layup, the wind starts right at the
+    hoop's start (*Start Wind at X* on auto); from a custom start, the run
+    goes at 45°.
+  - **Direction:** the pass ends at the other end of the tank, so the next
+    layup starts from there and winds the other way. Each 90° layup flips the
+    direction for everything after it. A helical layup that starts from the
+    far end winds its pattern mirrored, exactly as well aligned. The preview
+    caption says when a layup starts from the far end.
+  - **Automatic switch:** typing a *Winding Angle* above 85° and leaving the
+    field turns the layup into a 90° wind. Its helical angle stays at what it
+    was before the edit.
 - **Automatic cycle count:** a layup's *Number of Cycles* is set automatically
   to the fewest cycles that cover the tank 100 %, and follows any change to the
   tank diameter, tow width, winding angle or pattern number. It is shown in
@@ -69,11 +91,23 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 - **Eye clearance:** the Y position follows the tank profile plus a safety
   gap. It uses the largest radius under the full width of the eye, so the eye
   cannot hit the tank at the domes.
-- **Surface-speed control:** the speed limit is a surface speed in mm/s,
-  converted to an A-axis rate for the current diameter. Every feed rate is
-  computed from the coordinates exactly as written to the file, and rounded
-  down, so no move ever turns the mandrel faster than this limit (each still
-  runs within a fraction of a percent of it).
+- **Two speed limits:** every move runs as fast as the two limits in
+  Machine Settings allow:
+  - *Max Rotation Speed* is a surface speed in mm/s, converted to an A-axis
+    rate for the current diameter.
+  - *Max Feedrate* (default 300 mm/s) caps the G-code feed rate itself (F ÷ 60),
+    measured along the whole move with A in degrees, as Klipper measures it.
+    Set it to Klipper's `max_velocity`. At low winding angles the carriage
+    covers far more millimetres than the mandrel turns degrees, so the feed
+    rate is practically the carriage's X speed. Without this cap, a 12° layer
+    on a 250 mm tank would drive the carriage at over 1 m/s.
+
+  Every feed rate is computed from the coordinates exactly as written to the
+  file, and rounded down. No move ever exceeds either limit, and each still
+  runs within a fraction of a percent of the one that governs it. The limit
+  that sets the selected layup's speed in the middle of the tank is framed in
+  red. It updates as you switch layups or change a setting, and hovering over
+  either speed field shows the resulting carriage and surface speed.
 - **Responsive pause (Max Move Time):** Klipper can't interrupt a move it has
   already queued. It keeps about 2 s of motion queued, and each queued move
   always runs to its end. So after a pause, the machine keeps going for up to
@@ -86,7 +120,8 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 - **Wind-angle validation:** angles that the tank size and band width cannot
   produce are corrected automatically. At angles that are too steep, each wrap
   would lie on top of the previous one. At angles that are too shallow, the
-  strand barely moves around the tank.
+  strand barely moves around the tank. Above 85°, the layup becomes a 90° wind
+  (see above).
 - **Pause after each layup:** on by default. The program runs `PAUSE` after
   every layup except the last, so the fiber can be checked (for slipping, say)
   after each pattern change. Resume on the machine to continue.
@@ -103,17 +138,20 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   as large as the preview allows, and an end-on view showing the eye reach. A
   slim estimates sidebar sits beside them, with two groups:
   - **Program:** time · total cycles, tow length · dry fiber mass, resin mass,
-    rotation speed, eye reach (orange, like the reach lines in the end view)
-    and the safety factor at the operating pressure (orange below 1).
+    top rotation speed, eye reach (orange, like the reach lines in the end
+    view) and the safety factor at the operating pressure (orange below 1).
   - **Selected layup:** time · average time per cycle, tow length · dry fiber
-    mass, resin mass, X speed, coverage · the fewest cycles for full coverage
-    (orange while gaps would remain), and extra turnaround rotation.
+    mass, resin mass, X speed in the middle of the tank (set by the red-framed
+    speed limit), coverage · the fewest cycles for full coverage (orange while
+    gaps would remain), and extra turnaround rotation at the far end / chuck
+    side. A 90° wind shows full coverage of the straight section and no extra
+    rotation.
 
   Hover over a row for what it shows. Click the rotation or X speed to change
   units. **Strength & Materials…** opens the inputs of the mass and strength
   estimate next to its full result. See [Strength and material estimate](#strength-and-material-estimate).
 
-  Click the rotation or X speed to change units. The preview shows the first
+  The preview shows the first
   cycle of the selected layup. Check **Show All Layups** to overlay every
   layup in its own color, with a legend underneath; click a legend entry to
   select that layup. The simulation runs on a background thread, so the
@@ -136,12 +174,13 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; start_x: 146.82458365518542
 ; start_x_auto: True
 ; ...
+; max_feedrate: 300.0
 ; max_move_time: 0.5
 ; turnaround_zone: 80.0
 ; optimize_trajectory: False
 ; layups: 2
-; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True
-; layup_2: passes=4 pattern_number=5 wind_angle=75.0 turnaround_angle=270.0 auto_cycles=False
+; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False
+; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True
 ; estimate_fiber_strength: 5100.0     <- the Strength & Materials inputs...
 ; ...
 ; estimate_result_safety_factor: 1.203  <- ...and what they gave for this wind
@@ -316,7 +355,9 @@ python main.py
    Cycles* starts on auto (grey, tagged **AUTO**), so it covers the tank
    completely. Type a number only if you want a different count. Use **‹ ›**
    to switch between layups and **−** to remove the selected one. The colored
-   swatch next to the title matches that layup's color in the previews.
+   swatch next to the title matches that layup's color in the previews. Check
+   **90° Wind (Straight Section Only)** for a hoop layer over the straight
+   section.
 3. Check the estimates. *Cycles for Full Coverage* shows how many cycles the
    selected layup needs to cover the tank completely, and *Coverage* shows how
    much its current number of cycles covers. Check **Show All Layups** to see
@@ -363,6 +404,14 @@ python -m unittest -v
   the program. The G-code writer and the preview simulation both use it, so a
   change to the motion only has to be made there, and the preview always
   matches the file.
+- **90° winds:** `Layup.hoop` marks one. `WindingJob.hoop_span` is where its
+  band runs, `start_sides()` says which end each layup starts from (every 90°
+  layup flips it), and `iter_program()` winds the lead-in and the pass. A
+  helical layup that starts from the far end runs its circuits the other way
+  round, with the same pattern math. `HOOP_IGNORED` lists the settings a 90°
+  wind doesn't use, and `HOOP_ANGLE_THRESHOLD` and `LEAD_IN_ANGLE` are
+  constants at the top of `winding.py`. The `NinetyDegreeWind` tests check it
+  on the generated motion.
 - **Adding a setting:** add a field to `WindingJob` (global) or `Layup` (per
   layup) in `winding.py`, then add its entry field to the matching field list
   at the top of `plan_tab.py`. The Tk variables, the settings header and
@@ -377,8 +426,10 @@ python -m unittest -v
 - **Move splitting and feed rates:** `iter_program()` splits long moves (its
   inner `moves()` helper), so the preview, estimates and G-code all see the
   same pieces. `write_gcode()` computes each F from the written coordinates via
-  `_rotation_limited_feed()`. The `MoveSplitting` and `MaxRotationSpeed` tests
-  check both on the written file.
+  `_limited_feed()`. `wind_speed()` works out a layup's mid-tank speed and which
+  limit sets it, for the red frame and the X speed estimate. The
+  `MoveSplitting`, `MaxRotationSpeed` and `MaxFeedrate` tests check all of this
+  on the written file.
 - **Homing position:** the move to the wind start assumes `G28` leaves the
   carriage at X0 Y0, with Y0 the eye's fully retracted end (farthest from the
   tank), as in the app's machine model. It is written by `_write_move_to_start()`
@@ -390,16 +441,20 @@ python -m unittest -v
   the partial program.
 - **Background calculations:** `_BackgroundCalc` in `plan_tab.py` runs one
   calculation at a time on a worker thread and delivers only the newest
-  result. It runs both the simulation and the progress of a partial wind.
+  result. It runs both the simulation and the progress of a partial wind. The
+  worker starts only once the GUI has finished redrawing (`after_idle`), and
+  the GIL switch interval is lowered to 0.5 ms. Otherwise every Tk call would
+  wait for the busy worker, and a settings change would stall the GUI for up
+  to half a second.
 - **Auto/custom fields:** `AutoEntry` in `plan_tab.py` gives *Number of Cycles*
   and *Start Wind at X* their shared auto/custom behavior. A new auto setting
   needs a flag in the model (see `winding.AUTO_FLAGS`) and one `AutoEntry`.
 - **Feed rate and Klipper:** feed rates assume the controller applies F to the
   combined X/Y/A move length, with A in degrees, as the original generator did.
-  If Klipper's `max_velocity` or `max_accel` are lower than what the file asks
-  for, moves run slower than estimated: the wind takes longer than the
-  app's *Time* estimate, and pieces can outlast Max Move Time. Keep the
-  printer.cfg limits above the rates the app uses.
+  Set *Max Feedrate* to Klipper's `max_velocity`. If Klipper's limits
+  (`max_velocity`, `max_accel`) are lower than what the file asks for, moves
+  run slower than estimated: the wind takes longer than the app's *Time*
+  estimate, and pieces can outlast Max Move Time.
 - **Layup colors:** the palettes in `theme.py` were checked for contrast
   against the mint tank and between every pair of colors, including for
   red-green color-blind viewers. From the 7th layup on, the colors repeat with

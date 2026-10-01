@@ -10,7 +10,7 @@ opened again later in the session.
 import tkinter as tk
 from tkinter import ttk
 import winding
-from plan_tab import FIELD_FONT, format_hms
+from plan_tab import FIELD_FONT, format_hms, layup_caption
 
 
 class PartialPage:
@@ -175,8 +175,7 @@ class PartialPage:
             self._show_message(f"{self.app.plan_tab.describe_settings_error(e)} Fix it on the settings page (‹).")
             self.app.plan_tab.set_partial_point(None)
             return
-        self.layup_combo.configure(values=[f"Layup {i + 1} · {l.wind_angle:g}° · {l.passes} cycles"
-                                           for i, l in enumerate(job.layups)])
+        self.layup_combo.configure(values=[f"Layup {i + 1} · {layup_caption(l)}" for i, l in enumerate(job.layups)])
         layup = max(1, min(len(job.layups), self._int(self.vars["layup"], 1)))
         passes = job.layups[layup - 1].passes
         self.layup_combo.current(layup - 1)

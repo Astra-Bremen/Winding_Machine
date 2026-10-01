@@ -12,6 +12,13 @@ from partial_page import PartialPage
 from view_tab import ViewTab
 
 
+def _is_set(var):
+    try:
+        return bool(var.get())
+    except tk.TclError:
+        return False
+
+
 def _make_var(default, value=None):
     # Picks the Tk variable type from the type of the setting's default value.
     value = default if value is None else value
@@ -301,6 +308,9 @@ class CFRPWinderApp:
         if an entry field doesn't hold a valid number right now."""
         def read(variables, layup_index=None):
             values = {}
+            # A 90° wind doesn't use its helical settings, so a half-typed one
+            # doesn't hold it up either.
+            ignored = winding.HOOP_IGNORED if layup_index is not None and _is_set(variables["hoop"]) else ()
             for key, var in variables.items():
                 try:
                     values[key] = var.get()
@@ -309,6 +319,7 @@ class CFRPWinderApp:
                     # return it to auto); the WindingJob computes the value.
                     flag = winding.AUTO_FLAGS.get(key)
                     if flag and bool(variables[flag].get()): values[key] = 1
+                    elif key in ignored: values[key] = getattr(winding.Layup(), key)
                     else: raise winding.SettingsError(key, layup_index) from None
             return values
 

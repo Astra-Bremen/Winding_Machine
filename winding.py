@@ -9,7 +9,9 @@ and estimates can never drift from what actually gets written to the file.
 A winding program is a sequence of *layups*. Each layup winds its own number of
 cycles with its own winding angle, pattern number and turnaround dwell, one
 after the other on the same tank; the tank geometry, machine settings, tow
-width and trajectory optimization are shared by the whole program.
+width and trajectory optimization are shared by the whole program. A layup can
+instead be a 90° wind (`Layup.hoop`): a single pass over the straight section,
+each turn laid one band width on from the last.
 """
 import itertools
 import math
@@ -22,6 +24,8 @@ Y_REFERENCE = 550.0   # eye distance from the tank centerline at Y=0, before sub
 Y_TRAVEL = 180.0      # Y-axis travel; commanded Y is clamped to [0, Y_TRAVEL] (mm)
 STEP_SIZE = 5.0       # X distance covered by one traversal G-code move (mm)
 MIN_MOVE_TIME = 0.1   # lowest allowed Max Move Time (s); shorter moves only load the controller
+HOOP_ANGLE_THRESHOLD = 85.0  # a Winding Angle entered above this makes the layup a 90° wind (the app's rule)
+LEAD_IN_ANGLE = 45.0  # angle of the run onto a 90° wind's start when no helical layup precedes it
 
 # --- VISUALIZATION-ONLY RENDERING RESOLUTION ---
 # Caps how many degrees of rotation may separate two consecutive strand-path
@@ -56,6 +60,12 @@ class Layup:
     # the WindingJob whenever anything it depends on changes. False: `passes`
     # is used exactly as given.
     auto_cycles: bool = False
+    # A 90° wind: one pass along the straight section only (never over the
+    # domes), each turn one band width on from the last, so the bands lie edge
+    # to edge. It ends at the other end of the tank, so every layup after it
+    # starts from there and winds the other way (see start_sides). The helical
+    # settings (HOOP_IGNORED) are kept, but not used while this is set.
+    hoop: bool = False
 
     def __post_init__(self):
         _coerce_fields(self)
@@ -77,6 +87,14 @@ class WindingJob:
     eye_width: float = 20.0
     min_spacing: float = 10.0
     max_surface_speed: float = 220.0
+    # Highest feed rate (mm/s) any G-code move may use -- the controller's own
+    # top speed (Klipper's max_velocity), measured like the G-code F: along
+    # the whole move, with A in degrees. Every move runs at Max Rotation Speed
+    # unless that would take it past this; at low winding angles, where the
+    # carriage covers far more millimeters than the mandrel turns degrees, the
+    # feed rate is practically the carriage's X speed, so this is what keeps
+    # the carriage in check there. See wind_speed().
+    max_feedrate: float = 300.0
     # Longest time (s) any single G-code move may take; longer ones are split
     # into equal pieces. Klipper can't interrupt a move it has queued, so this
     # bounds how long the machine keeps going after a pause (see iter_program).
@@ -101,9 +119,11 @@ class WindingJob:
         # this job's own tank and tow -- so every consumer (motion, estimates,
         # settings header, cache key) sees the same, never-stale number.
         object.__setattr__(self, "layups", tuple(self._resolve_cycles(layup) for layup in self.layups))
-        # Same for an auto start position.
+        # Same for an auto start position: where the dome ends and the tank
+        # turns straight -- or, for a 90° first layup, right where it starts.
         if self.start_x_auto:
-            object.__setattr__(self, "start_x", self.chuck_offset + self.dome_length)
+            start = self.hoop_span[0] if self.layups and self.layups[0].hoop else self.chuck_offset + self.dome_length
+            object.__setattr__(self, "start_x", start)
 
     @property
     def wind_start_x(self):
@@ -121,6 +141,9 @@ class WindingJob:
         return self.chuck_offset, x_end - STEP_SIZE * max(self.turnaround_zone_steps, 3)
 
     def _resolve_cycles(self, layup):
+        if layup.hoop:
+            # Its one pass is its one cycle.
+            return layup if layup.passes == 1 else replace(layup, passes=1)
         if not layup.auto_cycles:
             return layup
         cycles = full_coverage_cycles(self.tank_diameter, layup.wind_angle, self.bandwidth, layup.pattern_number)
@@ -137,9 +160,29 @@ class WindingJob:
         return min(math.sqrt(max(0, rt**2 - rc**2)), self.tank_length / 2)
 
     @property
+    def hoop_span(self):
+        """(first, last) X of the band's center over a 90° wind: the whole band
+        stays on the straight section, its edges flush with where the domes
+        begin (the tank's ends for flat end caps)."""
+        half = self.bandwidth / 2
+        return (self.chuck_offset + self.dome_length + half,
+                self.chuck_offset + self.tank_length - self.dome_length - half)
+
+    @property
+    def hoop_angle(self):
+        # The angle a 90° wind actually winds at: one band width of advance per
+        # turn -- just short of 90°.
+        return math.degrees(math.atan2(math.pi * self.tank_diameter, self.bandwidth))
+
+    @property
     def max_a_speed(self):
         # Max Rotation Speed as an A-axis rate (deg/min) for this tank diameter.
         return surface_speed_to_deg_per_min(self.max_surface_speed, self.tank_diameter)
+
+    @property
+    def max_feed(self):
+        # Max Feedrate as a G-code F (mm/min).
+        return self.max_feedrate * 60.0
 
     @property
     def total_cycles(self):
@@ -160,6 +203,8 @@ def _traversal_step_count(length):
 
 GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
 LAYUP_KEYS = tuple(f.name for f in fields(Layup))
+# The layup settings a 90° wind doesn't use (it always winds exactly one pass).
+HOOP_IGNORED = ("passes", "pattern_number", "wind_angle", "turnaround_angle")
 
 # Settings the WindingJob can compute itself: value key -> the flag that, while
 # set, makes it do so (the value given is then ignored).
@@ -168,8 +213,8 @@ AUTO_FLAGS = {"passes": "auto_cycles", "start_x": "start_x_auto"}
 # How files written before a setting existed were actually wound, where that
 # differs from the setting's current default: restoring such a file uses these
 # values (or calls them with the file's settings header), so it regenerates
-# the motion it was made with. (Max Move Time needs no entry: splitting moves
-# never changes the path.)
+# the motion it was made with. (Max Move Time and Max Feedrate need no entry:
+# neither ever changes the path, only how fast it is run.)
 LEGACY_VALUES = {
     "turnaround_zone": 0.0,
     "pause_after_layup": False,
@@ -208,6 +253,8 @@ def geometry_errors(job):
         # G-code feed rates are whole numbers of at least 1 (per minute), which
         # would already rotate faster than a limit this low.
         errors.append("Max Rotation Speed is too low for this tank diameter.")
+    if job.max_feedrate < 1.0:
+        errors.append("Max Feedrate must be at least 1 mm/s.")
     if job.max_move_time < MIN_MOVE_TIME:
         errors.append(f"Max Move Time must be at least {MIN_MOVE_TIME:g} s.")
     if job.home_before_wind and job.tank_length > 0:
@@ -225,6 +272,12 @@ def geometry_errors(job):
         errors.append("At least one layup is required.")
     for i, layup in enumerate(job.layups):
         prefix = _layup_prefix(job, i)
+        if layup.hoop:
+            first, last = job.hoop_span
+            if job.tank_length > 0 and job.bandwidth > 0 and last <= first:
+                errors.append(f"{prefix}The straight section is too short for a 90° wind "
+                              "(it must be longer than the band is wide).")
+            continue
         if layup.passes < 1 or layup.pattern_number < 1:
             errors.append(f"{prefix}Number of Cycles and Pattern Number must both be at least 1.")
         if not 0 < layup.wind_angle < 90:
@@ -291,17 +344,16 @@ def calc_R_eye_footprint(x, x_start, x_end, r_tank, r_cap, l_dome, cap_type, eye
     return r_max
 
 
-def calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_next):
-    # The combined (X,Y,A) feed rate is always set so the A-axis itself moves
-    # at exactly max_a_speed -- there used to be a second, independent
-    # "Speed Base (%)" ceiling here too, but at its default (100%) it was
-    # always well above what max_a_speed already implied, so it never
-    # actually did anything except make the achieved speed harder to reason
-    # about if lowered. Removed: the machine's speed is defined by Max
-    # Rotation Speed alone now.
+def calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_next, max_feed=math.inf):
+    # The combined (X,Y,A) feed rate is set so the A axis turns at exactly
+    # max_a_speed (deg/min), capped at max_feed (Max Feedrate, mm/min): at a
+    # low winding angle the rotation limit alone would drive the carriage far
+    # faster than it can go. A move without rotation runs at max_a_speed's
+    # rate along its length, within the same cap.
     dx, dy, da = abs(x1 - x0), abs(y1 - y0), abs(a1 - a0)
     dist_klip = math.sqrt(dx**2 + dy**2 + da**2)
     act_f = max_a_speed * dist_klip / da if da > 0 and dist_klip > 0 else max_a_speed
+    act_f = min(act_f, max_feed)
     time_sec = (dist_klip / act_f) * 60.0 if act_f > 0 else 0
     tow_len = math.sqrt(dx**2 + (r_next * math.radians(da))**2)
     return act_f, time_sec, tow_len
@@ -573,10 +625,15 @@ class LayupPlan(NamedTuple):
         return self.extra_between if (circuit + 1) % n_strands == 0 else self.extra_within
 
 
+def helix_pitch(tank_diameter, wind_angle):
+    # Axial advance (mm) per mandrel revolution of a helix at wind_angle.
+    return (math.pi * tank_diameter) / math.tan(math.radians(wind_angle))
+
+
 def plan_layup(job, layup):
     dt, lt = job.tank_diameter, job.tank_length
     p = layup.pattern_number
-    pitch = (math.pi * dt) / math.tan(math.radians(layup.wind_angle))
+    pitch = helix_pitch(dt, layup.wind_angle)
     band_degrees = (job.bandwidth / math.cos(math.radians(layup.wind_angle)) / (math.pi * dt)) * 360.0
     # Closing shift: the gap between two neighbouring pattern slots (360/p) is
     # divided evenly over the layup's cycles, so after its last cycle the bands
@@ -593,6 +650,55 @@ def plan_layup(job, layup):
     extra_within, extra_between, skip = compute_dwell_extras(traverse_rotation, layup.turnaround_angle, p, shift_degrees)
     right_offset = compute_turnaround_balance_offset(total_circuits, p, layup.turnaround_angle, extra_within, extra_between)
     return LayupPlan(pitch, shift_degrees, band_degrees, total_circuits, skip, extra_within, extra_between, right_offset)
+
+
+def layup_pitch(job, layup):
+    # Axial advance per revolution while winding the layup: one band width for
+    # a 90° wind, the helix's for any other.
+    return job.bandwidth if layup.hoop else helix_pitch(job.tank_diameter, layup.wind_angle)
+
+
+def start_sides(job):
+    """Which end each layup starts from: 1 at the chuck side (winding toward
+    +X first), -1 at the far end. A helical layup ends where it started (every
+    circuit goes there and back); a 90° wind ends at the other end, so the
+    layups after it start from there."""
+    sides, side = [], 1
+    for layup in job.layups:
+        sides.append(side)
+        if layup.hoop:
+            side = -side
+    return sides
+
+
+class WindSpeed(NamedTuple):
+    """How fast a layup winds the middle of the tank -- its plain helix, clear
+    of the turnarounds -- and which of the two speed limits sets that pace."""
+    x_speed: float    # carriage speed (mm/s)
+    rotation: float   # mandrel speed (deg/min)
+    feed: float       # G-code F (mm/min)
+    limit: str        # "rotation" (Max Rotation Speed) or "feed" (Max Feedrate)
+
+
+def wind_speed(job, layup):
+    """The layup's WindSpeed, or None while its speed isn't defined (an angle
+    outside 0-90 deg, no tank diameter, or a speed limit not above 0)."""
+    if not ((layup.hoop or 0 < layup.wind_angle < 90) and job.tank_diameter > 0 and job.bandwidth > 0
+            and job.max_a_speed > 0 and job.max_feed > 0):
+        return None
+    # Mid-tank the eye holds its distance (no Y motion) and the mandrel turns
+    # 360/pitch degrees per mm of X, so -- measured the way F is, with A in
+    # degrees -- a move is sqrt(1 + (deg/mm)^2) long per mm of X. Turning at
+    # Max Rotation Speed takes the feed below; wherever that exceeds Max
+    # Feedrate (low angles, where the carriage covers far more millimeters
+    # than the mandrel turns degrees), Max Feedrate sets the pace instead,
+    # exactly as calc_move() does for every move.
+    deg_per_mm = 360.0 / layup_pitch(job, layup)
+    length_per_mm = math.sqrt(1.0 + deg_per_mm * deg_per_mm)
+    rotation_feed = job.max_a_speed * length_per_mm / deg_per_mm
+    feed = min(rotation_feed, job.max_feed)
+    return WindSpeed(feed / 60.0 / length_per_mm, feed * deg_per_mm / length_per_mm, feed,
+                     "feed" if rotation_feed > job.max_feed else "rotation")
 
 
 # --- The motion generator ---
@@ -663,7 +769,7 @@ def iter_program(job):
     geom = _tank_geometry(job)
     x_start, x_end = geom.x_start, geom.x_end
     eye_y = _eye_y_function(job, geom)
-    max_a_speed = job.max_a_speed
+    max_a_speed, max_feed = job.max_a_speed, job.max_feed
     n_layups = len(job.layups)
     zone_steps = job.turnaround_zone_steps
     max_move_time = job.max_move_time
@@ -679,7 +785,7 @@ def iter_program(job):
         # together, so the pieces trace exactly the same path at the same speed:
         # no corners for the planner to slow down at, and the pattern, time and
         # tow are unchanged.
-        _, duration, _ = calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, 0.0)
+        _, duration, _ = calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, 0.0, max_feed)
         n = max(1, math.ceil(duration / max_move_time - 1e-9))
         px, py, pa = x0, y0, a0
         for k in range(1, n + 1):
@@ -689,49 +795,81 @@ def iter_program(job):
                 f = k / n
                 qx, qy, qa = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, a0 + (a1 - a0) * f
             qr = geom.radius(qx)
-            feed, piece_duration, tow = calc_move(px, py, pa, qx, qy, qa, max_a_speed, qr)
+            feed, piece_duration, tow = calc_move(px, py, pa, qx, qy, qa, max_a_speed, qr, max_feed)
             yield Move(qx, qy, qa, feed, piece_duration, tow, qr, layup_index, circuit, dwell)
             px, py, pa = qx, qy, qa
+
+    def traverse(x, y, a, target_x, pitch, head_blend, tail_blend, layup_index, circuit):
+        # One X traversal (see traversal_steps), the eye following the tank.
+        for x_next, a_delta in traversal_steps(x, target_x, STEP_SIZE, pitch, head_blend, tail_blend):
+            y_next, a_next = eye_y(x_next), a + a_delta
+            yield from moves(x, y, a, x_next, y_next, a_next, layup_index, circuit, False)
+            x, y, a = x_next, y_next, a_next
 
     # The wind starts at wind_start_x, so its very first pass runs from there
     # (not from the tank's end) toward +X. Every circuit still turns the mandrel
     # by exactly the same amount, so this only shifts the whole program by a
     # constant angle: the pattern is untouched, and the part skipped (the
     # first pass over the chuck-side dome) is one band where every band
-    # overlaps anyway.
+    # overlaps anyway. The same holds for a layup that follows a 90° wind: its
+    # first pass starts where the hoop ended.
     x, a = job.wind_start_x, 0.0
     y = eye_y(x)
     cycle_number = 0
     pending_head_blend = []  # blend carried from the previous dwell into this traversal's first steps
-    for li, layup in enumerate(job.layups):
+    lead_in_pitch = helix_pitch(job.tank_diameter, LEAD_IN_ANGLE)  # replaced by each helical layup's own
+    for li, (layup, side) in enumerate(zip(job.layups, start_sides(job))):
         yield LayupStart(li)
+        if layup.hoop:
+            # A 90° wind: from its end of the straight section to the other, in
+            # one pass, each turn one band width on from the last. The eye gets
+            # to its start at the previous layup's angle -- over the dome, the
+            # fiber is already lying at that angle (see LEAD_IN_ANGLE when no
+            # helical layup precedes it).
+            first, last = job.hoop_span
+            start, end = (first, last) if side == 1 else (last, first)
+            for ev in traverse(x, y, a, start, lead_in_pitch, [], [], li, 0):
+                yield ev
+                x, y, a = ev.x, ev.y, ev.a
+            for ev in traverse(x, y, a, end, job.bandwidth, [], [], li, 0):
+                yield ev
+                x, y, a = ev.x, ev.y, ev.a
+            cycle_number += 1
+            yield CycleComplete(cycle_number, li, a)
+            continue
         plan = plan_layup(job, layup)
+        lead_in_pitch = plan.pitch
         n_strands = layup.pattern_number
+        # Whether this layup's last dwell is handed on to the next traversal:
+        # not at the end of the program, and not before a 90° wind, whose run
+        # onto the straight section isn't one of this layup's passes.
+        hands_on = li < n_layups - 1 and not job.layups[li + 1].hoop
         for i in range(plan.total_circuits):
             extra = plan.extra_after(i, n_strands)
-            # See compute_turnaround_balance_offset: the right (outbound)
-            # turnaround always gets the exact same fixed offset, every circuit,
-            # so the return traversal's own pattern stays in step; the left
-            # (return-side) turnaround absorbs whatever's left of this circuit's
-            # `extra`, exactly as it always has to for the forward traversal's
+            # Each circuit goes out from the layup's starting end and back
+            # (`side`: the chuck side, or the far end after a 90° wind -- the
+            # pattern is then simply mirrored). See
+            # compute_turnaround_balance_offset: the outbound turnaround always
+            # gets the exact same fixed offset (`right_offset`), every circuit,
+            # so the return traversal's own pattern stays in step; the
+            # return-side turnaround absorbs whatever's left of this circuit's
+            # `extra`, exactly as it always has to for the outbound traversal's
             # pattern to land correctly next circuit.
-            for direction in (1, -1):
+            for direction in (side, -side):
                 target_x = x_end if direction == 1 else x_start
-                dwell_amount = layup.turnaround_angle + (plan.right_offset if direction == 1 else (extra - plan.right_offset))
+                dwell_amount = layup.turnaround_angle + (plan.right_offset if direction == side else (extra - plan.right_offset))
                 head_blend, tail_blend, core_dwell = compute_dwell_blend(dwell_amount, job.optimize_trajectory, zone_steps)
-                if li == n_layups - 1 and i == plan.total_circuits - 1 and direction == -1:
-                    # Nothing follows the program's very last dwell to absorb a
-                    # head blend into, so fold it back into the dwell move itself
-                    # instead of losing that rotation. Between layups the blend
-                    # simply carries over into the next layup's first traversal,
-                    # just like it does between circuits.
+                if not hands_on and i == plan.total_circuits - 1 and direction == -side:
+                    # Nothing follows to absorb a head blend into, so fold it
+                    # back into the dwell move itself instead of losing that
+                    # rotation. Between helical layups the blend simply carries
+                    # over into the next layup's first traversal, just like it
+                    # does between circuits.
                     core_dwell += sum(head_blend)
                     head_blend = []
-                for x_next, a_delta in traversal_steps(x, target_x, STEP_SIZE, plan.pitch, pending_head_blend, tail_blend):
-                    y_next = eye_y(x_next)
-                    a_next = a + a_delta
-                    yield from moves(x, y, a, x_next, y_next, a_next, li, i, False)
-                    x, y, a = x_next, y_next, a_next
+                for ev in traverse(x, y, a, target_x, plan.pitch, pending_head_blend, tail_blend, li, i):
+                    yield ev
+                    x, y, a = ev.x, ev.y, ev.a
                 pending_head_blend = head_blend
                 # A turnaround zone spreads all of the rotation over the steps,
                 # leaving nothing (but float dust) for a pure-rotation move.
@@ -823,7 +961,9 @@ def simulate(job):
     """Runs the whole program for the time/tow estimates, and records each
     layup's first-cycle strand paths for the 3D preview (see _RunRecorder)."""
     geom = _tank_geometry(job)
-    results = [LayupResult(strand_runs=[[] for _ in range(l.pattern_number)]) for l in job.layups]
+    # One strand per pattern slot; a 90° wind's single pass is one strand.
+    strands = [1 if l.hoop else l.pattern_number for l in job.layups]
+    results = [LayupResult(strand_runs=[[] for _ in range(n)]) for n in strands]
     total_time, total_tow = 0.0, 0.0
     # The straight section, for the strength estimate: a move counts as laid
     # there when its midpoint is (moves are 5 mm steps, so that's exact enough).
@@ -839,7 +979,7 @@ def simulate(job):
         res.tow += ev.tow
         if cyl_lo <= (prev[0] + ev.x) / 2 <= cyl_hi:
             res.cylinder_tow += ev.tow
-        first_cycle = ev.circuit < job.layups[ev.layup].pattern_number
+        first_cycle = ev.circuit < strands[ev.layup]
         recorder.add(ev, prev, res.strand_runs[ev.circuit] if first_cycle else None)
         prev = (ev.x, ev.r, ev.a)
     recorder.close()
@@ -952,7 +1092,9 @@ class Progress(NamedTuple):
 
 def progress(job, point):
     _check_point(job, point)
-    covered = tuple(i for i in range(point.layup) if plan_layup(job, job.layups[i]).coverage >= 0.995)
+    # A 90° wind covers only the straight section, so it's drawn band by band.
+    covered = tuple(i for i in range(point.layup)
+                    if not job.layups[i].hoop and plan_layup(job, job.layups[i]).coverage >= 0.995)
     runs = {i: [] for i in range(point.layup + 1) if i not in covered}
     recorder = _RunRecorder(_tank_geometry(job))
     location, _ = _walk_to(job, point, lambda ev, prev: recorder.add(ev, prev, runs.get(ev.layup)))
@@ -1038,18 +1180,24 @@ def _set_a(angle):
     return "G92 A0" if abs(angle) < 5e-4 else f"G92 A{angle:.3f}"
 
 
-def _rotation_limited_feed(dx, dy, da, max_a_speed):
+def _limited_feed(dx, dy, da, max_a_speed, max_feed):
     # G-code F is the speed along the whole (X, Y, A) move, so the mandrel
     # turns at F * |da| / length. The largest whole F that keeps that at or
-    # below Max Rotation Speed is floor(max * length / |da|): rounding down, so
-    # no move -- however it was split or rounded -- ever turns faster than the
-    # limit, and each still runs within a hair of it. A move without rotation
-    # runs at Max Rotation Speed along its length.
+    # below Max Rotation Speed is floor(max * length / |da|), and F itself
+    # stays at or below Max Feedrate: both rounded down, so no move -- however
+    # it was split or rounded -- ever exceeds either limit, and each still
+    # runs within a hair of the one that governs it. A move without rotation
+    # runs at Max Rotation Speed's rate along its length, within Max Feedrate.
     da = abs(da)
-    if da <= 0:
-        return int(max_a_speed)
-    length = math.sqrt(dx * dx + dy * dy + da * da)
-    return max(1, math.floor(max_a_speed * length / da))
+    feed = max_a_speed if da <= 0 else max_a_speed * math.sqrt(dx * dx + dy * dy + da * da) / da
+    return max(1, math.floor(min(feed, max_feed)))
+
+
+def _travel_feed(job):
+    # Moves that aren't part of the wind (getting to its start): Max Rotation
+    # Speed's rate, within Max Feedrate -- so any rotation they do involve
+    # can't exceed the limit either.
+    return _limited_feed(0.0, 0.0, 0.0, job.max_a_speed, job.max_feed)
 
 
 def _split_travel(start, end, max_distance):
@@ -1065,10 +1213,10 @@ def _write_move_to_start(out, job, x, y, message, angle=0.0):
     # G28 normally leaves it there already), travel along X, and only then
     # move in to winding distance. Then PAUSE, so the fiber can be attached
     # there; winding resumes from the machine. Assumes G28 leaves the carriage
-    # at X0 Y0, the app's machine origin. Travel runs at Max Rotation Speed's
-    # rate along the move, split like every other move so none takes longer
-    # than Max Move Time.
-    feed = int(job.max_a_speed)
+    # at X0 Y0, the app's machine origin. Travel runs at the travel feed (see
+    # _travel_feed), split like every other move so none takes longer than
+    # Max Move Time.
+    feed = _travel_feed(job)
     max_distance = feed / 60.0 * job.max_move_time
     out.write("; --- MOVE TO WIND START ---\n")
     out.write(f"G1 Y{0.0:.3f} F{feed}\n")
@@ -1122,9 +1270,9 @@ def write_gcode(out, job, start_gcode="", end_gcode="", resume=None, extra_heade
             # declared to be the program's A at the point.
             out.write(_set_a(angle) + "\n")
     if start_gcode: out.write(start_gcode + "\n")
-    # No rotation is planned here, and with F = Max Rotation Speed any rotation
-    # the machine does need (e.g. an A axis not homed to 0) can't be faster.
-    out.write(f"G1 X{x:.3f} Y{y:.3f} A{angle:.3f} F{int(job.max_a_speed)}\n")
+    # No rotation is planned here, and at the travel feed any rotation the
+    # machine does need (e.g. an A axis not homed to 0) can't be faster.
+    out.write(f"G1 X{x:.3f} Y{y:.3f} A{angle:.3f} F{_travel_feed(job)}\n")
     if resume is not None:
         out.write(f"; LAYUP_START:{resume.point.layup + 1}\n")
     _write_events(out, job, events, x, y, angle, a_offset)
@@ -1136,11 +1284,12 @@ def _write_events(out, job, events, x, y, angle, a_offset):
     # rates are computed from those -- relative to the previous written
     # position -- not from the unrounded ones.
     wx, wy, wa = float(f"{x:.3f}"), float(f"{y:.3f}"), float(f"{angle:.3f}")
+    max_a_speed, max_feed = job.max_a_speed, job.max_feed
     for ev in events:
         if type(ev) is Move:
             gx, gy, ga = f"{ev.x:.3f}", f"{ev.y:.3f}", f"{(ev.a - a_offset):.3f}"
             nx, ny, na = float(gx), float(gy), float(ga)
-            out.write(f"G1 X{gx} Y{gy} A{ga} F{_rotation_limited_feed(nx - wx, ny - wy, na - wa, job.max_a_speed)}\n")
+            out.write(f"G1 X{gx} Y{gy} A{ga} F{_limited_feed(nx - wx, ny - wy, na - wa, max_a_speed, max_feed)}\n")
             wx, wy, wa = nx, ny, na
         elif type(ev) is CycleComplete:
             out.write(f"; CYCLE_COMPLETE:{ev.number}\n")

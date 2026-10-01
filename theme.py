@@ -47,6 +47,8 @@ PALETTES = {
         # start): ink-dark on a light halo, so they read on any strand color.
         "marker": "#1f2d2a",
         "marker_halo": "#ffffff",
+        # The frame around the speed limit that currently sets the wind's pace.
+        "limit": "#d7263d",
     },
     "dark": {
         "canvas_bg": "#22282a",
@@ -63,6 +65,7 @@ PALETTES = {
         "auto_text": "#7f8a8c",
         "marker": "#eef3f1",
         "marker_halo": "#22282a",
+        "limit": "#ff5c5c",
     },
 }
 
@@ -126,7 +129,14 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     """
     for name in ("Settings.TLabel", "Settings.TCheckbutton", "Settings.TCombobox"):
         style.configure(name, font=("TkDefaultFont", body_size))
-    style.configure("Settings.TEntry", font=("TkDefaultFont", body_size))
+    # Fields a little shorter than the theme's roomy default (6 px padding all
+    # round), in keeping with the smaller font -- the panel's many rows then
+    # fit a maximized window with room to spare. The combobox matches them; the
+    # spinbox (partial-export page) gets the same padding, though its arrow
+    # images keep it a couple of pixels taller.
+    style.configure("Settings.TEntry", font=("TkDefaultFont", body_size), padding=(6, 4))
+    style.configure("Settings.TCombobox", padding=(6, 5, 9, 3))
+    style.configure("Settings.TSpinbox", padding=(13, 4))
     style.configure("Settings.TLabelframe.Label", font=("TkDefaultFont", header_size, "bold"))
     # The layup switcher's title ("Layup 2 of 3", sized like the other section
     # headers) and its small square previous/next/add/remove buttons. The buttons
