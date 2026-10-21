@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import bisect
 import math
 import os
 from typing import NamedTuple
@@ -29,6 +30,9 @@ class GcodeData(NamedTuple):
     resume: object      # how a partial program continues (winding.Resume), or None
     total_cycles: int
     layup_count: int
+    geometry: tuple     # (chuck offset, tank length, tank radius, cap radius, dome length, cap type)
+    path: dict          # layup -> thinned strand path, for drawing (see _drawing_path)
+    solids: dict        # layup -> how to draw it once finished, if it covers the tank
 
 
 def _first_cycle_number(settings):
@@ -59,7 +63,7 @@ def read_gcode(filepath, on_progress=None):
         for n_line, line in enumerate(f, 1):
             read += len(line)
             if on_progress is not None and n_line % 5000 == 0:
-                on_progress(min(1.0, read / size))
+                on_progress(0.85 * min(1.0, read / size))
             line = line.strip()
             if line.startswith(";"):
                 if line.startswith("; CYCLE_COMPLETE:"):
@@ -121,10 +125,90 @@ def read_gcode(filepath, on_progress=None):
     header_layups = winding.layups_from_header(settings)
     total_cycles = sum(l.passes for l in header_layups) if header_layups else (cycle_num or 1)
     layup_count = max(len(header_layups) if header_layups else 1, max(cmd_layups, default=0) + 1)
+    geometry = _view_geometry(settings)
+    path, solids = _drawing_path(commands, cmd_layups, geometry, winding.job_from_header(settings),
+                                 None if on_progress is None else (lambda f: on_progress(0.85 + 0.15 * f)))
     if on_progress is not None:
         on_progress(1.0)
     return GcodeData(commands, times, cycles, cycle_starts, cmd_layups, settings,
-                     winding.resume_from_header(settings), total_cycles, layup_count)
+                     winding.resume_from_header(settings), total_cycles, layup_count, geometry, path, solids)
+
+
+def _view_geometry(settings):
+    # (chuck offset, tank length, tank radius, end cap radius, dome length,
+    # end cap type) from a settings header, for drawing.
+    get = lambda key, default: float(settings.get(key, default))
+    return (get("chuck_offset", 50), get("tank_length", 1000), get("tank_diameter", 300) / 2,
+            get("end_cap_diameter", 50) / 2, get("ld", 0), settings.get("end_cap_type", "Round"))
+
+
+def _drawing_path(commands, cmd_layups, geometry, job, on_progress=None):
+    """What the G-Code Preview draws, worked out once per file: per layup, the
+    thinned strand path ((keys, [(x, r, A in radians)])) -- a key being the
+    command a point belongs to, fractional for points retracing what one long
+    move swept through -- and, for the layups that cover the tank once
+    finished, how to draw them solid: ("tank",) or, for a 90° wind,
+    ("band", x_lo, x_hi, x where its pass begins). `job` is the file's own
+    (job_from_header), None if it can't be told."""
+    co, lt, rt, rc, ld, cap_type = geometry
+    lo, hi = co, co + lt
+    known = {}
+
+    def on_tank(x):
+        # (x, r) where the fiber lies with the eye at x: beyond the tank's ends
+        # (where a layup's Additional X-Axis Travel takes the eye) it stays at
+        # the end, around the polar opening.
+        p = known.get(x)
+        if p is None:
+            tx = lo if x < lo else hi if x > hi else x
+            p = known[x] = (tx, winding.calc_R(tx - co, 0, lt, rt, rc, ld, cap_type))
+        return p
+
+    solids, hoop_inside = {}, {}
+    if job is not None and len(job.layups) >= max(cmd_layups, default=-1) + 1:
+        sides = winding.start_sides(job)
+        first, last = job.hoop_span
+        half = job.bandwidth / 2
+        for li, layup in enumerate(job.layups):
+            if layup.hoop:
+                solids[li] = ("band", first - half, last + half, first - half if sides[li] == 1 else last + half)
+                hoop_inside[li] = (first + 1e-6, last - 1e-6)  # drawn as the band, not as strands
+            elif winding.plan_layup(job, layup).coverage >= 0.995:
+                solids[li] = ("tank",)
+    # Dense path: every command, plus in-between points along any move that
+    # turns the mandrel by more than RENDER_MAX_DEG_PER_STEP -- drawn as a
+    # straight chord, a near-full turn in one 5 mm step would be aliased into a
+    # shallow wrong-looking line. The move from i to i+1 belongs to i+1's layup.
+    dense = {}
+    cap_deg = winding.RENDER_MAX_DEG_PER_STEP
+    n = len(commands)
+    for i in range(n):
+        layup = cmd_layups[i]
+        if layup == SETUP:
+            continue
+        pts = dense.setdefault(layup, [])
+        x, a = commands[i][0], commands[i][2]
+        if i > 0:
+            px, pa = commands[i - 1][0], commands[i - 1][2]
+            if not pts:
+                pts.append((*on_tank(px), pa, i - 1))  # where the previous layup / the setup left off
+            da = a - pa
+            if abs(da) > cap_deg:
+                n_sub = min(60, math.ceil(abs(da) / cap_deg))
+                for k in range(1, n_sub):
+                    f = k / n_sub
+                    pts.append((*on_tank(px + (x - px) * f), pa + da * f, i - 1 + f))
+        pts.append((*on_tank(x), a, i))
+        if on_progress is not None and i % 50000 == 0:
+            on_progress(0.8 * i / max(1, n))
+    path = {}
+    for li, pts in dense.items():
+        inside = hoop_inside.get(li)
+        if inside is not None:
+            pts = [p for p in pts if not inside[0] < p[0] < inside[1]]
+        thin = winding.thin_path(pts)
+        path[li] = ([p[3] for p in thin], [(p[0], p[1], math.radians(p[2])) for p in thin])
+    return path, solids
 
 
 class ViewTab:
@@ -134,9 +218,7 @@ class ViewTab:
         self.view_canvas = None
         self.gcode_commands = []
         self.view_settings = {}
-        self._path_static = []
-        self._path_substeps = []
-        self._cache_key = None
+        self.data = None  # the file shown, as read_gcode() read it
         self.cmd_cycles = []
         self.cycle_starts = {}
         self.total_cycles = 0
@@ -346,7 +428,7 @@ class ViewTab:
 
     def _load(self, data):
         self.gcode_commands, self.view_settings = data.commands, data.settings
-        self._path_static, self._path_substeps, self._cache_key = [], [], None
+        self.data = data
         self.cmd_cycles, self.cycle_starts, self.cmd_times = data.cycles, data.cycle_starts, data.times
         self.cmd_layups, self.layup_count = data.layups, data.layup_count
         self.resume, self.total_cycles = data.resume, data.total_cycles
@@ -434,134 +516,84 @@ class ViewTab:
     # cmd_layups value of setup moves (homing, travel to the wind start).
     SETUP = SETUP
 
-    def _build_path_cache(self, co, lt, rt, rc, ld, cap_type, scale, ox, oy):
-        # Caches only what never changes once computed: a point's X-projection and
-        # local tank radius don't depend on playback position. Its on-screen angle
-        # does (see _draw_wound_path) -- the view co-rotates with the mandrel so the
-        # most-recently-laid point always sits at the eye, meaning every already-
-        # laid point's screen position must be re-derived relative to the CURRENT
-        # rotation on every redraw, not fixed at whatever it was when laid down.
-        # Each point also carries its layup index, which picks its strand color.
-        pts = []
-        for (cx, cy, ca, ca_raw), layup in zip(self.gcode_commands, self.cmd_layups):
-            r = winding.calc_R(cx - co, 0, lt, rt, rc, ld, cap_type)
-            pts.append((ox - cx * scale, r, ca, layup))
-        self._path_static = pts
-
-        # Each stored point is one real G-code command, which -- at a steep wind
-        # angle -- can be a single move that legitimately commands close to (or,
-        # right at the computed max angle, exactly) a full revolution over just
-        # one 5mm step of X, since the machine only needs its two endpoints and
-        # linearly interpolates X and A together within the move to reproduce the
-        # helix exactly. But that means two adjacent *stored* points can be far
-        # apart in angle, and drawing a straight chord directly between them (or
-        # testing front/back visibility only at those two points) skips right over
-        # what that single real move actually swept through, aliasing the drawn
-        # path into a shallow, wrong-looking shape instead of a tight helix. This
-        # inserts synthetic in-between points along the same straight-line (X, A)
-        # interpolation the machine itself performs for that move, purely so the
-        # already-correct G-code gets drawn correctly -- it changes nothing about
-        # gcode_commands, the timeline/scrubbing indices, or any other data.
-        raw_cx = [cmd[0] for cmd in self.gcode_commands]
-        raw_ca = [cmd[2] for cmd in self.gcode_commands]
-        subs = []
-        cap_deg = winding.RENDER_MAX_DEG_PER_STEP
-        for i in range(len(self.gcode_commands) - 1):
-            dx, da = raw_cx[i + 1] - raw_cx[i], raw_ca[i + 1] - raw_ca[i]
-            n_sub = min(60, math.ceil(abs(da) / cap_deg)) if abs(da) > cap_deg else 1
-            layup = self.cmd_layups[i + 1]  # the move from i to i+1 belongs to its target's layup
-            seg = []
-            for k in range(1, n_sub):
-                frac = k / n_sub
-                scx = raw_cx[i] + dx * frac
-                sca = raw_ca[i] + da * frac
-                sr = winding.calc_R(scx - co, 0, lt, rt, rc, ld, cap_type)
-                seg.append((ox - scx * scale, sr, sca, layup))
-            subs.append(seg)
-        self._path_substeps = subs
-
-    def _draw_wound_path(self, oy, scale, ca_now, idx, auto_rotate):
+    def _draw_layers(self, data, idx, oy, scale, ox, tank_outline, rt, auto_rotate):
+        # The fiber wound up to command `idx`, layup by layup in winding order
+        # (later ones lie on top): a finished layup that covers the tank is
+        # drawn as a solid layer of its color -- every band overlaps the next,
+        # so that's what the tank looks like, and how the Settings Preview shows
+        # a partial wind -- a 90° wind as the band it is, growing while it's
+        # wound; anything else as its strands. Only the layup being wound (or
+        # one with gaps) is drawn strand by strand, from the thinned path
+        # read_gcode() prepared, so a frame costs the same however much has
+        # been wound before.
+        #
         # Auto-rotate ON: a material point laid down when the mandrel's true
-        # rotation was `ca_recorded` is fixed to the mandrel surface, so as the
-        # mandrel keeps turning to its current angle `ca_now`, that point is
-        # carried along by exactly the same amount: its on-screen (vertical)
-        # position uses angle EYE_REF_ANGLE_DEG + (ca_now - ca_recorded). At
-        # ca_now == ca_recorded (the point currently being laid) this reduces to
-        # EYE_REF_ANGLE_DEG, i.e. it always sits right at the eye; older points
-        # recede from there as winding continues.
+        # rotation was `a` is fixed to the mandrel surface, so as the mandrel
+        # keeps turning to its current angle `a_now`, that point is carried
+        # along by exactly the same amount: its on-screen (vertical) position
+        # uses angle EYE_REF_ANGLE_DEG - (a_now - a). At a_now == a (the point
+        # being laid) that's EYE_REF_ANGLE_DEG, right at the eye; older points
+        # recede from there as winding continues. Subtracting (not adding) the
+        # elapsed rotation matches the tank's actual spin direction: material
+        # that has just left the eye stays on the visible near side for the
+        # following half-turn. Visibility uses that same angle's sin() (the
+        # front/back split of a cylinder seen edge-on); EYE_REF_ANGLE_DEG sits
+        # exactly on that boundary, so VIS_TOLERANCE keeps the freshly laid tip
+        # visible for a short stretch at the eye instead of vanishing at once.
         #
-        # Visibility uses that SAME angle's sin() (the true geometric front/back
-        # split for a cylinder viewed edge-on) so material properly cycles through
-        # both the near/visible and far/hidden side, sweeping across the full top
-        # and bottom of the tank as it ages -- an earlier attempt used a visibility
-        # rule tied to "how recently laid" instead, but that rule's sign always
-        # matched the vertical-position formula's sign exactly, which meant only
-        # ever the bottom half (nearer the eye) could show and the top half stayed
-        # permanently empty.
-        #
-        # The one wrinkle: EYE_REF_ANGLE_DEG sits exactly on that front/back
-        # boundary (sin=0 there), since the eye is drawn at the vertical extreme of
-        # the circle -- so the instant a point is laid it's precisely on the edge,
-        # and the very next degree of rotation would otherwise flip it to hidden.
-        # VIS_TOLERANCE softens that one boundary crossing slightly so the freshly
-        # laid tip stays visible for a short stretch right at the eye instead of
-        # vanishing immediately, without changing the true occlusion for anything
-        # already well clear of that edge.
-        #
-        # Auto-rotate OFF: the original plain 2D side view -- every point rendered
-        # at its own recorded angle directly, camera fixed in the world frame, tank
-        # never appears to spin.
-        #
-        # Each layup is drawn in its own identity color (theme.layup_style), the
-        # G-code viewport counterpart of the Settings Preview's layup colors.
-        VIS_TOLERANCE = math.sin(math.radians(20))
-        poly = []
-        poly_layup = None  # the layup whose color `poly` is drawn in
+        # Auto-rotate OFF: the plain 2D side view -- every point at its own
+        # recorded angle, the tank never appears to spin.
+        current = self.cmd_layups[idx]
+        if current == self.SETUP:
+            return
+        canvas = self.view_canvas
+        cmd = self.gcode_commands[idx]
+        a_now = math.radians(cmd[2])
+        ref = math.radians(self.EYE_REF_ANGLE_DEG)
+        vis_tol = -math.sin(math.radians(20)) if auto_rotate else 0.0
+        sin, cos = math.sin, math.cos
+        r_now = self._radius_at(data, cmd[0])
+        for li in range(current + 1):
+            color, dash = theme.layup_style(VP, li)
+            solid = data.solids.get(li)
+            done = li < current
+            if solid is not None and solid[0] == "tank" and done:
+                canvas.create_polygon(tank_outline, fill=color, outline=VP["tank_outline"])
+                continue
+            if solid is not None and solid[0] == "band":
+                # A 90° wind: the band from where its pass began, up to the eye.
+                _, x_lo, x_hi, x_from = solid
+                x_to = (x_hi if x_from == x_lo else x_lo) if done else min(x_hi, max(x_lo, cmd[0]))
+                if x_to != x_from:
+                    canvas.create_rectangle(ox - x_from * scale, oy - rt * scale, ox - x_to * scale, oy + rt * scale,
+                                            fill=color, outline="")
+            keys, points = data.path.get(li, ((), ()))
+            end = bisect.bisect_right(keys, idx) if not done else len(points)
+            line = []
 
-        def flush():
-            if len(poly) >= 2 and poly_layup != self.SETUP:
-                color, dash = theme.layup_style(VP, poly_layup)
-                self.view_canvas.create_line(*[c for p in poly for c in p], fill=color, dash=dash or "", width=1)
-            poly.clear()
+            def flush():
+                if len(line) >= 4:
+                    canvas.create_line(*line, fill=color, dash=dash or "", width=1)
+                line.clear()
+            for k in range(end):
+                x, r, a = points[k]
+                eff = ref - (a_now - a) if auto_rotate else a
+                if sin(eff) >= vis_tol:
+                    line.append(ox - x * scale)
+                    line.append(oy - r * cos(eff) * scale)
+                else:
+                    flush()
+            if not done and line:
+                # Right up to the eye, wherever the thinned path left off.
+                eff = ref if auto_rotate else a_now
+                line.append(ox - cmd[0] * scale)
+                line.append(oy - r_now * cos(eff) * scale)
+            flush()
 
-        def emit(px, r, ca_recorded, layup):
-            nonlocal poly_layup
-            if layup != poly_layup:
-                # Layup boundary: finish the previous layup's line in its own
-                # color, then carry on from its last point in the new color so
-                # the path stays visually continuous across the change.
-                last = poly[-1] if poly else None
-                flush()
-                if last is not None: poly.append(last)
-                poly_layup = layup
-            if auto_rotate:
-                # Subtracting (not adding) the elapsed rotation matches the tank's
-                # actual spin direction: material that has just left the eye stays
-                # on the visible near side for the following half-turn, instead of
-                # immediately swinging behind the tank.
-                eff = math.radians(self.EYE_REF_ANGLE_DEG - (ca_now - ca_recorded))
-                visible = math.sin(eff) >= -VIS_TOLERANCE
-            else:
-                eff = math.radians(ca_recorded)
-                visible = math.sin(eff) >= 0
-            py = oy - r * math.cos(eff) * scale
-            if layup == self.SETUP:
-                # Setup travel lays no fiber: only remember where it ended, so
-                # the wound path starts right there.
-                poly[:] = [(px, py)] if visible else []
-            elif visible:
-                poly.append((px, py))
-            else:
-                flush()
-        for i in range(idx + 1):
-            emit(*self._path_static[i])
-            # The substeps between real point i and i+1 retrace what that single
-            # G-code move actually swept through -- only relevant while both its
-            # endpoints are already part of the wound-so-far path (i < idx).
-            if i < idx and i < len(self._path_substeps):
-                for spt in self._path_substeps[i]:
-                    emit(*spt)
-        flush()
+    @staticmethod
+    def _radius_at(data, x):
+        co, lt, rt, rc, ld, cap_type = data.geometry
+        return winding.calc_R(x - co, 0, lt, rt, rc, ld, cap_type)
 
     def _draw_rotation_grid(self, co, lt, rt, rc, ld, cap_type, scale, ox, oy, ca):
         # A cylinder's outer silhouette never visually changes as it spins around
@@ -615,31 +647,28 @@ class ViewTab:
         h, m = divmod(int(elapsed), 3600); m, s = divmod(m, 60)
         self.time_at_pos_var.set(f"{h:02d}:{m:02d}:{s:02d}")
         c_w, c_h = self.view_canvas.winfo_width(), self.view_canvas.winfo_height()
-        if c_w < 100 or c_h < 100: return
+        if c_w < 100 or c_h < 100 or self.data is None: return
         try:
-            lt, dt, co, dc = [float(self.view_settings.get(k, v)) for k, v in zip(["tank_length", "tank_diameter", "chuck_offset", "end_cap_diameter"], [1000, 300, 50, 50])]
-            cap_type, ld, arm = self.view_settings.get("end_cap_type", "Round"), float(self.view_settings.get("ld", 0)), float(self.view_settings.get("eye_arm_length", 200))
+            co, lt, rt, rc, ld, cap_type = self.data.geometry
+            arm = float(self.view_settings.get("eye_arm_length", 200))
             eye_width = float(self.view_settings.get("eye_width", 20))
             # Center the view on the tank's X-center (chuck_offset + tank_length/2)
             # instead of right-anchoring, so short tanks aren't left off-center.
             half_extent = max(co + lt / 2.0, lt / 2.0 + 75)
-            rt, rc, scale = dt/2, dc/2, min((c_w / 2.0 - 40) / half_extent, (c_h - 100) / (dt + 200))
+            scale = min((c_w / 2.0 - 40) / half_extent, (c_h - 100) / (2 * rt + 200))
             ox, oy = c_w / 2.0 + (co + lt / 2.0) * scale, c_h / 2
             tank_top, tank_bottom = [], []
             for i in range(51):
                 x = i * (lt / 50); r = winding.calc_R(x, 0, lt, rt, rc, ld, cap_type)
                 tank_top.append((ox - (co + x) * scale, oy - r * scale))
                 tank_bottom.append((ox - (co + x) * scale, oy + r * scale))
-            self.view_canvas.create_polygon(tank_top + tank_bottom[::-1], fill=VP["tank"], outline=VP["tank_outline"])
+            outline = tank_top + tank_bottom[::-1]
+            self.view_canvas.create_polygon(outline, fill=VP["tank"], outline=VP["tank_outline"])
             auto_rotate = self.auto_rotate_var.get()
+            self._draw_layers(self.data, idx, oy, scale, ox, outline, rt, auto_rotate)
             if auto_rotate:
+                # Over the (solid) layers, so the tank is still seen to spin.
                 self._draw_rotation_grid(co, lt, rt, rc, ld, cap_type, scale, ox, oy, cmd[2])
-
-            cache_key = (len(self.gcode_commands), co, lt, rt, rc, ld, cap_type, scale, ox, oy)
-            if cache_key != self._cache_key:
-                self._build_path_cache(co, lt, rt, rc, ld, cap_type, scale, ox, oy)
-                self._cache_key = cache_key
-            self._draw_wound_path(oy, scale, cmd[2], idx, auto_rotate)
 
             tool_x, eye_y = ox - cmd[0] * scale, oy + (winding.Y_REFERENCE - arm - cmd[1]) * scale
             self.view_canvas.create_line(tool_x, oy + (winding.Y_REFERENCE - arm) * scale, tool_x, eye_y, width=3, fill=VP["eye_line"])

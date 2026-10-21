@@ -47,15 +47,26 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   exactly one band width, so the bands lie edge to edge at just under 90°
   (89.5° for a 200 mm tank and 5 mm tow). The band's edges are flush with the
   ends of the straight section. There is no pattern and no turnaround, so the
-  layup's cycles, pattern number, winding angle and dwell are greyed out. The
+  layup's cycles, pattern number, winding angle, dwell and additional X-axis
+  travel are greyed out. The
   fields show what it winds instead: one pass at its actual angle. The layup's
   helical values are kept, and unchecking the box brings them back.
-  - **Getting there:** a helical layup ends at the tank's end, so the eye first
-    runs over the dome to the start of the straight section, at that previous
-    layup's winding angle. As the first layup, the wind starts right at the
-    hoop's start (*Start Wind at X* on auto); from a custom start, the run
-    goes at 45°.
-  - **Direction:** the pass ends at the other end of the tank, so the next
+  - **Getting on:** the helical layup before it finishes its last turnaround
+    like every other one (the full dwell, and the smooth run back out of the
+    dome). It then runs on along its own helix to the start of the straight
+    section, heading the way the 90° wind will go. The layup change happens
+    there, with the eye on the straight section: with *Pause After Each
+    Layup*, the machine pauses at that point. As the first layup, the wind
+    starts right at the hoop's start (*Start Wind at X* on auto); from a
+    custom start, the run goes at 45°.
+  - **Getting off:** the pass ends at the other end of the straight section,
+    and the machine pauses there for the next layup change. A helical layup
+    after it doesn't wind back from there, which would pull the fiber back
+    over the hoop. It goes on the same way over the dome at its own winding
+    angle, turns around at the tank's end with its own dwell, and winds its
+    circuits from that end. Another 90° wind after it winds straight back
+    along the straight section.
+  - **Direction:** since the pass ends at the other end of the tank, the next
     layup starts from there and winds the other way. Each 90° layup flips the
     direction for everything after it. A helical layup that starts from the
     far end winds its pattern mirrored, exactly as well aligned. The preview
@@ -107,11 +118,33 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
     no junction anywhere in a layup needs to slow below the commanded speed.
     Winding time stays the same; the files get about 20–70 % more lines.
   - **Where the machine still slows down:** starting from rest at the wind
-    start, at layup changes (which pause anyway), and into and out of a 90°
-    wind.
+    start, at layup changes (which pause anyway, at a 90° wind's start and
+    end too), and in a turnaround squeezed into less than the zone: next to a
+    90° wind with flat end caps, or with a zone longer than the dome. With a
+    large *Additional X-Axis Travel* (60 mm on a 200 mm tank, say) a shallow
+    layup also eases off briefly, to about 90 %, where the eye levels off
+    beyond the tank's end.
+- **Additional X-Axis Travel (per layup, default 30 mm):** the eye turns
+  around this far beyond each end of the tank. The fiber trails behind the
+  eye, so this lets it reach all the way out to the polar opening before it
+  turns. The turnaround curve starts where the zone does and simply reaches
+  further, so it is still one smooth curve. With a zone of 0, the helix runs
+  on out to there and the eye turns on the spot. The mandrel turns the helix
+  over the extra travel, in and out, on top of the dwell. That rotation is
+  counted in the pattern math, so every circuit still lands exactly on the
+  pattern. A 90° wind doesn't use it. With it, the carriage runs from
+  *Chuck X-Offset* − travel to the tank's far end + travel; generating
+  G-code refuses a program that would leave 0 … 5250 mm. Files written before
+  the setting existed reopen with 0, which is how they were wound. The
+  previews draw the fiber where it lies: at the tank's end, around the polar
+  opening, while the eye is beyond it.
 - **Eye clearance:** the Y position follows the tank profile plus a safety
   gap. It uses the largest radius under the full width of the eye, so the eye
-  cannot hit the tank at the domes.
+  cannot hit the tank at the domes. Beyond the tank's ends (with *Additional
+  X-Axis Travel*) the eye carries on smoothly the way it was moving and
+  levels off at *Min Spacing* from the end cap diameter. So it closes in
+  further than at the tank's end, and nothing beyond the tank but the polar
+  opening's boss is known to the app: **check that the chuck has room there.**
 - **Two speed limits:** every move runs as fast as the two limits in
   Machine Settings allow. Each move takes the feed rate of whichever limit it
   reaches first:
@@ -152,7 +185,9 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   (see above).
 - **Pause after each layup:** on by default. The program runs `PAUSE` after
   every layup except the last, so the fiber can be checked (for slipping, say)
-  after each pattern change. Resume on the machine to continue.
+  after each pattern change. Resume on the machine to continue. Before and
+  after a 90° wind, the pause is where it starts and ends on the straight
+  section.
 - **Continuing an interrupted wind (Export Partial G-Code):** if something goes
   wrong, cancel the program on the machine, adjust the settings if needed, and
   export a partial program that continues from where the wind stopped. See
@@ -177,23 +212,29 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   The preview shows the first
   cycle of the selected layup. Check **Show All Layups** to overlay every
   layup in its own color, with a legend underneath; click a legend entry to
-  select that layup. The simulation runs on a background thread, so the
-  interface stays responsive. Switching layups redraws instantly from the
-  cached result without re-simulating.
+  select that layup. A 90° wind is drawn as the solid band it lays. The
+  simulation runs on a background thread, so the interface stays responsive.
+  Each layup's strands appear as soon as the simulation has got through its
+  first cycle, while the rest is still running (the time and tow figures
+  follow when it's done). After an edit to one layup, the layups before it
+  aren't simulated again. Switching layups redraws instantly from the cached
+  result without re-simulating.
 - **Progress on the machine:** while the wind runs, Mainsail shows where it
   is: the mandrel angle within the cycle in its Layer field ("Layer 1234 of
   5760"), the layup and cycle in its status line, and a console line at every
   cycle. See [Progress on the machine](#progress-on-the-machine).
 - **G-Code Preview:** load any generated file and play or scrub through it.
   You can jump to a line or cycle and see the coordinates, elapsed time and
-  current layup. Each layup is drawn in its own color. There is an optional 3D
-  mode that spins with the mandrel. Loading a file also restores its settings,
+  current layup. Each layup is drawn in its own color. A finished layup that
+  covers the tank is drawn as a solid layer, and a 90° wind as its band, so
+  playback stays smooth however many layups are already wound. There is an
+  optional 3D mode that spins with the mandrel. Loading a file also restores its settings,
   including every layup, into the settings panel. Files from before
   multi-layup support load as a single layup.
 - **Progress window:** generating a file runs in the background behind a small
   window that shows what's happening, a progress bar and the time left:
   writing the file, then loading it into the G-Code Preview. A 1.5-hour wind
-  (about 290,000 lines) takes roughly 20 s. The app stays responsive, and
+  (about 290,000 lines) takes about 4 s. The app stays responsive, and
   **Cancel** stops cleanly: the file is only written under its real name once
   it is complete, so a cancelled run leaves nothing behind. Once a run
   finishes, the window shows where the file was saved. Opening a large file
@@ -214,8 +255,8 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; turnaround_zone: 96.82458365518542
 ; turnaround_zone_auto: True
 ; layups: 2
-; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False
-; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True
+; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False x_extension=30.0
+; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True x_extension=30.0
 ; estimate_fiber_strength: 5100.0     <- the Strength & Materials inputs...
 ; ...
 ; estimate_result_safety_factor: 1.203  <- ...and what they gave for this wind
@@ -497,9 +538,13 @@ python -m unittest -v
   matches the file.
 - **90° winds:** `Layup.hoop` marks one. `WindingJob.hoop_span` is where its
   band runs, `start_sides()` says which end each layup starts from (every 90°
-  layup flips it), and `iter_program()` winds the lead-in and the pass. A
-  helical layup that starts from the far end runs its circuits the other way
-  round, with the same pattern math. `HOOP_IGNORED` lists the settings a 90°
+  layup flips it), and `iter_program()` winds the pass. It also winds the
+  transitions as part of the helical layups around it. The layup before runs
+  on to the hoop's start in its last cycle. The layup after gets an extra
+  first pass to its starting end, with a turnaround at its own dwell, in its
+  first circuit. So every `LayupStart`, where the program pauses, is on the
+  straight section. A helical layup that starts from the far end runs its
+  circuits the other way round, with the same pattern math. `HOOP_IGNORED` lists the settings a 90°
   wind doesn't use, and `HOOP_ANGLE_THRESHOLD` and `LEAD_IN_ANGLE` are
   constants at the top of `winding.py`. The `NinetyDegreeWind` tests check it
   on the generated motion.
@@ -541,7 +586,29 @@ python -m unittest -v
   worker starts only once the GUI has finished redrawing (`after_idle`), and
   the GIL switch interval is lowered to 0.5 ms. Otherwise every Tk call would
   wait for the busy worker, and a settings change would stall the GUI for up
-  to half a second.
+  to half a second. With `on_partial`, a worker can also hand over interim
+  results: the simulation reports each layup's strands as they're complete
+  (`simulate(..., on_layup=...)`), and the preview draws them right away.
+- **Performance, without changing the output:** every speed-up below keeps
+  the written G-code byte for byte the same (the `GoldenMaster` tests pin it
+  down), so they only change how the same numbers are reached:
+  - `iter_program()` looks the tank radius and eye Y up per X position
+    (`_memoized`) instead of working them out again on every pass, and its
+    inner `move()` has `calc_move()`'s arithmetic written out, in the same
+    order, with one generator less per step. A layup's turnarounds repeat,
+    so each distinct turnaround curve is worked out only once.
+  - `simulate(job, previous)` keeps checkpoints at every layup start. A
+    simulation of a job that differs only from layup *n* on picks up at layup
+    *n − 1* (whose last turnaround runs out onto layup *n*'s helix) with the
+    exact running totals. `ResumedSimulation` checks it equals a fresh run.
+  - The previews draw thinned strand paths (`winding.thin_path`: a chord
+    stands in for points within 8°, 15 mm and 1.5 mm of each other, X turns
+    always kept), with a coarser level while the view spins. They're
+    prepared on the worker thread, together with the calculation, for the
+    Settings Preview as well as for a loaded file (`view_tab._drawing_path`).
+    The G-Code Preview draws finished layups that cover the tank as solid
+    layers and finds the current position by bisecting, so a frame costs
+    about the same at any point of a long wind.
 - **Long tasks with a progress window:** `progress_dialog.ProgressTask` runs a
   function on a worker thread and shows what it reports through
   `progress(fraction, phase)`; a cancel raises `Cancelled` at the next report.

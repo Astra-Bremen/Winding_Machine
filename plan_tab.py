@@ -30,6 +30,7 @@ LAYUP_FIELDS = [
     ("Pattern Number (Strands per Cycle)", "pattern_number"),
     ("Winding Angle (Degrees)", "wind_angle"),
     ("Turnaround / Dwell Angle (Deg)", "turnaround_angle"),
+    ("Additional X-Axis Travel (mm)", "x_extension"),
 ]
 START_X_FIELD = ("Start Wind at X (mm)", "start_x")
 # The two speed limits. Every move runs as fast as both allow -- whichever it
@@ -84,12 +85,16 @@ FIELD_TIPS = {
                        "mm with flat end caps). Type a value to fix it; clear the field to go back to auto. "
                        "0 = turn on the spot at the end (the machine stops there).",
     "pause_after_layup": "Pauses (PAUSE) after every layup but the last, so the fiber can be checked, e.g. for "
-                         "slipping, before the pattern changes. Resume on the machine to continue.",
+                         "slipping, before the pattern changes. Resume on the machine to continue. Around a 90° "
+                         "wind it pauses where the wind starts and ends, on the straight section.",
     # Layup
     "hoop": "One pass along the straight section only, never over the domes, each turn laid one band width on "
             "from the last so the bands lie edge to edge (just short of 90°). No pattern and no turnarounds, so the "
-            "fields below don't apply.\n\nIt ends at the other end of the tank: the next layup starts from there "
-            f"and winds the other way. A Winding Angle above {winding.HOOP_ANGLE_THRESHOLD:g}° switches this on.",
+            "fields below don't apply.\n\nThe layup before it finishes its last turnaround and runs on at its own "
+            "angle to the straight section, where the layup change happens. The 90° wind ends at the other end of "
+            "the straight section: a helical layup after it goes on over that dome at its own angle, turns around "
+            "there with its own dwell, and winds back from that end. A Winding Angle above "
+            f"{winding.HOOP_ANGLE_THRESHOLD:g}° switches this on.",
     "passes": "How many cycles this layup winds. Each cycle lays one band per strand (Pattern Number), evenly "
               "around the tank, then moves the pattern on. Auto (grey): the fewest cycles that cover the tank "
               "completely, following every change. Type a number to fix it; clear the field to go back to auto.",
@@ -101,6 +106,12 @@ FIELD_TIPS = {
     "turnaround_angle": "Least rotation (degrees) at each end of the tank while the fiber turns around. A little "
                         "more is added where needed, so every circuit lands exactly on the pattern (Extra Rotation "
                         "in the estimates).",
+    "x_extension": "How far beyond each end of the tank the eye turns around (mm). The fiber trails behind the eye, "
+                   "so this lets it reach all the way out to the polar opening. The turnaround stretches out by this "
+                   "much, still one smooth curve, and its extra rotation is counted in the pattern, so every circuit "
+                   "still lands exactly on it. Beyond the ends the eye keeps closing in smoothly until it's Min "
+                   "Spacing from the End Cap Diameter: check that the chuck has room there. 0 = turn around at the "
+                   "tank's ends.",
     # Preview
     "show_all": "Draws the first cycle of every layup on the tank at once, each in its own color, with a legend "
                 "below; click a legend entry to select that layup. Off: only the selected layup.",
@@ -144,6 +155,63 @@ def _set_if_changed(var, value):
         var.set(value)
 
 
+def _preview_runs(job, runs_by_layup):
+    """What the preview draws of some layups' strand runs ({layup: [run of
+    (x, r, A deg)]}): {layup: (fine, coarse)}, each a list of runs thinned
+    (winding.thin_path) with A in radians -- `coarse` for while the view
+    spins, when sub-pixel detail can't be seen anyway -- and a 90° wind's pass
+    left out, since it's drawn as the band it is (only its run onto the
+    straight section stays a strand). Pure: runs on the worker thread,
+    together with the calculation it belongs to."""
+    first, last = job.hoop_span
+    drawn = {}
+    for li, runs in runs_by_layup.items():
+        fine, coarse = [], []
+        for run in runs:
+            parts = [run]
+            if job.layups[li].hoop:
+                parts, part = [], []
+                for p in run:
+                    if first + 1e-6 < p[0] < last - 1e-6:
+                        if len(part) >= 2:
+                            parts.append(part)
+                        part = []
+                    else:
+                        part.append(p)
+                if len(part) >= 2:
+                    parts.append(part)
+            for part in parts:
+                thin = winding.thin_path(part)
+                fine.append([(x, r, math.radians(a)) for x, r, a in thin])
+                coarse.append([(x, r, math.radians(a)) for x, r, a in winding.thin_path(thin, 20.0, 30.0, 3.0)])
+        drawn[li] = fine, coarse
+    return drawn
+
+
+def _simulate_for_preview(job, previous=None, report=None):
+    # The simulation -- picking up from `previous` (the last one) where the
+    # settings allow -- plus each layup's first cycle as the preview draws it.
+    # Each layup's is handed to `report((layup, drawn))` as soon as it's
+    # complete, so the preview can draw it while the rest is still running.
+    drawn = {}
+
+    def on_layup(li, strand_runs):
+        drawn.update(_preview_runs(job, {li: [run for runs in strand_runs for run in runs]}))
+        if report is not None:
+            report((li, drawn[li]))
+    result = winding.simulate(job, previous, on_layup)
+    return result, drawn
+
+
+def _progress_for_preview(job, point):
+    # The tank as wound up to `point`, its runs as the preview draws them.
+    progress = winding.progress(job, point)
+    return progress._replace(runs=_preview_runs(job, progress.runs))
+
+
+_PARTIAL = object()  # marks a worker's interim report in _BackgroundCalc's queue
+
+
 class _BackgroundCalc:
     """Runs fn(key) on a worker thread, for the newest requested key only, and
     hands the outcome to on_result(key, result, error) on the GUI thread (from
@@ -151,10 +219,14 @@ class _BackgroundCalc:
     runs just overwrites the single pending slot -- which is exactly how an
     outdated queued calculation gets "cancelled": it's replaced before it ever
     starts. Each request gets a unique token, and only the newest request's
-    outcome is delivered; anything else that arrives is stale and discarded."""
+    outcome is delivered; anything else that arrives is stale and discarded.
 
-    def __init__(self, fn, on_result, defer):
-        self._fn, self._on_result = fn, on_result
+    With `on_partial`, fn is called as fn(key, report): each report(update)
+    on the worker reaches on_partial(key, update) on the GUI thread -- also
+    for the newest request only -- before the outcome does."""
+
+    def __init__(self, fn, on_result, defer, on_partial=None):
+        self._fn, self._on_result, self._on_partial = fn, on_result, on_partial
         # The worker is started through `defer` (Tk's after_idle): once the GUI
         # has finished the redraw that asked for it. Started mid-redraw, it
         # would contend for the GIL with every Tk call still to come -- each one
@@ -200,7 +272,11 @@ class _BackgroundCalc:
     def _work(self, token, key):
         # Worker thread: pure math only, no Tkinter access.
         try:
-            self._queue.put((token, key, self._fn(key), None))
+            if self._on_partial is None:
+                result = self._fn(key)
+            else:
+                result = self._fn(key, lambda update: self._queue.put((token, key, update, _PARTIAL)))
+            self._queue.put((token, key, result, None))
         except Exception as e:
             self._queue.put((token, key, None, e))
 
@@ -209,6 +285,10 @@ class _BackgroundCalc:
         try:
             while True:
                 token, key, result, error = self._queue.get_nowait()
+                if error is _PARTIAL:
+                    if token == self._wanted:
+                        self._on_partial(key, result)
+                    continue
                 self._thread = self.inflight = None
                 if token == self._wanted:
                     self._on_result(key, result, error)
@@ -330,8 +410,17 @@ class PlanTab:
         # re-running the simulation, which is what keeps layup switching instant.
         # Progress is keyed and cached the same way, by (job, continue point).
         defer = self.app.root.after_idle
-        self._sim = _BackgroundCalc(winding.simulate, self._apply_calc_result, defer)
-        self._prog = _BackgroundCalc(lambda key: winding.progress(*key), self._apply_progress_result, defer)
+        # Each simulation starts from the last finished one: after an edit to
+        # one layup, the unchanged ones before it aren't wound again.
+        self._sim = _BackgroundCalc(
+            lambda job, report: _simulate_for_preview(job, self._result[1] if self._result else None, report),
+            self._apply_calc_result, defer, on_partial=self._apply_partial_runs)
+        self._prog = _BackgroundCalc(lambda key: _progress_for_preview(*key), self._apply_progress_result, defer)
+        self._runs = {}  # layup -> its first cycle as the preview draws it (see _preview_runs)
+        # The layups' first cycles of the simulation still running, as they
+        # come in: (job, {layup: drawn runs}). Drawn until the result is in.
+        self._partial = None
+        self._partial_changed = False  # a visible layup came in: redraw after this poll
         # While a calculation runs, the GUI thread gets the GIL back after at
         # most this long (Python's default is 5 ms) -- and it gives it up on
         # every Tk call, so a redraw with a hundred of them stays quick.
@@ -704,7 +793,11 @@ class PlanTab:
                 notes["passes"] = "A 90° wind is always exactly one pass."
                 notes["pattern_number"] = notes["turnaround_angle"] = "Not used by a 90° wind."
                 notes["wind_angle"] = f"Not used by a 90° wind: it winds at {job.hoop_angle:.1f}°."
+                notes["x_extension"] = "Not used by a 90° wind: it stays on the straight section."
             else:
+                x_start, x_end = job.chuck_offset, job.chuck_offset + job.tank_length
+                notes["x_extension"] = (f"This layup turns around at X {x_start - layup.x_extension:.1f} and "
+                                        f"X {x_end + layup.x_extension:.1f} (the tank spans {x_start:g}–{x_end:g}).")
                 needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth,
                                                       layup.pattern_number)
                 if needed is not None:
@@ -1367,13 +1460,29 @@ class PlanTab:
         # Runs on the GUI thread via after(): delivers finished calculations.
         self._sim.poll()
         self._prog.poll()
+        if self._partial_changed:
+            # One redraw for all the layups that came in since the last poll.
+            self._partial_changed = False
+            self._redraw_strands()
         self._update_indicator()
         self.app.root.after(50, self._poll_calc_queue)
+
+    def _apply_partial_runs(self, job, update):
+        # A layup's first cycle from the simulation still running.
+        li, drawn = update
+        if self._partial is None or self._partial[0] != job:
+            self._partial = (job, {})
+        self._partial[1][li] = drawn
+        if job == self._job and self.partial_point is None and (self.show_all_var.get()
+                                                                or li == self.app.active_layup):
+            self._partial_changed = True
 
     def _apply_calc_result(self, job, result, error):
         if error is not None:
             print(f"Calc error: {error}")
             return
+        result, self._runs = result
+        self._partial, self._partial_changed = None, False
         self._result = (job, result)
         self._update_sim_estimates()
         self._redraw_strands()
@@ -1438,44 +1547,74 @@ class PlanTab:
         # "front" depends on self._view_azimuth, so this alone is re-run (cheaply)
         # on every rotate-animation frame, while the tank/shaft/end-view stay
         # untouched. Only results calculated from the exact settings on screen
-        # are ever drawn.
+        # are ever drawn -- while the simulation still runs, the layups it has
+        # got through so far.
         self.canvas.delete("strand_path")
         if self.partial_point is not None:
             self._draw_progress()
-        elif self._view_geom and self._result is not None and self._result[0] == self._job:
-            job, result = self._result
-            indices = range(len(result.layups)) if self.show_all_var.get() else [self.app.active_layup]
-            # In winding order, so later layups lie on top of earlier ones like
-            # they do on the real tank.
-            for li in indices:
-                self._draw_runs(li, [run for runs in result.layups[li].strand_runs for run in runs])
+        elif self._view_geom:
+            runs = None
+            if self._result is not None and self._result[0] == self._job:
+                runs = self._runs
+            elif self._partial is not None and self._partial[0] == self._job:
+                runs = self._partial[1]
+            if runs is not None:
+                job = self._job
+                indices = range(len(job.layups)) if self.show_all_var.get() else [self.app.active_layup]
+                # In winding order, so later layups lie on top of earlier ones
+                # like they do on the real tank.
+                for li in indices:
+                    if li not in runs:
+                        continue
+                    if job.layups[li].hoop:
+                        first, last = job.hoop_span
+                        self._draw_band(li, first - job.bandwidth / 2, last + job.bandwidth / 2)
+                    self._draw_runs(li, runs[li][self._detail()])
         # Strand paths draw on top of everything else drawn synchronously (tank,
         # warnings); keep the markers, caption and calc indicator above that.
         for tag in ("start_marker", "continue_marker", "eye", "caption", "calc_indicator"):
             self.canvas.tag_raise(tag)
 
     def _draw_runs(self, layup_index, runs):
+        # `runs` as _preview_runs() prepared them: (x, r, A in radians) points.
         scale, ox, oy = self._view_geom
         pal = self.app.canvas_palette
         color, dash = theme.layup_style(pal, layup_index)
-        # The band's width on screen, rounded up: bands laid edge to edge (a 90°
-        # wind, full coverage) then close up instead of showing slivers of tank.
+        # The band's width on screen, rounded up: bands laid edge to edge (full
+        # coverage) then close up instead of showing slivers of tank.
         style = dict(fill=color, width=max(1, math.ceil(self._job.bandwidth * scale)), capstyle=tk.ROUND,
                      dash=dash or "", tags="strand_path")
         az = math.radians(self._view_azimuth)
+        sin, cos, create_line = math.sin, math.cos, self.canvas.create_line
         for run in runs:
-            poly = []
+            line = []
             for x, r, a in run:
-                eff = math.radians(a) - az
-                px, py = ox - x * scale, oy - r * math.cos(eff) * scale
-                if math.sin(eff) >= 0:
-                    poly.append((px, py))
+                eff = a - az
+                if sin(eff) >= 0:
+                    line.append(ox - x * scale)
+                    line.append(oy - r * cos(eff) * scale)
                 else:
-                    if len(poly) >= 2:
-                        self.canvas.create_line(*[c for p in poly for c in p], **style)
-                    poly = []
-            if len(poly) >= 2:
-                self.canvas.create_line(*[c for p in poly for c in p], **style)
+                    if len(line) >= 4:
+                        create_line(*line, **style)
+                    line = []
+            if len(line) >= 4:
+                create_line(*line, **style)
+
+    def _detail(self):
+        # Which of _preview_runs' levels of detail to draw: the coarse one while
+        # the view spins (redrawn every frame), the fine one once it rests.
+        return 1 if self._spin_direction != 0 or abs(self._spin_velocity) > 0.5 else 0
+
+    def _draw_band(self, layup_index, x_from, x_to):
+        # A 90° wind: its bands lie edge to edge, so it's drawn as the solid band
+        # it makes over the straight section (from x_from to x_to).
+        if x_from == x_to:
+            return
+        scale, ox, oy = self._view_geom
+        color, _ = theme.layup_style(self.app.canvas_palette, layup_index)
+        rt = self._job.tank_diameter / 2
+        self.canvas.create_rectangle(ox - x_from * scale, oy - rt * scale, ox - x_to * scale, oy + rt * scale,
+                                     fill=color, outline="", tags="strand_path")
 
     def _draw_progress(self):
         # The tank as it should look at the continue point: every layup wound
@@ -1490,13 +1629,24 @@ class PlanTab:
         if isinstance(progress, Exception):
             return
         pal = self.app.canvas_palette
+        job = self._job
+        sides = winding.start_sides(job)
         for li in range(progress.location.point.layup + 1):
             if li in progress.covered and self._tank_outline:
                 color, _ = theme.layup_style(pal, li)
                 self.canvas.create_polygon(self._tank_outline, fill=color, outline=pal["tank_outline"], width=2,
                                            tags="strand_path")
-            elif li in progress.runs:
-                self._draw_runs(li, progress.runs[li])
+                continue
+            if job.layups[li].hoop:
+                # The band from where the pass began -- to the eye while it's wound.
+                first, last = job.hoop_span
+                lo, hi = first - job.bandwidth / 2, last + job.bandwidth / 2
+                start, end = (lo, hi) if sides[li] == 1 else (hi, lo)
+                if li == progress.location.point.layup:
+                    end = min(hi, max(lo, progress.location.x))
+                self._draw_band(li, start, end)
+            if li in progress.runs:
+                self._draw_runs(li, progress.runs[li][self._detail()])
         self._draw_eye(progress.location)
         self._draw_marker(progress.location.x, "continue_marker",
                           f"Continue here  X {progress.location.x:.1f}  A {progress.location.point.angle:.1f}°")
@@ -1552,6 +1702,7 @@ class PlanTab:
         else:
             self._spin_velocity = 0.0
             self._spin_job = None
+            self._redraw_strands()  # at rest: full detail again
 
     # --- Cosmetic pseudo-3D tank shading ---
 

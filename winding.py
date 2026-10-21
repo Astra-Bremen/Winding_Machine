@@ -21,7 +21,7 @@ from typing import NamedTuple
 # --- HARDCODED MACHINE LIMITS / GEOMETRY ---
 MAX_X = 5250.0        # carriage's physical X-axis travel limit (mm)
 Y_REFERENCE = 550.0   # eye distance from the tank centerline at Y=0, before subtracting the eye arm (mm)
-Y_TRAVEL = 180.0      # Y-axis travel; commanded Y is clamped to [0, Y_TRAVEL] (mm)
+Y_TRAVEL = 150.0      # Y-axis travel; commanded Y is clamped to [0, Y_TRAVEL] (mm)
 STEP_SIZE = 5.0       # X distance covered by one traversal G-code move (mm)
 MIN_MOVE_TIME = 0.1   # lowest allowed Max Move Time (s); shorter moves only load the controller
 # Failsafe: the highest G-code feed rate (F, mm/min) any move may use, whatever
@@ -29,7 +29,7 @@ MIN_MOVE_TIME = 0.1   # lowest allowed Max Move Time (s); shorter moves only loa
 # degrees. Keep it at or below the controller's max_velocity (mm/s) x 60.
 MAX_FEED = 40000.0
 HOOP_ANGLE_THRESHOLD = 85.0  # a Winding Angle entered above this makes the layup a 90° wind (the app's rule)
-LEAD_IN_ANGLE = 45.0  # angle of the run onto a 90° wind's start when no helical layup precedes it
+LEAD_IN_ANGLE = 45.0  # angle of the run onto a 90° wind's start when it's the first layup, started elsewhere
 FLAT_TURNAROUND_ZONE = 50.0  # Auto turnaround zone with flat end caps (no dome to turn on), mm
 # Most a turnaround's direction may change from one G-code move to the next,
 # in (X, Y, A) space (deg). Klipper takes such a junction at full speed: at its
@@ -72,9 +72,17 @@ class Layup:
     # A 90° wind: one pass along the straight section only (never over the
     # domes), each turn one band width on from the last, so the bands lie edge
     # to edge. It ends at the other end of the tank, so every layup after it
-    # starts from there and winds the other way (see start_sides). The helical
-    # settings (HOOP_IGNORED) are kept, but not used while this is set.
+    # starts from there and winds the other way (see start_sides; how the
+    # layups around it get on and off the straight section: iter_program).
+    # The helical settings (HOOP_IGNORED) are kept, but not used while this is
+    # set.
     hoop: bool = False
+    # Additional X-Axis Travel (mm): how far beyond the tank's ends the eye
+    # turns around. The fiber trails behind the eye, so this carries the
+    # turnaround out to the polar opening. The turnaround stretches out by
+    # this much (see iter_program), and its helix there is counted in the
+    # pattern (see plan_layup), so every circuit still lands on it.
+    x_extension: float = 30.0
 
     def __post_init__(self):
         _coerce_fields(self)
@@ -200,8 +208,9 @@ class WindingJob:
 
 GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
 LAYUP_KEYS = tuple(f.name for f in fields(Layup))
-# The layup settings a 90° wind doesn't use (it always winds exactly one pass).
-HOOP_IGNORED = ("passes", "pattern_number", "wind_angle", "turnaround_angle")
+# The layup settings a 90° wind doesn't use (it always winds exactly one pass,
+# on the straight section).
+HOOP_IGNORED = ("passes", "pattern_number", "wind_angle", "turnaround_angle", "x_extension")
 
 # Settings the WindingJob can compute itself: value key -> the flag that, while
 # set, makes it do so (the value given is then ignored).
@@ -222,6 +231,8 @@ LEGACY_VALUES = {
     "start_x_auto": False,
     "start_x": lambda settings: float(settings["chuck_offset"]),
 }
+# The same for a layup's settings: its turnarounds were at the tank's ends.
+LAYUP_LEGACY_VALUES = {"x_extension": 0.0}
 
 
 class SettingsError(ValueError):
@@ -283,17 +294,30 @@ def geometry_errors(job):
             errors.append(f"{prefix}Winding Angle must be between 0° and 90°.")
         if layup.turnaround_angle < 0:
             errors.append(f"{prefix}Turnaround / Dwell Angle can't be negative.")
+        if layup.x_extension < 0:
+            errors.append(f"{prefix}Additional X-Axis Travel can't be negative.")
     return errors
+
+
+def x_overtravel(job):
+    """The furthest any layup takes the eye beyond the tank's ends (mm): its
+    Additional X-Axis Travel (a 90° wind stays on the straight section)."""
+    return max((layup.x_extension for layup in job.layups if not layup.hoop), default=0.0)
 
 
 def validate(job):
     """Every problem that blocks G-code generation: the geometry errors plus the
     machine's own physical limits."""
     errors = geometry_errors(job)
-    x_max = job.chuck_offset + job.tank_length
+    extra = max(0.0, x_overtravel(job))
+    x_max = job.chuck_offset + job.tank_length + extra
     if x_max > MAX_X:
         errors.append(f"X-Axis would reach {x_max:.0f}mm, exceeding the carriage's travel limit of {MAX_X:.0f}mm. "
-                      "Reduce Tank Length or Chuck X-Offset.")
+                      "Reduce Tank Length, Chuck X-Offset or Additional X-Axis Travel.")
+    x_min = job.chuck_offset - extra
+    if x_min < 0:
+        errors.append(f"Additional X-Axis Travel would take the carriage to X {x_min:.0f}mm, below X0. "
+                      "Reduce it or increase Chuck X-Offset.")
     return errors
 
 
@@ -469,7 +493,8 @@ def traversal_steps(x_start, x_end, step_size, pitch):
 
 
 def turnaround_curve(x_turn, direction, zone, k_in, k_out, dwell, eye_y):
-    """One turnaround at the tank end x_turn, reached moving in `direction`
+    """One turnaround at x_turn -- the tank's end, or beyond it by the layup's
+    Additional X-Axis Travel -- reached moving in `direction`
     (+1/-1): the eye runs into the zone (the last `zone` mm) on the incoming
     helix (k_in deg of rotation per mm of X), slows smoothly to a stop at
     x_turn while the mandrel keeps turning, and runs back out on the outgoing
@@ -661,7 +686,10 @@ def plan_layup(job, layup):
     # uncovered strips up to several mm wide at some slot seams.
     shift_degrees = (360.0 / p) / layup.passes
     total_circuits = p * layup.passes
-    traverse_rotation = (2.0 * lt / pitch) * 360.0
+    # The helix over a circuit: there and back along the tank, and on past
+    # both its ends by the layup's Additional X-Axis Travel (every turnaround
+    # winds the helix out to there and back, see iter_program).
+    traverse_rotation = (2.0 * (lt + 2.0 * layup.x_extension) / pitch) * 360.0
     extra_within, extra_between, skip = compute_dwell_extras(traverse_rotation, layup.turnaround_angle, p, shift_degrees)
     right_offset = compute_turnaround_balance_offset(total_circuits, p, layup.turnaround_angle, extra_within, extra_between)
     return LayupPlan(pitch, shift_degrees, band_degrees, total_circuits, skip, extra_within, extra_between, right_offset)
@@ -677,7 +705,8 @@ def start_sides(job):
     """Which end each layup starts from: 1 at the chuck side (winding toward
     +X first), -1 at the far end. A helical layup ends where it started (every
     circuit goes there and back); a 90° wind ends at the other end, so the
-    layups after it start from there."""
+    layups after it start from there. (A helical layup after a 90° wind first
+    turns around at that end, then winds its circuits from it.)"""
     sides, side = [], 1
     for layup in job.layups:
         sides.append(side)
@@ -768,13 +797,55 @@ def _eye_y_function(job, geom):
     # Y keeps the eye's whole footprint min_spacing clear of the tank surface,
     # clamped to the axis travel. Returned as a closure so the per-step hot loop
     # doesn't re-derive the constant geometry every 5 mm.
+    #
+    # Beyond the tank's ends (where a layup's Additional X-Axis Travel takes
+    # the eye) it carries on the way it was moving at the end, closing in
+    # along the dome's slope, and levels off evenly until it's min_spacing
+    # from the polar opening (the end cap diameter: the boss). Stopping dead
+    # at the end's Y would put a corner into every turnaround's smooth curve,
+    # where Klipper would brake hard; levelling off over all the room there
+    # is keeps the bend gentle enough to take at speed. While the eye's inner
+    # edge is still over the dome, the dome's convex profile keeps it clear:
+    # the path stays below the tangent at the end, which stays below the
+    # clearance the dome needs.
     y_base = Y_REFERENCE - job.eye_arm_length
     args = (geom.x_start, geom.x_end, geom.r_tank, geom.r_cap, geom.l_dome, geom.cap_type, job.eye_width)
     space = job.min_spacing
+    x_start, x_end = geom.x_start, geom.x_end
+    y_end = y_base - (calc_R_eye_footprint(x_end, *args) + space)  # not yet clamped; the same at both ends
+    # How far onto the dome the eye's inner edge is at the tank's end: the
+    # tank's radius under it, Y's slope there (the sphere's), and how much
+    # closer the eye may come before it's min_spacing from the polar opening.
+    onto = geom.l_dome - job.eye_width / 2
+    slope = rise = 0.0
+    if geom.cap_type == "Round" and onto > 0:
+        r_edge = math.sqrt(geom.r_tank ** 2 - onto ** 2)
+        slope, rise = onto / r_edge, r_edge - geom.r_cap
+    level = 2.0 * rise / slope if slope > 0 else 0.0  # how far beyond the end it levels off
+    bend = slope * slope / (4.0 * rise) if rise > 0 else 0.0
 
     def eye_y(x):
-        return max(0.0, min(Y_TRAVEL, y_base - (calc_R_eye_footprint(x, *args) + space)))
+        if x_start <= x <= x_end:
+            return max(0.0, min(Y_TRAVEL, y_base - (calc_R_eye_footprint(x, *args) + space)))
+        u = min(x_start - x if x < x_start else x - x_end, level)
+        return max(0.0, min(Y_TRAVEL, y_end + slope * u - bend * u * u))
     return eye_y
+
+
+def _memoized(fn):
+    # fn (of one float) remembering its results: a program's X positions repeat
+    # on every pass (the same steps, the same cached turnaround curves), so
+    # looking them up beats working the tank profile out again -- with exactly
+    # the same numbers.
+    known = {}
+
+    def cached(x):
+        try:
+            return known[x]
+        except KeyError:
+            value = known[x] = fn(x)
+            return value
+    return cached
 
 
 def start_position(job):
@@ -783,16 +854,50 @@ def start_position(job):
     return x, _eye_y_function(job, _tank_geometry(job))(x)
 
 
-def iter_program(job):
+def iter_program(job, resume_at=None, checkpoints=None):
     """Yields every event of the winding program in machine order: a LayupStart
     before each layup, a Move per G-code move, and a CycleComplete after each
-    cycle. The job must be free of geometry_errors()."""
+    cycle. The job must be free of geometry_errors().
+
+    `checkpoints`, if given, is a dict filled with the generator's state at
+    each layup's start ({layup index: state}); `resume_at` = (layup index,
+    state) continues from such a state, from that layup on -- exactly as the
+    whole program would have (see simulate)."""
     geom = _tank_geometry(job)
     x_start, x_end = geom.x_start, geom.x_end
-    eye_y = _eye_y_function(job, geom)
+    eye_y = _memoized(_eye_y_function(job, geom))
+    radius = _memoized(geom.radius)
     max_a_speed, max_filament = job.max_a_speed, job.max_filament_speed * 60.0
     n_layups = len(job.layups)
     max_move_time = job.max_move_time
+    sqrt, radians, ceil, max_feed = math.sqrt, math.radians, math.ceil, MAX_FEED
+
+    def move(x0, y0, a0, x1, y1, a1, layup_index, circuit, dwell):
+        # One straight (X, Y, A) move: a Move -- or, for one that takes longer
+        # than Max Move Time, the list of its pieces (see moves()). The common
+        # single move is returned as is, without a generator per step. This is
+        # the program's innermost loop, so calc_move is written out here, with
+        # the very same arithmetic (the same numbers to the last bit): first at
+        # the step's larger radius, for moves()'s split test, then -- only where
+        # the radius changes over the step -- at its end, for the move itself.
+        r1 = radius(x1)
+        r_max = max(radius(x0), r1)
+        dx, dy, da = abs(x1 - x0), abs(y1 - y0), abs(a1 - a0)
+        dist_klip = sqrt(dx**2 + dy**2 + da**2)
+        rotation_feed = max_a_speed * dist_klip / da if da > 0 and dist_klip > 0 else max_a_speed
+        da_rad = radians(da)
+        tow = sqrt(dx**2 + (r_max * da_rad)**2)
+        feed = min(rotation_feed, max_filament * dist_klip / tow) if tow > 0 else rotation_feed
+        feed = min(feed, max_feed)
+        duration = (dist_klip / feed) * 60.0 if feed > 0 else 0
+        if ceil(duration / max_move_time - 1e-9) > 1:  # the same test as moves()
+            return list(moves(x0, y0, a0, x1, y1, a1, layup_index, circuit, dwell))
+        if r_max != r1:
+            tow = sqrt(dx**2 + (r1 * da_rad)**2)
+            feed = min(rotation_feed, max_filament * dist_klip / tow) if tow > 0 else rotation_feed
+            feed = min(feed, max_feed)
+            duration = (dist_klip / feed) * 60.0 if feed > 0 else 0
+        return Move(x1, y1, a1, feed, duration, tow, r1, layup_index, circuit, dwell)
 
     def moves(x0, y0, a0, x1, y1, a1, layup_index, circuit, dwell):
         # One straight (X, Y, A) move, split into equal pieces if it would take
@@ -807,7 +912,7 @@ def iter_program(job):
         # tow are unchanged. The fiber the move lays grows with the radius, so
         # it's estimated at the larger end (a 5 mm step's largest radius is at
         # one of its ends): no piece then runs longer than the estimate allows.
-        r_max = max(geom.radius(x0), geom.radius(x1))
+        r_max = max(radius(x0), radius(x1))
         _, duration, _ = calc_move(x0, y0, a0, x1, y1, a1, max_a_speed, r_max, max_filament)
         n = max(1, math.ceil(duration / max_move_time - 1e-9))
         px, py, pa = x0, y0, a0
@@ -817,7 +922,7 @@ def iter_program(job):
             else:
                 f = k / n
                 qx, qy, qa = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, a0 + (a1 - a0) * f
-            qr = geom.radius(qx)
+            qr = radius(qx)
             feed, piece_duration, tow = calc_move(px, py, pa, qx, qy, qa, max_a_speed, qr, max_filament)
             yield Move(qx, qy, qa, feed, piece_duration, tow, qr, layup_index, circuit, dwell)
             px, py, pa = qx, qy, qa
@@ -826,14 +931,22 @@ def iter_program(job):
         # One straight helix run (see traversal_steps), the eye following the tank.
         for x_next, a_delta in traversal_steps(x, target_x, STEP_SIZE, pitch):
             y_next, a_next = eye_y(x_next), a + a_delta
-            yield from moves(x, y, a, x_next, y_next, a_next, layup_index, circuit, False)
+            m = move(x, y, a, x_next, y_next, a_next, layup_index, circuit, False)
+            if type(m) is Move:
+                yield m
+            else:
+                yield from m
             x, y, a = x_next, y_next, a_next
 
     def curve(x, y, a, points, layup_index, circuit):
         # Part of a turnaround curve: (x, y, a relative to `a`) points.
         a0 = a
         for qx, qy, qa in points:
-            yield from moves(x, y, a, qx, qy, a0 + qa, layup_index, circuit, False)
+            m = move(x, y, a, qx, qy, a0 + qa, layup_index, circuit, False)
+            if type(m) is Move:
+                yield m
+            else:
+                yield from m
             x, y, a = qx, qy, a0 + qa
 
     def slope(layup):
@@ -853,24 +966,40 @@ def iter_program(job):
     # by exactly the same amount, so this only shifts the whole program by a
     # constant angle: the pattern is untouched, and the part skipped (the
     # first pass over the chuck-side dome) is one band where every band
-    # overlaps anyway. The same holds for a layup that follows a 90° wind: its
-    # first pass starts where the hoop ended.
+    # overlaps anyway.
+    #
+    # A 90° wind starts and ends on the straight section, and every layup
+    # change around it happens right there (where write_gcode pauses, at the
+    # LayupStart): the helical layup before it finishes its last turnaround
+    # as usual and runs on along its own helix to the 90° wind's start; a
+    # helical layup after it first runs on in the same direction, over the
+    # dome at its own angle, and turns around at the tank's end with its own
+    # dwell -- so the fiber never reverses on the straight section, where
+    # nothing holds it -- and its circuits start from there. Two 90° winds in
+    # a row simply wind back from where the first one ended.
     x, a = job.wind_start_x, 0.0
     y = eye_y(x)
     cycle_number = 0
-    pending_head = []  # the run back out of the last turnaround: the next pass begins with it
-    lead_in_pitch = helix_pitch(job.tank_diameter, LEAD_IN_ANGLE)  # replaced by each helical layup's own
-    for li, (layup, side) in enumerate(zip(job.layups, start_sides(job))):
+    pending_head = ()  # the run back out of the last turnaround: the next pass begins with it
+    first_layup = 0
+    if resume_at is not None:
+        first_layup, (x, y, a, cycle_number, pending_head) = resume_at
+    sides = start_sides(job)
+    first, last = job.hoop_span
+    for li in range(first_layup, n_layups):
+        layup, side = job.layups[li], sides[li]
+        if checkpoints is not None:
+            # Everything the rest of the program depends on, at this layup's start.
+            checkpoints[li] = (x, y, a, cycle_number, tuple(pending_head))
         yield LayupStart(li)
         if layup.hoop:
             # A 90° wind: from its end of the straight section to the other, in
-            # one pass, each turn one band width on from the last. The eye gets
-            # to its start at the previous layup's angle -- over the dome, the
-            # fiber is already lying at that angle (see LEAD_IN_ANGLE when no
-            # helical layup precedes it).
-            first, last = job.hoop_span
+            # one pass, each turn one band width on from the last. Any layup
+            # before it ends right at its start; only as the program's first
+            # layup, started elsewhere, does the eye still have to get there
+            # (at LEAD_IN_ANGLE).
             start, end = (first, last) if side == 1 else (last, first)
-            for ev in traverse(x, y, a, start, lead_in_pitch, li, 0):
+            for ev in traverse(x, y, a, start, helix_pitch(job.tank_diameter, LEAD_IN_ANGLE), li, 0):
                 yield ev
                 x, y, a = ev.x, ev.y, ev.a
             for ev in traverse(x, y, a, end, job.bandwidth, li, 0):
@@ -880,43 +1009,68 @@ def iter_program(job):
             yield CycleComplete(cycle_number, li, a)
             continue
         plan = plan_layup(job, layup)
-        lead_in_pitch = plan.pitch
         k = 360.0 / plan.pitch
         n_strands = layup.pattern_number
-        # The next layup's helix, which this layup's last turnaround runs out
-        # onto -- none at the end of the program, nor before a 90° wind, whose
-        # run onto the straight section isn't a helical pass.
+        # What this layup's last turnaround runs out onto: the next layup's
+        # helix -- or, before a 90° wind, this layup's own, up to where the
+        # 90° wind starts -- and nothing at the end of the program.
         following = job.layups[li + 1] if li < n_layups - 1 else None
-        k_next = slope(following) if following is not None and not following.hoop else None
+        into_hoop = following is not None and following.hoop
+        k_next = None if following is None else k if into_hoop else slope(following)
+        hoop_start = first if side == 1 else last  # (a 90° wind next starts from this layup's end too)
+        out_of_hoop = li > 0 and job.layups[li - 1].hoop
+        extension = layup.x_extension
         for i in range(plan.total_circuits):
             extra = plan.extra_after(i, n_strands)
+            last_circuit = i == plan.total_circuits - 1
             # Each circuit goes out from the layup's starting end and back
             # (`side`: the chuck side, or the far end after a 90° wind -- the
-            # pattern is then simply mirrored). See
+            # pattern is then simply mirrored): a pass to each end, and the
+            # turnaround there, with its dwell. See
             # compute_turnaround_balance_offset: the outbound turnaround always
             # gets the exact same fixed offset (`right_offset`), every circuit,
             # so the return traversal's own pattern stays in step; the
             # return-side turnaround absorbs whatever's left of this circuit's
             # `extra`, exactly as it always has to for the outbound traversal's
             # pattern to land correctly next circuit.
-            for direction in (side, -side):
+            passes = [(side, layup.turnaround_angle + plan.right_offset),
+                      (-side, layup.turnaround_angle + (extra - plan.right_offset))]
+            if i == 0 and out_of_hoop:
+                # Out of a 90° wind, which ended on the straight section
+                # heading for this layup's starting end: first on over the
+                # dome at this layup's angle, and around that end with its
+                # dwell. The first circuit runs back out of this turnaround.
+                passes.insert(0, (-side, layup.turnaround_angle))
+            for n_pass, (direction, dwell_amount) in enumerate(passes):
                 x_turn = x_end if direction == 1 else x_start
-                dwell_amount = layup.turnaround_angle + (plan.right_offset if direction == side else (extra - plan.right_offset))
                 # The run back out of the previous turnaround, then the helix
                 # up to this end's turnaround zone.
                 for ev in curve(x, y, a, pending_head, li, i):
                     yield ev
                     x, y, a = ev.x, ev.y, ev.a
-                # A pass that starts closer to the end than the zone (after a
-                # 90° wind) turns around over what's left.
+                # A pass that starts closer to the end than the zone (from the
+                # wind's start, or out of a 90° wind) turns around over what's
+                # left.
                 zone = min(job.turnaround_zone, abs(x_turn - x))
-                for ev in traverse(x, y, a, x_turn - direction * zone, plan.pitch, li, i):
+                last_pass = last_circuit and n_pass == len(passes) - 1
+                if last_pass and into_hoop:
+                    # Its run back out must end before the 90° wind's start
+                    # (with flat end caps, or a long zone, it would run past).
+                    zone = min(zone, abs(hoop_start - x_turn))
+                # The eye turns back the Additional X-Axis Travel beyond the
+                # tank's end: the turnaround curve starts where the zone does
+                # and reaches out past the end by that much, still one smooth
+                # curve -- or, without a zone, the helix runs on out to there.
+                # Either way the mandrel turns the helix over that stretch, in
+                # and out, plus the dwell (counted in plan_layup's pattern).
+                x_back = x_turn + direction * extension
+                reach = zone + extension if zone > 0 else 0.0
+                for ev in traverse(x, y, a, x_back - direction * reach, plan.pitch, li, i):
                     yield ev
                     x, y, a = ev.x, ev.y, ev.a
-                last_pass = i == plan.total_circuits - 1 and direction == -side
-                k_out = (k_next if last_pass else k) if zone > 0 else None
-                tail, head = turnaround(x_turn, direction, zone, k, k_out if k_out is not None else k, dwell_amount)
-                if zone <= 0:
+                k_out = (k_next if last_pass else k) if reach > 0 else None
+                tail, head = turnaround(x_back, direction, reach, k, k_out if k_out is not None else k, dwell_amount)
+                if reach <= 0:
                     # No zone: the whole turnaround is one rotation at the end.
                     a_next = a + tail[0][2]
                     yield from moves(x, y, a, x, y, a_next, li, i, True)
@@ -931,10 +1085,21 @@ def iter_program(job):
                         # the curve's own direction there (pure rotation), so
                         # without a kink. (Its helix share, winding back out of
                         # the zone, has nowhere to go.)
-                        a_next = a + head[-1][2] - zone * k
+                        a_next = a + head[-1][2] - reach * k
                         yield from moves(x, y, a, x, y, a_next, li, i, True)
-                        a, head = a_next, []
+                        a, head = a_next, ()
                 pending_head = head
+            if last_circuit and into_hoop:
+                # On to the 90° wind's start: out of the last turnaround and
+                # along this layup's helix -- part of its last cycle, so the
+                # layup change happens right there.
+                for ev in curve(x, y, a, pending_head, li, i):
+                    yield ev
+                    x, y, a = ev.x, ev.y, ev.a
+                for ev in traverse(x, y, a, hoop_start, plan.pitch, li, i):
+                    yield ev
+                    x, y, a = ev.x, ev.y, ev.a
+                pending_head = ()
             if (i + 1) % n_strands == 0:
                 cycle_number += 1
                 yield CycleComplete(cycle_number, li, a)
@@ -957,6 +1122,12 @@ class SimulationResult:
     total_time: float
     total_tow: float
     layups: list  # one LayupResult per job layup
+    # What a simulation of a changed job can pick up from (see simulate): the
+    # job, and per layup start the generator's state, the running totals, the
+    # last move's (x, r, a) and the finished layups' results.
+    job: object = field(default=None, repr=False, compare=False)
+    checkpoints: dict = field(default_factory=dict, repr=False, compare=False)
+    resumed_from: int = field(default=0, repr=False, compare=False)  # the layup it started at
 
     @property
     def cylinder_tow(self):
@@ -971,7 +1142,10 @@ class _RunRecorder:
     re-running the program, so that work is left to the caller. Points are
     grouped into "runs": one per single-direction traversal, broken at every
     turnaround (a pure-rotation dwell or, with a turnaround zone, wherever the
-    traverse reverses), so the caller knows which points to connect."""
+    traverse reverses), so the caller knows which points to connect. Where
+    the eye goes on beyond the tank's ends (Additional X-Axis Travel), the
+    fiber stays at the end, around the polar opening: that's where it's
+    drawn."""
 
     def __init__(self, geom):
         self.geom = geom
@@ -986,8 +1160,9 @@ class _RunRecorder:
             self.close()
         if key is None:
             return
+        lo, hi = self.geom.x_start, self.geom.x_end
         if self.run is None:
-            self.run, self.key, self.sink = [prev], key, sink
+            self.run, self.key, self.sink = [(min(max(x0, lo), hi), prev[1], a0)], key, sink
         # STEP_SIZE is a fixed X distance, not an angular one, so near the steep
         # end of the wind-angle range (where pitch shrinks toward the tow width)
         # a single step can sweep close to -- or, right at the computed max
@@ -1007,7 +1182,7 @@ class _RunRecorder:
             frac = k / n_sub
             fx = x0 + (ev.x - x0) * frac
             fr = ev.r if k == n_sub else self.geom.radius(fx)
-            self.run.append((fx, fr, a0 + a_delta * frac))
+            self.run.append((min(max(fx, lo), hi), fr, a0 + a_delta * frac))
 
     def close(self):
         if self.run is not None:
@@ -1015,9 +1190,37 @@ class _RunRecorder:
         self.run = self.key = self.sink = None
 
 
-def simulate(job):
+def _resume_point(job, previous):
+    # The latest layup start a simulation of `job` can pick up from in
+    # `previous` (a SimulationResult): every setting before it the same --
+    # including the layup itself, whose helix the one before it runs out onto.
+    # 0: from the beginning.
+    if previous is None or previous.job is None:
+        return 0
+    before = previous.job
+    if any(getattr(job, key) != getattr(before, key) for key in GLOBAL_KEYS):
+        return 0
+    same = 0
+    for mine, theirs in zip(job.layups, before.layups):
+        if mine != theirs:
+            break
+        same += 1
+    start = same - 1  # its layup, and every one before it, unchanged
+    return start if start >= 1 and start in previous.checkpoints else 0
+
+
+def simulate(job, previous=None, on_layup=None):
     """Runs the whole program for the time/tow estimates, and records each
-    layup's first-cycle strand paths for the 3D preview (see _RunRecorder)."""
+    layup's first-cycle strand paths for the 3D preview (see _RunRecorder).
+
+    With `previous` -- the SimulationResult of an earlier job, e.g. before one
+    layup was edited -- the unchanged layups at the start aren't wound again:
+    the simulation picks up where they ended (see _resume_point), with exactly
+    the numbers a full run gives.
+
+    `on_layup(index, strand_runs)`, if given, is called for each layup as
+    soon as its strand paths are complete (after its first cycle), long
+    before the whole program is: a preview can draw them right away."""
     geom = _tank_geometry(job)
     # One strand per pattern slot; a 90° wind's single pass is one strand.
     strands = [1 if l.hoop else l.pattern_number for l in job.layups]
@@ -1025,23 +1228,116 @@ def simulate(job):
     total_time, total_tow = 0.0, 0.0
     # The straight section, for the strength estimate: a move counts as laid
     # there when its midpoint is (moves are 5 mm steps, so that's exact enough).
+    # Without domes it's the whole tank -- where the eye goes on beyond its
+    # ends too, since the fiber stays at the end, on the straight section.
     cyl_lo, cyl_hi = geom.x_start + geom.l_dome, geom.x_end - geom.l_dome
+    all_straight = geom.l_dome <= 0
     recorder = _RunRecorder(geom)
     prev = (job.wind_start_x, geom.radius(job.wind_start_x), 0.0)
-    for ev in iter_program(job):
+    program_states, checkpoints = {}, {}
+    start = _resume_point(job, previous)
+    resume_at = None
+    if start:
+        state, total_time, total_tow, prev, done = previous.checkpoints[start]
+        results[:start] = done  # finished then, never changed again
+        checkpoints = {li: cp for li, cp in previous.checkpoints.items() if li <= start}
+        resume_at = (start, state)
+    if on_layup is not None:
+        for li in range(start):
+            on_layup(li, results[li].strand_runs)
+    reported = start  # the next layup to report to on_layup
+    for ev in iter_program(job, resume_at, program_states):
         if type(ev) is not Move:
+            # Closing the strand run here is what the next move would do: it
+            # belongs to another layup, or (after a cycle) records nothing.
+            recorder.close()
+            if type(ev) is LayupStart:
+                # The layup before is finished: note where this one starts.
+                checkpoints[ev.index] = (program_states[ev.index], total_time, total_tow, prev,
+                                         tuple(results[:ev.index]))
+            elif ev.layup == reported:
+                # Its first cycle: the layup's strand paths are complete.
+                if on_layup is not None:
+                    on_layup(reported, results[reported].strand_runs)
+                reported += 1
             continue
         total_time, total_tow = total_time + ev.duration, total_tow + ev.tow
         res = results[ev.layup]
         res.time += ev.duration
         res.tow += ev.tow
-        if cyl_lo <= (prev[0] + ev.x) / 2 <= cyl_hi:
+        if all_straight or cyl_lo <= (prev[0] + ev.x) / 2 <= cyl_hi:
             res.cylinder_tow += ev.tow
         first_cycle = ev.circuit < strands[ev.layup]
-        recorder.add(ev, prev, res.strand_runs[ev.circuit] if first_cycle else None)
+        if first_cycle or recorder.run is not None:  # otherwise add() would do nothing
+            recorder.add(ev, prev, res.strand_runs[ev.circuit] if first_cycle else None)
         prev = (ev.x, ev.r, ev.a)
     recorder.close()
-    return SimulationResult(total_time, total_tow, results)
+    return SimulationResult(total_time, total_tow, results, job, checkpoints, start)
+
+
+def thin_path(points, max_deg=8.0, max_dx=15.0, max_dr=1.5):
+    """For drawing: `points` -- (x, r, a, ...) tuples along one strand -- with
+    those a straight chord can stand in for left out. Each kept point is as far
+    from the last as it can be while the angle changes by at most max_deg, X by
+    max_dx and the radius by max_dr; the ends, and where X turns around, are
+    always kept. On a preview canvas the difference doesn't show (over 8 deg a
+    chord sags by a quarter of a percent of the radius), but low-angle helices
+    -- many short steps per degree -- draw several times fewer points."""
+    n = len(points)
+    if n <= 2:
+        return list(points)
+    out = [points[0]]
+    ax, ar, aa = points[0][0], points[0][1], points[0][2]
+    prev, heading = points[0], 0
+    for p in points[1:]:
+        x, r, a = p[0], p[1], p[2]
+        step = x - prev[0]
+        turn = heading != 0 and step != 0 and (step > 0) != (heading > 0)
+        if turn or abs(a - aa) > max_deg or abs(x - ax) > max_dx or abs(r - ar) > max_dr:
+            if prev is not out[-1]:
+                out.append(prev)
+                ax, ar, aa = prev[0], prev[1], prev[2]
+            if abs(a - aa) > max_deg or abs(x - ax) > max_dx or abs(r - ar) > max_dr:
+                out.append(p)
+                ax, ar, aa = x, r, a
+        if step != 0:
+            heading = step
+        prev = p
+    if out[-1] is not points[-1]:
+        out.append(points[-1])
+    return out
+
+
+def job_from_header(settings):
+    """The WindingJob a file's settings header ({key: raw string}) describes --
+    settings it predates taking the values it was wound with (LEGACY_VALUES,
+    else the default) -- or None if it doesn't describe one."""
+    if not all(k in settings for k in ("tank_length", "tank_diameter", "chuck_offset")):
+        return None
+    defaults = WindingJob()
+    values = {}
+    try:
+        for f in fields(WindingJob):
+            if f.name == "layups":
+                continue
+            if f.name not in settings:
+                value = LEGACY_VALUES.get(f.name, getattr(defaults, f.name))
+                values[f.name] = value(settings) if callable(value) else value
+                continue
+            raw = settings[f.name].strip()
+            if f.type in (bool, "bool"):
+                values[f.name] = raw.lower() in ("1", "true", "yes", "on")
+            elif f.type in (float, "float"):
+                values[f.name] = float(raw)
+            else:
+                values[f.name] = raw
+        layups = layups_from_header(settings)
+        if not layups:
+            return None
+        job = WindingJob(**values, layups=tuple(layups))
+    except (ValueError, TypeError, KeyError):
+        return None
+    return None if geometry_errors(job) else job
 
 
 # --- Continuing an interrupted wind ---
@@ -1177,15 +1473,18 @@ def settings_items(job):
 def layups_from_header(settings):
     """Rebuilds the layup list from a parsed settings header ({key: raw string}).
     Also reads files written before multi-layup support, which stored a single
-    pattern's settings as top-level keys. Settings a file predates keep their
-    defaults -- in particular, its cycle counts stay exactly as written (not
-    auto). Returns None if there's nothing to restore."""
+    pattern's settings as top-level keys. Settings a file predates take the
+    values it was wound with (LAYUP_LEGACY_VALUES), else their defaults -- in
+    particular, its cycle counts stay exactly as written (not auto). Returns
+    None if there's nothing to restore."""
     def parse(values):
         parsed = {}
         for f in fields(Layup):
             if f.name in values:
                 raw = values[f.name].strip()
                 parsed[f.name] = raw.lower() in ("1", "true", "yes", "on") if f.type in (bool, "bool") else float(raw)
+            elif f.name in LAYUP_LEGACY_VALUES:
+                parsed[f.name] = LAYUP_LEGACY_VALUES[f.name]
         return Layup(**parsed)
 
     try:
@@ -1365,7 +1664,19 @@ def _write_events(out, job, events, x, y, angle, a_offset, on_progress=None, fir
     # within the layup).
     wx, wy, wa = float(f"{x:.3f}"), float(f"{y:.3f}"), float(f"{angle:.3f}")
     max_a_speed, max_filament = job.max_a_speed, job.max_filament_speed * 60.0
-    radius = _tank_geometry(job).radius
+    radius = _memoized(_tank_geometry(job).radius)
+    sqrt, radians, floor, max_feed = math.sqrt, math.radians, math.floor, MAX_FEED
+    # X and Y take the same few thousand values on every pass: each is
+    # formatted (and read back as the machine will run it) once.
+    written_as = {}
+
+    def as_written(value):
+        try:
+            return written_as[value]
+        except KeyError:
+            text = f"{value:.3f}"
+            written_as[value] = text, float(text)
+            return written_as[value]
     n_layups = len(job.layups)
     # The program-wide cycle count before each layup: a CycleComplete's number
     # minus this is the cycle's number within its layup.
@@ -1380,10 +1691,19 @@ def _write_events(out, job, events, x, y, angle, a_offset, on_progress=None, fir
             n_moves += 1
             if on_progress is not None and n_moves % PROGRESS_EVERY == 0:
                 on_progress(written)
-            gx, gy, ga = f"{ev.x:.3f}", f"{ev.y:.3f}", f"{(ev.a - a_offset):.3f}"
-            nx, ny, na = float(gx), float(gy), float(ga)
-            # The fiber is laid at the radius where the written move ends.
-            feed = _limited_feed(nx - wx, ny - wy, na - wa, radius(nx), max_a_speed, max_filament)
+            (gx, nx), (gy, ny) = as_written(ev.x), as_written(ev.y)
+            ga = f"{(ev.a - a_offset):.3f}"
+            na = float(ga)
+            # _limited_feed(nx - wx, ny - wy, na - wa, radius(nx), ...), written
+            # out (the same arithmetic) as this runs for every move. The fiber
+            # is laid at the radius where the written move ends.
+            dx, dy, da = nx - wx, ny - wy, abs(na - wa)
+            length = sqrt(dx * dx + dy * dy + da * da)
+            feed = max_a_speed if da <= 0 else max_a_speed * length / da
+            tow = sqrt(dx * dx + (radius(nx) * radians(da)) ** 2)
+            if tow > 0:
+                feed = min(feed, max_filament * length / tow)
+            feed = max(1, floor(min(feed, max_feed)))
             line = f"G1 X{gx} Y{gy} A{ga} F{feed}\n"
             if cycle is None:
                 out.write(line)

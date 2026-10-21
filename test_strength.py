@@ -48,8 +48,14 @@ class Estimate(unittest.TestCase):
         self.assertAlmostEqual(low.burst_pressure, e.burst_pressure, places=6)  # a property of the wall
 
     def test_simulation_counts_tow_on_the_straight_section(self):
-        flat = winding.simulate(WindingJob(end_cap_type="Flat", layups=(Layup(passes=2),)))
+        flat = winding.simulate(WindingJob(end_cap_type="Flat", layups=(Layup(passes=2, x_extension=0.0),)))
         self.assertAlmostEqual(flat.cylinder_tow, flat.total_tow, places=6)  # no domes: all of it
+        # ...even while the eye goes on beyond the tank's ends: the fiber stays at the end.
+        beyond = winding.simulate(WindingJob(end_cap_type="Flat", layups=(Layup(passes=2),)))
+        self.assertAlmostEqual(beyond.cylinder_tow, beyond.total_tow, places=6)
+        # With domes, the turnarounds beyond them never count.
+        domed, domed_beyond = (winding.simulate(WindingJob(layups=(Layup(passes=2, x_extension=e),))) for e in (0.0, 30.0))
+        self.assertAlmostEqual(domed_beyond.cylinder_tow, domed.cylinder_tow, delta=0.02 * domed.cylinder_tow)
         round_ = winding.simulate(WindingJob(layups=(Layup(passes=2),)))
         self.assertLess(round_.cylinder_tow, round_.total_tow)
         self.assertGreater(round_.cylinder_tow, 0.5 * round_.total_tow)
