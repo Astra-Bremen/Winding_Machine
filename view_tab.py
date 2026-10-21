@@ -169,12 +169,17 @@ def _drawing_path(commands, cmd_layups, geometry, job, on_progress=None):
         sides = winding.start_sides(job)
         first, last = job.hoop_span
         half = job.bandwidth / 2
+        first_cycle = 1  # each layup's first cycle, numbered across the program
         for li, layup in enumerate(job.layups):
             if layup.hoop:
-                solids[li] = ("band", first - half, last + half, first - half if sides[li] == 1 else last + half)
+                # (The band is whole once its first pass is: a double 90°
+                # wind's second cycle winds back over it.)
+                solids[li] = ("band", first - half, last + half, first - half if sides[li] == 1 else last + half,
+                              first_cycle)
                 hoop_inside[li] = (first + 1e-6, last - 1e-6)  # drawn as the band, not as strands
             elif winding.plan_layup(job, layup).coverage >= 0.995:
                 solids[li] = ("tank",)
+            first_cycle += layup.passes
     # Dense path: every command, plus in-between points along any move that
     # turns the mandrel by more than RENDER_MAX_DEG_PER_STEP -- drawn as a
     # straight chord, a near-full turn in one 5 mm step would be aliased into a
@@ -561,9 +566,11 @@ class ViewTab:
                 canvas.create_polygon(tank_outline, fill=color, outline=VP["tank_outline"])
                 continue
             if solid is not None and solid[0] == "band":
-                # A 90° wind: the band from where its pass began, up to the eye.
-                _, x_lo, x_hi, x_from = solid
-                x_to = (x_hi if x_from == x_lo else x_lo) if done else min(x_hi, max(x_lo, cmd[0]))
+                # A 90° wind: the band from where its pass began, up to the eye
+                # (whole on a double one's way back).
+                _, x_lo, x_hi, x_from, first_cycle = solid
+                whole = done or (idx < len(data.cycles) and data.cycles[idx] > first_cycle)
+                x_to = (x_hi if x_from == x_lo else x_lo) if whole else min(x_hi, max(x_lo, cmd[0]))
                 if x_to != x_from:
                     canvas.create_rectangle(ox - x_from * scale, oy - rt * scale, ox - x_to * scale, oy + rt * scale,
                                             fill=color, outline="")

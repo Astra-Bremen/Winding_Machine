@@ -23,12 +23,13 @@ MACHINE_FIELDS = [
     ("Max Filament Speed (mm/s)", "max_filament_speed"),
     ("Max Move Time (s)", "max_move_time"),
 ]
-TANK_FIELDS = [("Tank Length (mm)", "tank_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
+TANK_FIELDS = [("Straight Length (mm)", "straight_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
 WINDING_FIELDS = [("Bandwidth / Tow Width (mm)", "bandwidth"), ("Turnaround Zone (mm)", "turnaround_zone")]
 LAYUP_FIELDS = [
     ("Number of Cycles", "passes"),
     ("Pattern Number (Strands per Cycle)", "pattern_number"),
     ("Winding Angle (Degrees)", "wind_angle"),
+    ("Bulkhead Angle (Deg)", "bulkhead_angle"),
     ("Turnaround / Dwell Angle (Deg)", "turnaround_angle"),
     ("Additional X-Axis Travel (mm)", "x_extension"),
 ]
@@ -69,11 +70,13 @@ FIELD_TIPS = {
     # Tank
     "end_cap_type": "Round: spherical domes that close down to the End Cap Diameter; the helical layers wind over "
                     "them. Flat: flat ends, no domes.",
-    "tank_length": "Overall length of the tank (mm), end to end, domes included.",
+    "straight_length": "Length of the tank's straight (cylindrical) section (mm), between the two domes. With round "
+                       "end caps the domes come on top of it: the whole tank is this plus a dome at each end.",
     "tank_diameter": "Outer diameter of the straight section (mm). It also turns Max Rotation Speed, a surface "
                      "speed, into the mandrel's turning speed.",
     "end_cap_diameter": "Diameter (mm) of the polar opening at each dome's tip, where the dome ends and the boss "
-                        "begins. The helical passes turn around there.",
+                        "begins. No layup can turn around closer to the axis than this: winding down to it covers "
+                        "the whole dome.",
     # Winding
     "bandwidth": "Width (mm) of the tow band as it lies on the tank. It decides how many cycles cover the tank "
                  "completely, and how far a 90° wind advances per turn.",
@@ -81,9 +84,10 @@ FIELD_TIPS = {
                        "slows smoothly to a stop at the very end while the mandrel keeps turning, and runs back "
                        "out -- one smooth curve, so the machine never has to brake for a corner. The turnaround's "
                        "rotation is spread over the zone, so no fiber piles up in a ring at the end. Auto (grey): "
-                       f"the dome, so the fiber turns around beyond the straight section ({winding.FLAT_TURNAROUND_ZONE:g} "
-                       "mm with flat end caps). Type a value to fix it; clear the field to go back to auto. "
-                       "0 = turn on the spot at the end (the machine stops there).",
+                       "the dome -- each layup turns over the part of it that it winds (its Bulkhead Angle), so "
+                       "the fiber turns around beyond the straight section "
+                       f"({winding.FLAT_TURNAROUND_ZONE:g} mm with flat end caps). Type a value to fix it; clear the "
+                       "field to go back to auto. 0 = turn on the spot (the machine stops there).",
     "pause_after_layup": "Pauses (PAUSE) after every layup but the last, so the fiber can be checked, e.g. for "
                          "slipping, before the pattern changes. Resume on the machine to continue. Around a 90° "
                          "wind it pauses where the wind starts and ends, on the straight section.",
@@ -95,6 +99,9 @@ FIELD_TIPS = {
             "the straight section: a helical layup after it goes on over that dome at its own angle, turns around "
             "there with its own dwell, and winds back from that end. A Winding Angle above "
             f"{winding.HOOP_ANGLE_THRESHOLD:g}° switches this on.",
+    "double": "Only for a 90° wind: winds it a second time, back to where it began -- exactly like a second 90° "
+              "layup right after it, with the pause between the two (Pause After Each Layup). The layups after it "
+              "then start from the same end this one did.",
     "passes": "How many cycles this layup winds. Each cycle lays one band per strand (Pattern Number), evenly "
               "around the tank, then moves the pattern on. Auto (grey): the fewest cycles that cover the tank "
               "completely, following every change. Type a number to fix it; clear the field to go back to auto.",
@@ -103,18 +110,31 @@ FIELD_TIPS = {
     "wind_angle": "Angle between the fiber and the tank's axis (degrees). Low angles run along the tank and cover "
                   f"the domes; high ones run around it. Above {winding.HOOP_ANGLE_THRESHOLD:g}° the layup becomes "
                   "a 90° wind.",
+    "bulkhead_angle": "How far onto each dome the layup winds before it turns around: the angle at the dome's "
+                      "center (on the axis, where the straight section ends) from the axis to the turning point. "
+                      "90° winds the straight section only; the lower the angle, the closer to the polar opening "
+                      "it turns, and at the opening's own angle (or below) it winds the whole dome. Auto (grey): "
+                      "where the fiber turns by itself at this Winding Angle -- on a round dome at the same angle, "
+                      "but never inside the polar opening. Type a value to fix it; clear the field to go back to "
+                      "auto. The Bulkhead view beside the preview shows it.",
     "turnaround_angle": "Least rotation (degrees) at each end of the tank while the fiber turns around. A little "
                         "more is added where needed, so every circuit lands exactly on the pattern (Extra Rotation "
                         "in the estimates).",
-    "x_extension": "How far beyond each end of the tank the eye turns around (mm). The fiber trails behind the eye, "
-                   "so this lets it reach all the way out to the polar opening. The turnaround stretches out by this "
-                   "much, still one smooth curve, and its extra rotation is counted in the pattern, so every circuit "
-                   "still lands exactly on it. Beyond the ends the eye keeps closing in smoothly until it's Min "
-                   "Spacing from the End Cap Diameter: check that the chuck has room there. 0 = turn around at the "
-                   "tank's ends.",
+    "x_extension": "How much further than where the layup turns (its Bulkhead Angle) the eye goes before turning "
+                   "back (mm). The fiber trails behind the eye, so this lets it reach all the way out to that "
+                   "point. The turnaround stretches out by this much, still one smooth curve, and its extra "
+                   "rotation is counted in the pattern, so every circuit still lands exactly on it. Beyond the "
+                   "tank's ends the eye keeps closing in smoothly until it's Min Spacing from the End Cap Diameter: "
+                   "check that the chuck has room there. 0 = turn around right there; a negative value is set to 0.",
     # Preview
     "show_all": "Draws the first cycle of every layup on the tank at once, each in its own color, with a legend "
                 "below; click a legend entry to select that layup. Off: only the selected layup.",
+    "bulk_single": "Shows a single circuit in the Bulkhead view: one strand coming onto the dome, going around "
+                   "it (dashed where it runs behind) and back off. Off: every circuit of the first cycle, one per "
+                   "strand of the pattern, with the Bulkhead Angle drawn over them -- its line and arc from the "
+                   "dome's center, the turning circle (dashed), the polar opening's angle (dotted) and, with "
+                   "Additional X-Axis Travel, where the eye turns back (▼). While continuing a wind, the view shows "
+                   "what's wound so far.",
 }
 
 # Entry fields use the same compact size as their labels (a ttk style can't
@@ -124,13 +144,31 @@ LEGEND_FONT = ("TkDefaultFont", 8)
 # The Estimates sidebar's rows: compact, a notch below the app's body text.
 ESTIMATE_FONT = ("TkDefaultFont", 9)
 LEGEND_FONT_ACTIVE = ("TkDefaultFont", 8, "bold")
+# The side views' small print: a view's title, its labels, and a value.
+VIEW_TITLE_FONT = ("TkDefaultFont", 8, "bold")
+VIEW_LABEL_FONT = ("TkDefaultFont", 8)
+VIEW_VALUE_FONT = ("TkDefaultFont", 9, "bold")
 SWATCH_W, SWATCH_H = 24, 12
+# The column beside the tank preview: the end-on Eye Reach view on top, the
+# Bulkhead view below it.
+SIDE_COLUMN_W = 196
+BULK_ARROW_X = 12  # where the Bulkhead view's turn arrows sit, from its left edge
+TANK_ARROW_X = 18  # where the tank preview's do (it keeps 40 px clear on each side)
+# The tank preview's margins (px): a band on top for the markers' labels (and
+# warnings), one at the foot for the caption, and room at each side.
+TANK_TOP, TANK_BOTTOM, TANK_SIDE = 64, 40, 40
+END_VIEW_H = 124
+# How much of the straight section the Bulkhead view shows next to the dome
+# (at least), and of the boss beyond it, as a share of the tank's radius --
+# and how far onto the straight section it has the strands to draw, as much
+# as it ever shows of it.
+BULKHEAD_STUB, BULKHEAD_BOSS, BULKHEAD_REACH = 0.45, 0.22, 3.0
 
 
 def layup_caption(layup, sep=" · "):
     """What a layup winds, in short: "45° · 30 cycles", or "90° wind"."""
     if layup.hoop:
-        return "90° wind"
+        return "90° wind ×2" if layup.double else "90° wind"
     return f"{layup.wind_angle:g}°{sep}{layup.passes} cycle{'s' if layup.passes != 1 else ''}"
 
 
@@ -155,36 +193,73 @@ def _set_if_changed(var, value):
         var.set(value)
 
 
-def _preview_runs(job, runs_by_layup):
-    """What the preview draws of some layups' strand runs ({layup: [run of
-    (x, r, A deg)]}): {layup: (fine, coarse)}, each a list of runs thinned
-    (winding.thin_path) with A in radians -- `coarse` for while the view
-    spins, when sub-pixel detail can't be seen anyway -- and a 90° wind's pass
-    left out, since it's drawn as the band it is (only its run onto the
-    straight section stays a strand). Pure: runs on the worker thread,
-    together with the calculation it belongs to."""
+def _drawn_parts(job, layup, runs):
+    # The parts of these runs drawn as strands: all of them -- except a 90°
+    # wind's pass, which is drawn as the band it is (only its run onto the
+    # straight section stays a strand).
+    if not layup.hoop:
+        return runs
     first, last = job.hoop_span
-    drawn = {}
-    for li, runs in runs_by_layup.items():
-        fine, coarse = [], []
-        for run in runs:
-            parts = [run]
-            if job.layups[li].hoop:
-                parts, part = [], []
-                for p in run:
-                    if first + 1e-6 < p[0] < last - 1e-6:
-                        if len(part) >= 2:
-                            parts.append(part)
-                        part = []
-                    else:
-                        part.append(p)
+    parts = []
+    for run in runs:
+        part = []
+        for p in run:
+            if first + 1e-6 < p[0] < last - 1e-6:
                 if len(part) >= 2:
                     parts.append(part)
-            for part in parts:
-                thin = winding.thin_path(part)
-                fine.append([(x, r, math.radians(a)) for x, r, a in thin])
-                coarse.append([(x, r, math.radians(a)) for x, r, a in winding.thin_path(thin, 20.0, 30.0, 3.0)])
-        drawn[li] = fine, coarse
+                part = []
+            else:
+                part.append(p)
+        if len(part) >= 2:
+            parts.append(part)
+    return parts
+
+
+def _bulkhead_parts(job, parts):
+    # What of these runs lies over the far end's dome and the straight section
+    # next to it -- as much of it as the Bulkhead view can show, whatever its
+    # size (BULKHEAD_REACH) -- in finer detail, A in radians.
+    cyl_end = job.chuck_offset + job.tank_length - job.dome_length
+    x_near = max(job.chuck_offset + job.dome_length, cyl_end - BULKHEAD_REACH * job.tank_diameter / 2)
+    out = []
+    for part in parts:
+        near = []
+        for p in list(part) + [None]:  # (a sentinel ends the last stretch)
+            if p is not None and p[0] >= x_near:
+                near.append(p)
+                continue
+            if len(near) >= 2:
+                out.append([(x, r, math.radians(a)) for x, r, a in winding.thin_path(near, 4.0, 6.0, 0.4)])
+            near = []
+    return out
+
+
+def _preview_runs(job, runs_by_layup, first_circuit=None):
+    """What the preview draws of some layups' strand runs ({layup: [run of
+    (x, r, A deg)]}): {layup: (fine, coarse, bulkhead, bulkhead_single)}, each
+    a list of runs thinned (winding.thin_path) with A in radians -- `coarse`
+    for while the view spins, when sub-pixel detail can't be seen anyway;
+    `bulkhead` just what lies over the far end's dome, in finer detail, for
+    the Bulkhead view, and `bulkhead_single` the same of the layup's first
+    circuit alone (from `first_circuit`, {layup: its runs}; else all of them)
+    -- and a 90° wind's pass left out, since it's drawn as the band it is.
+    Pure: runs on the worker thread, together with the calculation it belongs
+    to."""
+    drawn = {}
+    for li, runs in runs_by_layup.items():
+        layup = job.layups[li]
+        parts = _drawn_parts(job, layup, runs)
+        fine, coarse = [], []
+        for part in parts:
+            thin = winding.thin_path(part)
+            fine.append([(x, r, math.radians(a)) for x, r, a in thin])
+            coarse.append([(x, r, math.radians(a)) for x, r, a in winding.thin_path(thin, 20.0, 30.0, 3.0)])
+        bulkhead = _bulkhead_parts(job, parts)
+        if first_circuit is not None and li in first_circuit:
+            single = _bulkhead_parts(job, _drawn_parts(job, layup, first_circuit[li]))
+        else:
+            single = bulkhead
+        drawn[li] = fine, coarse, bulkhead, single
     return drawn
 
 
@@ -196,7 +271,9 @@ def _simulate_for_preview(job, previous=None, report=None):
     drawn = {}
 
     def on_layup(li, strand_runs):
-        drawn.update(_preview_runs(job, {li: [run for runs in strand_runs for run in runs]}))
+        # strand_runs: per circuit of the first cycle, its runs.
+        drawn.update(_preview_runs(job, {li: [run for runs in strand_runs for run in runs]},
+                                   {li: strand_runs[0] if strand_runs else []}))
         if report is not None:
             report((li, drawn[li]))
     result = winding.simulate(job, previous, on_layup)
@@ -207,6 +284,62 @@ def _progress_for_preview(job, point):
     # The tank as wound up to `point`, its runs as the preview draws them.
     progress = winding.progress(job, point)
     return progress._replace(runs=_preview_runs(job, progress.runs))
+
+
+class _Spinner:
+    """Turns a view around the tank's axis while one of its turn arrows is
+    held (see PlanTab._bind_turn_arrows), calling `on_frame()` to redraw it --
+    every frame, and once more at rest (for full detail again).
+
+    Velocity-based rather than a per-press "ease toward a target" animation:
+    an earlier version re-triggered a position-ease curve on every hold-repeat
+    tick, but a cubic ease-in-out has zero slope at its start, so restarting it
+    every ~80ms meant the view barely got moving before being reset again --
+    it visibly slowed the longer the button was held, then lurched through the
+    whole backlog of queued steps in one 350ms burst once released. Tracking
+    actual angular velocity (ramped by acceleration while held, ramped back
+    down by deceleration once released) avoids that entirely: holding longer
+    just means cruising at a steady top speed for longer, and releasing always
+    decelerates smoothly from whatever speed it was actually at."""
+    MAX_SPEED = 220.0  # deg/s
+    ACCEL = 700.0      # deg/s², while held
+    DECEL = 700.0      # deg/s², once released
+
+    def __init__(self, root, on_frame):
+        self._root, self._on_frame = root, on_frame
+        self.azimuth = 0.0   # deg: which side of the tank faces the viewer
+        self.direction = 0   # -1, 0, or +1 -- which way is currently held
+        self.velocity = 0.0  # deg/s, signed
+        self._job = None
+        self._last = None
+
+    @property
+    def moving(self):
+        return self.direction != 0 or abs(self.velocity) > 0.5
+
+    def hold(self, direction):
+        self.direction = direction
+        if self._job is None and self.moving:
+            self._last = time.monotonic()
+            self._tick()
+
+    def _tick(self):
+        now = time.monotonic()
+        dt = max(0.0, min(0.05, now - self._last))
+        self._last = now
+        target = self.direction * self.MAX_SPEED
+        rate = self.ACCEL if self.direction != 0 else self.DECEL
+        if self.velocity < target:
+            self.velocity = min(target, self.velocity + rate * dt)
+        elif self.velocity > target:
+            self.velocity = max(target, self.velocity - rate * dt)
+        self.azimuth = (self.azimuth + self.velocity * dt) % 360.0
+        self._on_frame()
+        if self.moving:
+            self._job = self._root.after(16, self._tick)
+        else:
+            self.velocity, self._job = 0.0, None
+            self._on_frame()  # at rest: full detail again
 
 
 _PARTIAL = object()  # marks a worker's interim report in _BackgroundCalc's queue
@@ -445,29 +578,18 @@ class PlanTab:
         # front-facing (visible) vs. wrapped around the back changes. That split is
         # cheap trig over the cached raw simulation points, so rotating can be
         # redrawn every animation frame without re-running the background simulation.
-        self._view_azimuth = 0.0
-
-        # Rotation is driven by a simple velocity model rather than a per-click
-        # "ease toward a target" animation: while a button is held, angular velocity
-        # ramps up toward a max speed; once released, it ramps back down to zero.
-        # This gives a genuinely smooth accelerate/cruise/decelerate feel for both a
-        # quick tap (a small nudge that speeds up and back down almost immediately)
-        # and a long hold (ramps up to, and cruises at, a steady top speed), with a
-        # single continuous animation loop instead of restarting an ease curve on
-        # every repeat tick (which caused the earlier "slows down the longer you
-        # hold it, then lurches forward on release" bug).
-        self._spin_direction = 0  # -1, 0, or +1 -- which way is currently held
-        self._spin_velocity = 0.0  # deg/s, signed
-        self._spin_job = None
-        self._spin_last_time = None
-        self.SPIN_MAX_SPEED_DEG_S = 220.0
-        self.SPIN_ACCEL_DEG_S2 = 700.0
-        self.SPIN_DECEL_DEG_S2 = 700.0
+        # The tank preview and the Bulkhead view each turn on their own arrows
+        # (see _Spinner).
+        self._tank_spin = _Spinner(self.app.root, self._redraw_tank_strands)
+        self._bulk_spin = _Spinner(self.app.root, self._draw_bulkhead_strands)
 
         # Preview-only (not a G-code setting): draw every layup's first cycle on
         # the tank at once, color-coded, with a legend -- instead of only the
         # layup currently selected in the settings panel.
         self.show_all_var = tk.BooleanVar(value=False)
+        # Preview-only too: the Bulkhead view shows one circuit going around the
+        # dome (on), or every circuit of the first cycle (off).
+        self.bulk_single_var = tk.BooleanVar(value=False)
         self._legend_fonts = (tkfont.Font(font=LEGEND_FONT), tkfont.Font(font=LEGEND_FONT_ACTIVE))
 
         self.setup_ui()
@@ -576,22 +698,38 @@ class PlanTab:
         for button, tip in ((self._prev_btn, "Previous layup"), (self._next_btn, "Next layup"),
                             (self._remove_btn, "Remove this layup"),
                             (self._add_btn, "Add a layup after the last one, with its settings (its Number of "
-                                            "Cycles starts on auto)")):
+                                            "Cycles and Bulkhead Angle start on auto)")):
             ToolTip(button, text=tip, wraplength=300, delay=400)
         layup_frame = ttk.LabelFrame(left_panel, labelwidget=nav, padding=FRAME_PAD, style=FRM)
         layup_frame.pack(fill=tk.X, pady=FRAME_GAP)
         nav.lift(layup_frame)  # a labelwidget must stack above its frame to be visible
         # The 90° switch heads the section: it decides whether the fields below
-        # apply. Its variable is the selected layup's (see _apply_layup_mode).
-        self._hoop_check = ttk.Checkbutton(layup_frame, text="90° Wind (Straight Section Only)",
-                                           style="Settings.TCheckbutton", command=self._on_hoop_toggled)
-        self._hoop_check.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 3))
+        # apply. Beside it, "Double" (a 90° wind's only setting) winds it there
+        # and back. Their variables are the selected layup's (see
+        # _apply_layup_mode).
+        hoop_row = ttk.Frame(layup_frame)
+        hoop_row.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 3))
+        self._hoop_check = ttk.Checkbutton(hoop_row, text="90° Wind", style="Settings.TCheckbutton",
+                                           command=self._on_hoop_toggled)
+        self._hoop_check.pack(side=tk.LEFT)
         self._add_tip("hoop", self._hoop_check)
+        self._double_check = ttk.Checkbutton(hoop_row, text="Double", style="Settings.TCheckbutton",
+                                             command=self._on_double_toggled)
+        self._double_check.pack(side=tk.LEFT, padx=(18, 0))
+        self._add_tip("double", self._double_check)
         add_fields(layup_frame, LAYUP_FIELDS, first_row=1, store=self.layup_entries)
         # What a 90° wind's greyed-out fields show instead of its (unused)
-        # helical settings: one pass, its actual angle, no pattern or dwell.
+        # helical settings: its pass(es), its actual angle, the straight
+        # section only (90°), no pattern, dwell or travel beyond. A field that
+        # doesn't apply to the tank (the Bulkhead Angle with flat end caps)
+        # shows "—" the same way.
         self._hoop_display = {key: tk.StringVar(value="—") for key in self.layup_entries}
         self._hoop_display["passes"].set("1")
+        self._hoop_display["bulkhead_angle"].set("90")
+        self._no_value = tk.StringVar(value="—")
+        for key, check in (("x_extension", self._validate_x_extension), ("bulkhead_angle", self._validate_bulkhead)):
+            self.layup_entries[key].bind("<FocusOut>", check, add="+")
+            self.layup_entries[key].bind("<Return>", check, add="+")
         self._angle_before_edit = None
         self.layup_entries["wind_angle"].bind("<FocusIn>", self._remember_angle, add="+")
         # Angles too close to 0/90 deg aren't physically realizable for the
@@ -605,6 +743,10 @@ class PlanTab:
         self._cycles_field = AutoEntry(self, self.layup_entries["passes"],
                                        lambda: self.app.layups[self.app.active_layup]["auto_cycles"],
                                        self._cycles_mode_changed)
+        # Auto: where the fiber turns by itself at the layup's winding angle.
+        self._bulkhead_field = AutoEntry(self, self.layup_entries["bulkhead_angle"],
+                                         lambda: self.app.layups[self.app.active_layup]["bulkhead_auto"],
+                                         self._bulkhead_mode_changed)
 
         # Side by side, equal widths: the primary action filled, the secondary
         # one outlined in the same color.
@@ -619,14 +761,21 @@ class PlanTab:
         ttk.Button(actions, text="Export Partial G-Code…", command=self.app.show_partial_page,
                    style="primary.Outline.TButton").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0), ipady=1)
 
-        # Visualization Section. Bottom strip first (so it claims its height
-        # before the row above expands): the "Show All Layups" toggle plus the
-        # legend it reveals. Above it, left to right: rotate-view arrows, the
-        # main (pseudo-3D) tank canvas, a thin end-on view keeping the eye-reach
-        # lines, and the Estimates sidebar. Packed right-to-left/then-left-to-right
-        # so the visual order ends up: [arrows][3D canvas][end view][estimates].
-        bottom_bar = ttk.Frame(self.viz_parent)
-        bottom_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        # Visualization Section, a grid: on top, left to right, the main
+        # (pseudo-3D) tank canvas, a column with the end-on view keeping the
+        # eye-reach lines over the Bulkhead view, and the Estimates sidebar
+        # (the full height). Below, the views' checkboxes in one row, on one
+        # line: "Show All Layups" (with the legend it reveals) under the tank
+        # canvas, "View Single" under the Bulkhead view. Both views' turn
+        # arrows are drawn inside them (see _draw_turn_arrows).
+        viz_row = ttk.Frame(self.viz_parent)
+        viz_row.pack(fill=tk.BOTH, expand=True)
+        viz_row.columnconfigure(0, weight=1)
+        viz_row.rowconfigure(0, weight=1)
+        CHECK_PAD = (6, 0)  # above the checkbox row
+
+        bottom_bar = ttk.Frame(viz_row)
+        bottom_bar.grid(row=1, column=0, sticky="new", pady=CHECK_PAD)
         show_all = ttk.Checkbutton(bottom_bar, text="Show All Layups", variable=self.show_all_var,
                                    style="Settings.TCheckbutton", command=self._on_show_all_toggled)
         show_all.pack(side=tk.LEFT, anchor="n")
@@ -635,47 +784,43 @@ class PlanTab:
         self.legend_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(18, 0))
         self.legend_canvas.bind("<Configure>", lambda e: self._draw_legend())
 
-        viz_row = ttk.Frame(self.viz_parent)
-        viz_row.pack(fill=tk.BOTH, expand=True)
+        self._build_estimates_panel(viz_row).grid(row=0, column=2, rowspan=2, sticky="ns")
 
-        self._build_estimates_panel(viz_row)
-
-        self.end_canvas = tk.Canvas(viz_row, bg=self.app.canvas_palette["canvas_bg"], relief="flat",
-                                     borderwidth=1, highlightthickness=1,
-                                     highlightbackground=self.app.canvas_palette["shaft_outline"], width=110)
-        self.end_canvas.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 6))
+        # The column: the end view on top, the Bulkhead view under it -- the
+        # same width and frame. The Bulkhead view's own turn arrows are drawn
+        # inside it, at its left edge (see _draw_turn_arrows), so nothing
+        # sticks out of the column.
+        side_column = ttk.Frame(viz_row, width=SIDE_COLUMN_W)
+        side_column.grid(row=0, column=1, sticky="ns", padx=(6, 6))
+        side_column.grid_propagate(False)
+        side_column.columnconfigure(0, weight=1)
+        side_column.rowconfigure(1, weight=1)
+        canvas_style = dict(bg=self.app.canvas_palette["canvas_bg"], relief="flat", borderwidth=1, highlightthickness=1,
+                            highlightbackground=self.app.canvas_palette["shaft_outline"])
+        self.end_canvas = tk.Canvas(side_column, height=END_VIEW_H, **canvas_style)
+        self.end_canvas.grid(row=0, column=0, sticky="ew")
         self.end_canvas.bind("<Configure>", lambda e: self.schedule_redraw())
-
-        rotate_frame = ttk.Frame(viz_row, padding=(0, 0, 4, 0))
-        rotate_frame.pack(side=tk.LEFT, fill=tk.Y)
-        rotate_frame.rowconfigure(0, weight=1)
-        rotate_frame.rowconfigure(3, weight=1)
-        ttk.Frame(rotate_frame).grid(row=0, column=0)
-        pal = self.app.canvas_palette
-        up_btn = tk.Button(rotate_frame, text="▲",
-                            relief="flat", bd=0, highlightthickness=0, font=("TkDefaultFont", 13),
-                            fg=pal["muted"], activeforeground=pal["tank"], cursor="hand2")
-        up_btn.grid(row=1, column=0, pady=(0, 4))
-        up_btn.bind("<ButtonPress-1>", lambda e: self._set_spin_direction(-1))
-        up_btn.bind("<ButtonRelease-1>", lambda e: self._set_spin_direction(0))
-        up_btn.bind("<Leave>", lambda e: self._set_spin_direction(0))
-        down_btn = tk.Button(rotate_frame, text="▼",
-                              relief="flat", bd=0, highlightthickness=0, font=("TkDefaultFont", 13),
-                              fg=pal["muted"], activeforeground=pal["tank"], cursor="hand2")
-        down_btn.grid(row=2, column=0, pady=(4, 0))
-        down_btn.bind("<ButtonPress-1>", lambda e: self._set_spin_direction(1))
-        down_btn.bind("<ButtonRelease-1>", lambda e: self._set_spin_direction(0))
-        down_btn.bind("<Leave>", lambda e: self._set_spin_direction(0))
-        ttk.Frame(rotate_frame).grid(row=3, column=0)
-        self._rotate_buttons = (up_btn, down_btn)
-        for button in self._rotate_buttons:
-            ToolTip(button, text="Hold to turn the view around the tank's axis.", wraplength=300, delay=400)
+        # The selected layup's turnaround up close: one dome in profile, its
+        # Bulkhead Angle, and its first cycle's strands over it -- one circuit
+        # or all of them ("View Single"), turned on arrows of its own.
+        self.bulkhead_canvas = tk.Canvas(side_column, height=1, **canvas_style)
+        self.bulkhead_canvas.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.bulkhead_canvas.bind("<Configure>", lambda e: self.schedule_redraw())
+        self._bind_turn_arrows(self.bulkhead_canvas, self._bulk_spin)
+        # In the checkbox row, under the Bulkhead view (lined up with it).
+        self._bulk_single_check = ttk.Checkbutton(viz_row, text="View Single", variable=self.bulk_single_var,
+                                                  style="Settings.TCheckbutton", command=self._draw_bulkhead_strands)
+        self._bulk_single_check.grid(row=1, column=1, sticky="nw", padx=(6, 6), pady=CHECK_PAD)
+        self._add_tip("bulk_single", self._bulk_single_check)
+        self._bulk_geom = None     # (scale, junction x, axis y) the Bulkhead view is drawn with
+        self._bulk_outline = None  # the dome's silhouette there (screen points)
 
         self.canvas = tk.Canvas(viz_row, bg=self.app.canvas_palette["canvas_bg"], relief="flat",
                                  borderwidth=1, highlightthickness=1,
                                  highlightbackground=self.app.canvas_palette["shaft_outline"])
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", lambda e: self.schedule_redraw())
+        self._bind_turn_arrows(self.canvas, self._tank_spin)
         self.on_cap_type_change()
 
     def _build_estimates_panel(self, parent):
@@ -687,8 +832,8 @@ class PlanTab:
         # Hovering a row says what it shows; clicking the rotation or X-speed
         # changes their units. The masses and the safety factor come from
         # strength.estimate(), set up in the Strength & Materials window.
+        # Returned to be placed by the caller.
         panel = ttk.Frame(parent, padding=(12, 0, 2, 0))
-        panel.pack(side=tk.RIGHT, fill=tk.Y)
         panel.columnconfigure(1, weight=1)
         self.est, self._est_values = {}, {}
 
@@ -751,6 +896,7 @@ class PlanTab:
         self._xspeed_mm_s = 0.0
         self._xspeed_unit_idx = 0
         self.XSPEED_UNITS = ["mm/s", "m/s"]
+        return panel
 
     # --- Hover explanations ---
 
@@ -780,24 +926,47 @@ class PlanTab:
                 notes["start_x"] = f"Allowed on this tank: X {lo:.1f} to {hi:.1f} mm.{auto}"
             else:
                 notes["start_x"] = "Not used while homing is off: the wind then starts at the tank's end."
+            round_caps = job.end_cap_type == "Round" and job.dome_length > 0
+            x_start, x_end = job.chuck_offset, job.chuck_offset + job.tank_length
+            notes["straight_length"] = (f"The whole tank: {job.tank_length:.1f} mm end to end, a {job.dome_length:.1f} "
+                                        f"mm dome at each end (X {x_start:g}–{x_end:.1f})." if round_caps else
+                                        "With flat end caps the whole tank is the straight section.")
             if job.end_cap_type == "Flat":
                 notes["end_cap_diameter"] = "Not used with flat end caps."
+            elif round_caps:
+                notes["end_cap_diameter"] = (f"Its Bulkhead Angle: {winding.opening_angle(job):.1f}° -- a layup "
+                                             "at this or lower winds the whole dome.")
             if job.turnaround_zone_auto:
-                where = "the dome" if job.end_cap_type == "Round" else "flat end caps"
-                notes["turnaround_zone"] = f"Auto now: {job.turnaround_zone:.1f} mm ({where})."
+                where = "the dome; each layup turns over the part it winds" if round_caps else "flat end caps"
+                notes["turnaround_zone"] = f"Auto now: up to {job.turnaround_zone:.1f} mm ({where})."
             notes["turnaround_zone"] = ((notes["turnaround_zone"] + " " if notes["turnaround_zone"] else "")
-                                        + f"At most {job.tank_length / 2:g} mm on this tank (half its length).")
+                                        + f"At most {job.tank_length / 2:g} mm on this tank (half its whole length).")
             if len(job.layups) == 1:
                 notes["pause_after_layup"] = "With a single layup there's nothing to pause between."
             if layup.hoop:
-                notes["passes"] = "A 90° wind is always exactly one pass."
+                notes["passes"] = ("A double 90° wind is two passes: there and back." if layup.double
+                                   else "A 90° wind is always exactly one pass.")
                 notes["pattern_number"] = notes["turnaround_angle"] = "Not used by a 90° wind."
                 notes["wind_angle"] = f"Not used by a 90° wind: it winds at {job.hoop_angle:.1f}°."
                 notes["x_extension"] = "Not used by a 90° wind: it stays on the straight section."
+                notes["bulkhead_angle"] = "A 90° wind stays on the straight section: 90°."
             else:
-                x_start, x_end = job.chuck_offset, job.chuck_offset + job.tank_length
-                notes["x_extension"] = (f"This layup turns around at X {x_start - layup.x_extension:.1f} and "
-                                        f"X {x_end + layup.x_extension:.1f} (the tank spans {x_start:g}–{x_end:g}).")
+                notes["double"] = "Only for a 90° wind."
+                turn_lo, turn_hi = winding.turn_points(job, layup)
+                notes["x_extension"] = (f"This layup's eye turns at X {turn_lo - layup.x_extension:.1f} and "
+                                        f"X {turn_hi + layup.x_extension:.1f} (the tank spans {x_start:g}–{x_end:.1f}).")
+                if round_caps:
+                    cover = winding.bulkhead_cover(job, layup)
+                    auto = winding.auto_bulkhead_angle(job, layup.wind_angle)
+                    whole = cover >= job.dome_length
+                    notes["bulkhead_angle"] = (
+                        (f"Auto now: {auto:.1f}°. " if layup.bulkhead_auto else f"Auto would be {auto:.1f}°. ")
+                        + ("This layup winds the whole dome" if whole else
+                           f"This layup winds {cover:.1f} of each dome's {job.dome_length:.1f} mm")
+                        + f", turning at X {turn_lo:.1f} and X {turn_hi:.1f}. The whole dome from "
+                          f"{winding.opening_angle(job):.1f}° (the polar opening) down.")
+                else:
+                    notes["bulkhead_angle"] = "Not used with flat end caps: there's no dome."
                 needed = winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth,
                                                       layup.pattern_number)
                 if needed is not None:
@@ -848,6 +1017,17 @@ class PlanTab:
             self.app.set_status(f"{prefix}Number of Cycles set to {value} and fixed there. "
                                 "Clear the field to put it back on auto (full coverage).")
 
+    def _bulkhead_mode_changed(self, auto):
+        n = len(self.app.layups)
+        prefix = f"Layup {self.app.active_layup + 1}: " if n > 1 else ""
+        value = self.layup_entries["bulkhead_angle"].get().strip()
+        if auto:
+            self.app.set_status(f"{prefix}Bulkhead Angle is back on auto -- {value}°, where the fiber turns by "
+                                "itself at this winding angle.")
+        else:
+            self.app.set_status(f"{prefix}Bulkhead Angle set to {value}° and fixed there. "
+                                "Clear the field to put it back on auto.")
+
     def _zone_mode_changed(self, auto):
         value = self._zone_field.entry.get().strip()
         if auto:
@@ -873,8 +1053,13 @@ class PlanTab:
         # A field the user is typing in is left alone until they leave it, so a
         # cleared field isn't refilled under their cursor.
         editing = self._cycles_field.editing()
+        editing_bulkhead = self._bulkhead_field.editing()
         for i, (layup_vars, layup) in enumerate(zip(self.app.layups, job.layups)):
-            if not layup.auto_cycles or layup.hoop or (editing and i == self.app.active_layup):
+            if layup.hoop:
+                continue
+            if layup.bulkhead_auto and not (editing_bulkhead and i == self.app.active_layup):
+                _set_if_changed(layup_vars["bulkhead_angle"], round(layup.bulkhead_angle, 1))
+            if not layup.auto_cycles or (editing and i == self.app.active_layup):
                 continue
             if winding.full_coverage_cycles(job.tank_diameter, layup.wind_angle, job.bandwidth, layup.pattern_number) is None:
                 continue  # not computable right now; geometry_errors() explains why
@@ -888,6 +1073,7 @@ class PlanTab:
         self._start_x_entry.state(state)
         self._start_x_label.state(state)
         self._cycles_field.refresh()
+        self._bulkhead_field.refresh()
         self._start_x_field.refresh()
         self._zone_field.refresh()
 
@@ -913,6 +1099,7 @@ class PlanTab:
         self._remove_btn.configure(state="normal" if n > 1 else "disabled")
         self._draw_layup_swatch()
         self._cycles_field.rebind()
+        self._bulkhead_field.rebind()
         # Redraw right away rather than debounced: nothing here is slow (a
         # switch that doesn't change any setting redraws from the cached
         # simulation), and an instant response is what makes switching feel snappy.
@@ -928,18 +1115,52 @@ class PlanTab:
         # unchecking the box brings them straight back.
         layup_vars = self.app.layups[self.app.active_layup]
         self._hoop_check.configure(variable=layup_vars["hoop"])
+        self._double_check.configure(variable=layup_vars["double"])
         hoop = self._is_hoop(layup_vars)
+        # "Double" is a 90° wind's own setting.
+        self._double_check.state(["!disabled"] if hoop else ["disabled"])
+        self._hoop_display["passes"].set("2" if hoop and self._is_set(layup_vars["double"]) else "1")
+        # Without a dome there's no Bulkhead Angle to set.
+        flat = self.app.params["end_cap_type"].get() == "Flat"
         for key, entry in self.layup_entries.items():
-            entry.configure(textvariable=self._hoop_display[key] if hoop else layup_vars[key])
-            entry.state(["disabled"] if hoop else ["!disabled"])
+            if hoop:
+                variable, off = self._hoop_display[key], True
+            elif key == "bulkhead_angle" and flat:
+                variable, off = self._no_value, True
+            else:
+                variable, off = layup_vars[key], False
+            entry.configure(textvariable=variable)
+            entry.state(["disabled"] if off else ["!disabled"])
         self._cycles_field.refresh()
+        self._bulkhead_field.refresh()
+
+    @staticmethod
+    def _is_set(var):
+        try:
+            return bool(var.get())
+        except tk.TclError:
+            return False
 
     @staticmethod
     def _is_hoop(layup_vars):
-        try:
-            return bool(layup_vars["hoop"].get())
-        except tk.TclError:
-            return False
+        return PlanTab._is_set(layup_vars["hoop"])
+
+    def _on_double_toggled(self):
+        layup_vars = self.app.layups[self.app.active_layup]
+        i, n = self.app.active_layup, len(self.app.layups)
+        prefix = f"Layup {i + 1}: " if n > 1 else ""
+        if self._is_set(layup_vars["double"]):
+            text = ("the 90° wind goes there and back, pausing at the far end like between two layups." if prefix
+                    else "The 90° wind goes there and back, pausing at the far end like between two layups.")
+            if i < n - 1:
+                text += f" The layup{'s' if i < n - 2 else ''} after it now start{'' if i < n - 2 else 's'} from the same end it does."
+        else:
+            text = "the 90° wind is a single pass again." if prefix else "The 90° wind is a single pass again."
+            if i < n - 1:
+                text += f" The layup{'s' if i < n - 2 else ''} after it now start{'' if i < n - 2 else 's'} from the other end."
+        self.app.set_status(prefix + text)
+        self._apply_layup_mode()
+        self._redraw_now()
 
     def _on_hoop_toggled(self):
         # The checkbox itself was clicked.
@@ -959,7 +1180,8 @@ class PlanTab:
         i, n = self.app.active_layup, len(self.app.layups)
         prefix = f"Layup {i + 1}: " if n > 1 else ""
         text = prefix + (text if prefix else text[:1].upper() + text[1:])
-        if i < n - 1:
+        # (A double one winds back to where it began: nothing after it moves.)
+        if i < n - 1 and not self._is_set(self.app.layups[i]["double"]):
             text += f" The layup{'s' if i < n - 2 else ''} after it now start{'' if i < n - 2 else 's'} from the other end."
         self.app.set_status(text)
 
@@ -1003,7 +1225,8 @@ class PlanTab:
         self._validate_wind_angle()
         self.app.add_layup()
         n = len(self.app.layups)
-        self.app.set_status(f"Layup {n} added with the settings of Layup {n - 1}; its Number of Cycles is on auto.")
+        self.app.set_status(f"Layup {n} added with the settings of Layup {n - 1}; its Number of Cycles and "
+                            "Bulkhead Angle are on auto.")
 
     def _remove_layup(self):
         index = self.app.active_layup
@@ -1026,12 +1249,11 @@ class PlanTab:
         if self._is_hoop(layup_vars):
             return  # its angle field isn't in use
         try:
-            lt = float(self.app.params["tank_length"].get())
-            dt = float(self.app.params["tank_diameter"].get())
-            bandwidth = float(self.app.params["bandwidth"].get())
+            job = self.app.build_job()  # for the whole tank's length
             angle = float(layup_vars["wind_angle"].get())
-        except (tk.TclError, ValueError):
+        except (winding.SettingsError, tk.TclError, ValueError):
             return  # field is mid-edit / not a valid number yet -- leave it alone
+        lt, dt, bandwidth = job.tank_length, job.tank_diameter, job.bandwidth
         if angle > winding.HOOP_ANGLE_THRESHOLD:
             # Steeper than that is a 90° wind: switch the layup over.
             keep = self._settle_helical_angle(layup_vars)
@@ -1050,11 +1272,55 @@ class PlanTab:
             layup_vars["wind_angle"].set(round(angle_max, 2))
             self.app.set_status(f"Winding Angle{which} lowered to {angle_max:.2f}° -- the highest realistic angle for this tank/tow width (above it, each wrap would overlap the last).")
 
+    def _validate_x_extension(self, event=None):
+        # The eye can't turn around before it gets there: a negative Additional
+        # X-Axis Travel is set to 0 once the user leaves the field, the way an
+        # angle above the 90° threshold turns the layup into a 90° wind.
+        layup_vars = self.app.layups[self.app.active_layup]
+        if self._is_hoop(layup_vars):
+            return
+        try:
+            value = float(layup_vars["x_extension"].get())
+        except (tk.TclError, ValueError):
+            return
+        if value < 0:
+            layup_vars["x_extension"].set(0.0)
+            which = f" for Layup {self.app.active_layup + 1}" if len(self.app.layups) > 1 else ""
+            self.app.set_status(f"Additional X-Axis Travel{which} set to 0 mm -- it can't be negative: the eye "
+                                "then turns around right where the layup does.")
+
+    def _validate_bulkhead(self, event=None):
+        # Within what the dome allows: down to the polar opening's angle (the
+        # whole dome; anything lower winds just the same) and up to 90° (the
+        # straight section only). An emptied field is going back to auto.
+        layup_vars = self.app.layups[self.app.active_layup]
+        if self._is_hoop(layup_vars) or self._is_set(layup_vars["bulkhead_auto"]):
+            return
+        try:
+            angle = float(layup_vars["bulkhead_angle"].get())
+            job = self.app.build_job()
+        except (winding.SettingsError, tk.TclError, ValueError):
+            return
+        if job.end_cap_type != "Round":
+            return
+        # Shown to one decimal, rounded down: still at or below the opening.
+        lowest = math.floor(winding.opening_angle(job) * 10) / 10
+        which = f" for Layup {self.app.active_layup + 1}" if len(self.app.layups) > 1 else ""
+        if angle < lowest:
+            layup_vars["bulkhead_angle"].set(lowest)
+            self.app.set_status(f"Bulkhead Angle{which} raised to {lowest:.1f}° -- the polar opening's: the "
+                                "layup winds the whole dome, and can't turn any closer to the axis.")
+        elif angle > 90:
+            layup_vars["bulkhead_angle"].set(90.0)
+            self.app.set_status(f"Bulkhead Angle{which} lowered to 90° -- the straight section only.")
+
     def on_cap_type_change(self, *args):
         if self.app.params["end_cap_type"].get() == "Flat":
             self.tank_entries["end_cap_diameter"].config(state="disabled")
         else:
             self.tank_entries["end_cap_diameter"].config(state="normal")
+        if self.layup_entries:  # (not yet while the panel is being built)
+            self._apply_layup_mode()  # the Bulkhead Angle needs a dome
         self.schedule_redraw()
 
     def on_theme_changed(self):
@@ -1086,12 +1352,11 @@ class PlanTab:
         # Colors (and the border) are set on every redraw: ttkbootstrap's theme
         # switch recolors plain Tk widgets and drops canvas borders.
         self.canvas.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"], highlightthickness=1)
-        panel_bg = self.app.root.style.colors.bg
-        for btn in self._rotate_buttons:
-            btn.configure(fg=pal["muted"], activeforeground=pal["tank"], bg=panel_bg, activebackground=panel_bg)
         self.generate_btn.config(state="disabled")
         self._view_geom = None
         c_w, c_h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        # Centered on the tank's axis (see _draw_tank).
+        self._draw_turn_arrows(self.canvas, TANK_ARROW_X, TANK_TOP + (c_h - TANK_TOP - TANK_BOTTOM) / 2.0, 13, 14)
 
         try:
             job = self.app.build_job()
@@ -1102,6 +1367,7 @@ class PlanTab:
                                         fill=pal["muted"], font=("TkDefaultFont", 10))
             self._draw_legend()
             self._cycles_field.refresh()
+            self._bulkhead_field.refresh()
             self._start_x_field.refresh()
             self._zone_field.refresh()
             self._update_speed_limit(None, None)
@@ -1121,6 +1387,7 @@ class PlanTab:
             self._draw_tank(job, c_w, c_h)
             self._draw_end_view(job.tank_diameter / 2, job.eye_arm_length)
             self._draw_start_marker()
+        self._draw_bulkhead_view(job)
         self._draw_warnings(errors, c_w)
         self._draw_caption()
         self._draw_legend()
@@ -1147,22 +1414,24 @@ class PlanTab:
         rt, rc = dt / 2, dc / 2
 
         # Scale and offset: the tank as large as the canvas allows, centered.
-        # Across: the tank's X-center in the middle, with room for the shaft's
-        # extension beyond the tank and for X=0 (the chuck side) so neither
-        # side gets clipped. Down: the tank's diameter plus a band above for
-        # the markers' labels (and warnings) and one below for the caption.
-        # (The end view beside it shows the eye's reach, so no vertical room
-        # needs keeping for that here.)
-        top, bottom, side = 64, 40, 40
-        half_extent = max(co + lt / 2.0, lt / 2.0 + 100)
+        # Across: the tank's X-center in the middle, with a mounting rod of the
+        # same length at each end (as long as the chuck side's, from X=0, within
+        # limits), so the whole assembly sits centered. Down: the tank's
+        # diameter plus a band above for the markers' labels (and warnings) and
+        # one below for the caption. (The end view beside it shows the eye's
+        # reach, so no vertical room needs keeping for that here.)
+        top, bottom, side = TANK_TOP, TANK_BOTTOM, TANK_SIDE
+        rod = min(max(co, 30.0), 150.0)
+        half_extent = lt / 2.0 + rod
         scale = max(0.01, min((c_w / 2.0 - side) / half_extent, (c_h - top - bottom) / max(dt, 1.0)))
         ox = c_w / 2.0 + (co + lt / 2.0) * scale
         oy = top + (c_h - top - bottom) / 2.0
         self._view_geom = (scale, ox, oy)
 
-        # Draw center line / shaft
+        # The shaft through the tank, the rod sticking out at both ends.
         shaft_w = (dc if cap_type == "Round" else dt) * scale
-        self.canvas.create_rectangle(ox - (co + lt + 100) * scale, oy - shaft_w/2, ox, oy + shaft_w/2, fill=pal["shaft"], outline=pal["shaft_outline"])
+        self.canvas.create_rectangle(ox - (co + lt + rod) * scale, oy - shaft_w / 2, ox - (co - rod) * scale,
+                                     oy + shaft_w / 2, fill=pal["shaft"], outline=pal["shaft_outline"])
 
         # Draw Tank (with a subtle vertical shading band to read as a cylinder
         # rather than a flat rectangle -- the outer silhouette itself never
@@ -1240,8 +1509,12 @@ class PlanTab:
             text = f"All {n} layups · first cycle of each"
         else:
             i = self.app.active_layup
-            hoop = i < len(self._job.layups) and self._job.layups[i].hoop
-            text = f"Layup {i + 1} of {n} · " + ("90° wind over the straight section" if hoop else "first cycle")
+            layup = self._job.layups[i] if i < len(self._job.layups) else None
+            if layup is not None and layup.hoop:
+                what = "90° wind there and back" if layup.double else "90° wind over the straight section"
+            else:
+                what = "first cycle"
+            text = f"Layup {i + 1} of {n} · {what}"
             if i < len(self._job.layups) and winding.start_sides(self._job)[i] == -1:
                 text += " · from the far end"
         self.canvas.create_text(10, c_h - 8, text=text, anchor="sw", fill=self.app.canvas_palette["muted"],
@@ -1540,15 +1813,20 @@ class PlanTab:
     # --- Strands ---
 
     def _redraw_strands(self):
+        # The strands in both views: the tank preview and the Bulkhead view.
+        self._redraw_tank_strands()
+        self._draw_bulkhead_strands()
+
+    def _redraw_tank_strands(self):
         # Draws the wound strands: normally the selected layup's first cycle --
         # or, with "Show All Layups", every layup's first cycle -- and while the
         # partial page is open, the tank as wound up to the continue point.
         # Only front-facing path segments are drawn; which portions count as
-        # "front" depends on self._view_azimuth, so this alone is re-run (cheaply)
-        # on every rotate-animation frame, while the tank/shaft/end-view stay
-        # untouched. Only results calculated from the exact settings on screen
-        # are ever drawn -- while the simulation still runs, the layups it has
-        # got through so far.
+        # "front" depends on the view's azimuth (self._tank_spin), so this alone
+        # is re-run (cheaply) on every rotate-animation frame, while the
+        # tank/shaft/end-view stay untouched. Only results calculated from the
+        # exact settings on screen are ever drawn -- while the simulation still
+        # runs, the layups it has got through so far.
         self.canvas.delete("strand_path")
         if self.partial_point is not None:
             self._draw_progress()
@@ -1572,7 +1850,7 @@ class PlanTab:
                     self._draw_runs(li, runs[li][self._detail()])
         # Strand paths draw on top of everything else drawn synchronously (tank,
         # warnings); keep the markers, caption and calc indicator above that.
-        for tag in ("start_marker", "continue_marker", "eye", "caption", "calc_indicator"):
+        for tag in ("start_marker", "continue_marker", "eye", "caption", "calc_indicator", "turn_arrows"):
             self.canvas.tag_raise(tag)
 
     def _draw_runs(self, layup_index, runs):
@@ -1584,7 +1862,7 @@ class PlanTab:
         # coverage) then close up instead of showing slivers of tank.
         style = dict(fill=color, width=max(1, math.ceil(self._job.bandwidth * scale)), capstyle=tk.ROUND,
                      dash=dash or "", tags="strand_path")
-        az = math.radians(self._view_azimuth)
+        az = math.radians(self._tank_spin.azimuth)
         sin, cos, create_line = math.sin, math.cos, self.canvas.create_line
         for run in runs:
             line = []
@@ -1603,7 +1881,7 @@ class PlanTab:
     def _detail(self):
         # Which of _preview_runs' levels of detail to draw: the coarse one while
         # the view spins (redrawn every frame), the fine one once it rests.
-        return 1 if self._spin_direction != 0 or abs(self._spin_velocity) > 0.5 else 0
+        return 1 if self._tank_spin.moving else 0
 
     def _draw_band(self, layup_index, x_from, x_to):
         # A 90° wind: its bands lie edge to edge, so it's drawn as the solid band
@@ -1638,11 +1916,13 @@ class PlanTab:
                                            tags="strand_path")
                 continue
             if job.layups[li].hoop:
-                # The band from where the pass began -- to the eye while it's wound.
+                # The band from where the pass began -- to the eye while it's
+                # wound (a double one's way back runs over the finished band).
                 first, last = job.hoop_span
                 lo, hi = first - job.bandwidth / 2, last + job.bandwidth / 2
                 start, end = (lo, hi) if sides[li] == 1 else (hi, lo)
-                if li == progress.location.point.layup:
+                point = progress.location.point
+                if li == point.layup and point.cycle == 0:
                     end = min(hi, max(lo, progress.location.x))
                 self._draw_band(li, start, end)
             if li in progress.runs:
@@ -1667,43 +1947,6 @@ class PlanTab:
         self.canvas.create_rectangle(px - half_w, eye_y - 4, px + half_w, eye_y + 4, fill=pal["marker"],
                                      outline=pal["marker_halo"], tags="eye")
 
-    # --- View rotation (up/down arrows) ---
-    # Velocity-based rather than a per-press "ease toward a target" animation: an
-    # earlier version re-triggered a position-ease curve on every hold-repeat tick,
-    # but a cubic ease-in-out has zero slope at its start, so restarting it every
-    # ~80ms meant the view barely got moving before being reset again -- it visibly
-    # slowed the longer the button was held, then lurched through the whole
-    # backlog of queued steps in one 350ms burst once released. Tracking actual
-    # angular velocity (ramped by acceleration while held, ramped back down by
-    # deceleration once released) avoids that entirely: holding longer just means
-    # cruising at a steady top speed for longer, and releasing always decelerates
-    # smoothly from whatever speed it was actually at.
-
-    def _set_spin_direction(self, direction):
-        self._spin_direction = direction
-        if self._spin_job is None:
-            self._spin_last_time = time.monotonic()
-            self._spin_tick()
-
-    def _spin_tick(self):
-        now = time.monotonic()
-        dt = max(0.0, min(0.05, now - self._spin_last_time))
-        self._spin_last_time = now
-        target_v = self._spin_direction * self.SPIN_MAX_SPEED_DEG_S
-        rate = self.SPIN_ACCEL_DEG_S2 if self._spin_direction != 0 else self.SPIN_DECEL_DEG_S2
-        if self._spin_velocity < target_v:
-            self._spin_velocity = min(target_v, self._spin_velocity + rate * dt)
-        elif self._spin_velocity > target_v:
-            self._spin_velocity = max(target_v, self._spin_velocity - rate * dt)
-        self._view_azimuth = (self._view_azimuth + self._spin_velocity * dt) % 360.0
-        self._redraw_strands()
-        if self._spin_direction != 0 or abs(self._spin_velocity) > 0.5:
-            self._spin_job = self.app.root.after(16, self._spin_tick)
-        else:
-            self._spin_velocity = 0.0
-            self._spin_job = None
-            self._redraw_strands()  # at rest: full detail again
-
     # --- Cosmetic pseudo-3D tank shading ---
 
     def _draw_cylinder_shading(self, tank_top, tank_bottom):
@@ -1719,24 +1962,291 @@ class PlanTab:
     # --- Thin end-on view: keeps the eye Min/Max reach lines from the old 2D view ---
 
     def _draw_end_view(self, rt, arm):
+        # The tank end-on, with how close to and how far from its axis the eye
+        # can get (Y at its travel's ends). The axis sits low, as the eye only
+        # ever works above it.
         pal = self.app.canvas_palette
-        self.end_canvas.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"], highlightthickness=1)
-        self.end_canvas.delete("all")
-        w, h = self.end_canvas.winfo_width(), self.end_canvas.winfo_height()
-        if w < 20 or h < 20:
+        c = self.end_canvas
+        c.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"], highlightthickness=1)
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 40 or h < 40:
             return
+        c.create_text(8, 6, text="Eye Reach", anchor="nw", fill=pal["muted"], font=VIEW_TITLE_FONT)
         eye_dist_min, eye_dist_max = winding.eye_reach(arm)
-        cx, cy = w / 2.0, h / 2.0
-        scale2 = min((w / 2.0 - 10) / max(rt, 1.0), (h / 2.0 - 15) / max(eye_dist_max, 1.0))
-        scale2 = max(scale2, 0.001)
+        top, bottom = 24, 8
+        reach = max(eye_dist_max, rt, 1.0)
+        scale2 = max(0.001, min((w / 2.0 - 12) / max(rt, 1.0), (h - top - bottom) / (reach + rt)))
+        cx, cy = w / 2.0, top + reach * scale2
         r_px = rt * scale2
-        self.end_canvas.create_oval(cx - r_px, cy - r_px, cx + r_px, cy + r_px, fill=pal["tank"], outline=pal["tank_outline"], width=2)
-        y_min = cy - eye_dist_min * scale2
-        y_max = cy - eye_dist_max * scale2
-        self.end_canvas.create_line(4, y_min, w - 4, y_min, fill=pal["reach"], dash=(4, 4))
-        self.end_canvas.create_text(w / 2.0, y_min - 9, text="Max", fill=pal["reach"], font=("TkDefaultFont", 8))
-        self.end_canvas.create_line(4, y_max, w - 4, y_max, fill=pal["reach"], dash=(4, 4))
-        self.end_canvas.create_text(w / 2.0, y_max + 9, text="Min", fill=pal["reach"], font=("TkDefaultFont", 8))
+        c.create_oval(cx - r_px, cy - r_px, cx + r_px, cy + r_px, fill=pal["tank"], outline=pal["tank_outline"], width=2)
+        for dist, label in ((eye_dist_min, "Max"), (eye_dist_max, "Min")):
+            y = cy - dist * scale2
+            c.create_line(6, y, w - 6, y, fill=pal["reach"], dash=(4, 4))
+            c.create_text(w - 8, y - 2, text=label, anchor="se", fill=pal["reach"], font=VIEW_LABEL_FONT)
+
+    # --- Bulkhead view: the selected layup's turnaround at one dome, up close ---
+
+    def _draw_bulkhead_view(self, job):
+        # The far end's dome in profile -- the semicircle the Bulkhead Angle is
+        # measured on -- with a little of the straight section and the boss,
+        # the selected layup's angle as a line from the semicircle's center,
+        # where it turns around, and (drawn by _draw_bulkhead_strands) its
+        # first cycle's strands over the dome. +X runs to the left, as in the
+        # tank preview beside it.
+        pal = self.app.canvas_palette
+        c = self.bulkhead_canvas
+        c.configure(bg=pal["canvas_bg"], highlightbackground=pal["shaft_outline"], highlightthickness=1)
+        c.delete("all")
+        self._bulk_geom = self._bulk_outline = None
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 60 or h < 80:
+            return
+        n, i = len(job.layups), min(self.app.active_layup, len(job.layups) - 1)
+        title = "Bulkhead" + (f" · Layup {i + 1}" if n > 1 else "")
+        title_item = c.create_text(8, 6, text=title, anchor="nw", fill=pal["muted"], font=VIEW_TITLE_FONT)
+        self._draw_turn_arrows(c, BULK_ARROW_X, h / 2, 11, 11)
+        rt, rc, dome = job.tank_diameter / 2, job.end_cap_diameter / 2, job.dome_length
+        if rt <= 0 or job.straight_length < 0:
+            return
+        layup = job.layups[i]
+        round_caps = job.end_cap_type == "Round" and dome > 0
+        # Room at the foot for the caption: a second line for a 90° wind or
+        # flat end caps.
+        caption_lines = 2 if layup.hoop or not round_caps else 1
+        top, bottom, left = 26, 10 + 15 * caption_lines, 2 * BULK_ARROW_X + 2  # (clear of the turn arrows)
+        # Room beyond the dome for a stub of the boss -- and for the eye, where
+        # its Additional X-Axis Travel takes it past the tank's end.
+        beyond = 0.0
+        if round_caps and not layup.hoop:
+            beyond = winding.bulkhead_cover(job, layup) + max(0.0, layup.x_extension) - dome
+        boss = max(BULKHEAD_BOSS * rt, 1.15 * beyond) if round_caps else 0.0
+        span = boss + dome + BULKHEAD_STUB * rt
+        scale = max(0.001, min((w - left) / span, (h - top - bottom) / (2 * rt)))
+        jx = left + (boss + dome) * scale        # where the straight section ends (the semicircle's center)
+        cy = top + (h - top - bottom) / 2.0      # the tank axis
+        self._bulk_geom = (scale, jx, cy)
+        # The axis, the boss, and the tank: the straight section running off to
+        # the right, the dome's profile around the center.
+        c.create_line(0, cy, w, cy, fill=pal["shaft_outline"], dash=(6, 3, 2, 3), tags="bulk_base")
+        if round_caps:
+            bx = jx - dome * scale
+            c.create_rectangle(bx - boss * scale, cy - rc * scale, bx, cy + rc * scale, fill=pal["shaft"],
+                               outline=pal["shaft_outline"], tags="bulk_base")
+        steps = 48
+        # The straight section runs off the view's right edge -- unless the
+        # tank is so short that its other end shows there too.
+        cyl_start = job.chuck_offset + dome
+        cyl_end = job.chuck_offset + job.tank_length - dome
+        x_edge = cyl_end - (w + 2 - jx) / scale  # machine X at the right edge
+        upper = []
+        if x_edge >= cyl_start:
+            upper.append((w + 2, cy - rt * scale))
+        else:
+            radius, x_from = winding._tank_geometry(job).radius, max(job.chuck_offset, x_edge)
+            for k in range(steps + 1):
+                x = x_from + (cyl_start - x_from) * k / steps
+                upper.append((jx - (x - cyl_end) * scale, cy - radius(x) * scale))
+        for k in range(steps + 1):
+            x = dome * k / steps
+            r = math.sqrt(max(rt * rt - x * x, rc * rc)) if round_caps else rt
+            upper.append((jx - x * scale, cy - r * scale))
+        lower = [(px, 2 * cy - py) for px, py in upper]
+        self._bulk_outline = upper + lower[::-1]
+        c.create_polygon(self._bulk_outline, fill=pal["tank"], outline=pal["tank_outline"], width=2, tags="bulk_base")
+        for share, color in ((0.28, pal["highlight"]), (0.82, pal["shadow"])):
+            c.create_line(*[v for (px, py) in upper for v in (px, py + (2 * (cy - py)) * share)],
+                          fill=color, width=2, smooth=True, tags="bulk_base")
+        if not round_caps:
+            self._bulk_caption(c, w, h, "Flat end caps: no dome,", "every layup turns at the tank's end.")
+            return
+        # The selected layup's Bulkhead Angle: from the semicircle's center to
+        # where the layup turns around on the dome, the turning circle seen
+        # edge-on through that point, and where its eye turns back beyond it.
+        opening = winding.opening_angle(job)
+        if layup.hoop:
+            angle, cover = 90.0, 0.0
+        else:
+            angle, cover = max(layup.bulkhead_angle, opening), winding.bulkhead_cover(job, layup)
+        ink, halo = pal["marker"], pal["marker_halo"]
+        # The polar opening's angle, faintly: the whole dome is wound from it down.
+        c.create_line(jx, cy, jx - rt * math.cos(math.radians(opening)) * scale,
+                      cy - rt * math.sin(math.radians(opening)) * scale, fill=pal["muted"], dash=(2, 3),
+                      tags="bulk_overlay")
+        px = jx - rt * math.cos(math.radians(angle)) * scale
+        py = cy - rt * math.sin(math.radians(angle)) * scale
+        r_turn = cy - py
+        tx = jx - cover * scale
+        for color, width in ((halo, 4), (ink, 2)):
+            c.create_line(tx, cy - r_turn, tx, cy + r_turn, fill=color, width=width,
+                          dash=(5, 3) if color == ink else "", tags="bulk_overlay")
+        for color, width in ((halo, 4), (ink, 2)):
+            c.create_line(jx, cy, px, py, fill=color, width=width, capstyle=tk.ROUND, tags="bulk_overlay")
+        arc = max(14.0, min(0.34 * rt * scale, 40.0))
+        c.create_arc(jx - arc, cy - arc, jx + arc, cy + arc, start=180.0 - angle, extent=angle, style=tk.ARC,
+                     outline=ink, width=1.5, tags="bulk_overlay")
+        for x, y, size in ((jx, cy, 3), (px, py, 4)):
+            c.create_oval(x - size, y - size, x + size, y + size, fill=ink, outline=halo, tags="bulk_overlay")
+        # Its value in the title row (never over the drawing), tagged AUTO
+        # like the field it comes from. Where the title would run into it, the
+        # title drops the layup's number (the caption under the tank has it).
+        auto = layup.bulkhead_auto and not layup.hoop
+        value = c.create_text(w - 8, 5, text=f"{angle:.1f}°", anchor="ne", fill=ink, font=VIEW_VALUE_FONT,
+                              tags="bulk_caption")
+        left_edge = c.bbox(value)[0]
+        if auto:
+            tag = c.create_text(left_edge - 5, 7, text="AUTO", anchor="ne", fill=pal["auto_text"],
+                                font=("TkDefaultFont", 7, "bold"), tags="bulk_caption")
+            left_edge = c.bbox(tag)[0]
+        if c.bbox(title_item)[2] > left_edge - 6:
+            c.itemconfigure(title_item, text="Bulkhead")
+        if not layup.hoop and layup.x_extension > 0:
+            # Where the eye turns back (beyond the tank's end too, if it goes there).
+            ex = jx - (cover + layup.x_extension) * scale
+            ey = cy - max(r_turn, rc * scale) - 6
+            c.create_polygon(ex - 5, ey - 7, ex + 5, ey - 7, ex, ey, fill=pal["reach"], outline="", tags="bulk_overlay")
+        # What it means, below.
+        if layup.hoop:
+            lines = ("90° wind: straight section only", "-- never on the dome")
+        else:
+            lines = ("Winds the whole dome" if cover >= dome else f"Dome: {cover:.0f} of {dome:.0f} mm wound",)
+        self._bulk_caption(c, w, h, *lines)
+        c.itemconfigure("bulk_overlay", state="hidden" if self._bulk_single() else "normal")
+
+    # --- Turn arrows: ▲ ▼ drawn into a view, at its left edge ---
+
+    def _bind_turn_arrows(self, c, spinner):
+        # A view's turn arrows are canvas items (see _draw_turn_arrows),
+        # redrawn with the view; their tag bindings, made once here, carry over
+        # to every redraw. Holding one turns the view (`spinner`); letting go
+        # -- anywhere -- stops it.
+        pal = lambda key: self.app.canvas_palette[key]  # the current theme's, at the time
+        for tag, direction in (("turn_up", -1), ("turn_down", 1)):
+            c.tag_bind(tag, "<ButtonPress-1>", lambda e, d=direction: spinner.hold(d))
+            c.tag_bind(tag, "<Enter>", lambda e, t=tag: (c.itemconfigure(t, fill=pal("tank")),
+                                                         c.configure(cursor="hand2")))
+            c.tag_bind(tag, "<Leave>", lambda e, t=tag: (c.itemconfigure(t, fill=pal("muted")),
+                                                         c.configure(cursor=""), spinner.hold(0)))
+        c.bind("<ButtonRelease-1>", lambda e: spinner.hold(0), add="+")
+
+    def _draw_turn_arrows(self, c, x, y, size, gap):
+        # ▲ and ▼ around (x, y) -- a view's left edge, half way down -- in the
+        # muted color, highlighted while hovered (see _bind_turn_arrows).
+        muted = self.app.canvas_palette["muted"]
+        for tag, glyph, dy in (("turn_up", "▲", -gap), ("turn_down", "▼", gap)):
+            c.create_text(x, y + dy, text=glyph, fill=muted, font=("TkDefaultFont", size), tags=("turn_arrows", tag))
+
+    def _bulk_single(self):
+        # Whether the Bulkhead view shows a single circuit: "View Single" --
+        # except while continuing a wind, when it shows what's wound so far.
+        return self.bulk_single_var.get() and self.partial_point is None
+
+    def _bulk_caption(self, c, w, h, *lines):
+        # One or two lines of small print at the view's foot.
+        pal = self.app.canvas_palette
+        for k, text in enumerate(reversed(lines)):
+            c.create_text(8, h - 7 - 15 * k, text=text, anchor="sw", fill=pal["muted"], font=VIEW_LABEL_FONT,
+                          tags="bulk_caption")
+
+    def _draw_bulkhead_strands(self):
+        # The strands over the dome, the way the tank preview draws them (the
+        # same layups), under the Bulkhead Angle's construction, seen from the
+        # view's own angle (its arrows turn it, the tank preview's don't).
+        # With "View Single", only the first circuit: one strand coming onto
+        # the dome, going around it -- thin and dashed where it runs behind --
+        # and back off. Re-run on every rotation frame: _preview_runs() kept
+        # only what lies over this dome, so it's cheap.
+        c = self.bulkhead_canvas
+        c.delete("bulk_strand")
+        # Single circuits only exist for a layup's first cycle, not for a
+        # continued wind's progress.
+        self._bulk_single_check.state(["disabled"] if self.partial_point is not None else ["!disabled"])
+        c.itemconfigure("bulk_overlay", state="hidden" if self._bulk_single() else "normal")
+        if self._bulk_geom is None or self._job is None:
+            return
+        job, pal = self._job, self.app.canvas_palette
+        scale, jx, cy = self._bulk_geom
+        cyl_end = job.chuck_offset + job.tank_length - job.dome_length
+        width = max(1, math.ceil(job.bandwidth * scale))
+        az = math.radians(self._bulk_spin.azimuth)
+        sin, cos, create_line = math.sin, math.cos, c.create_line
+        single = self._bulk_single()
+
+        def draw(li, runs, hidden=False):
+            color, dash = theme.layup_style(pal, li)
+            style = dict(fill=color, width=width, capstyle=tk.ROUND, dash=dash or "", tags="bulk_strand")
+            back_style = dict(fill=color, width=1, dash=(3, 3), tags="bulk_strand")
+            for run in runs:
+                front, back = [], []
+                for x, r, a in run:
+                    eff = a - az
+                    px, py = jx - (x - cyl_end) * scale, cy - r * cos(eff) * scale
+                    if sin(eff) >= 0:
+                        front += (px, py)
+                        if hidden and back:
+                            # Join up where it comes round to the front.
+                            back += (px, py)
+                            if len(back) >= 4:
+                                create_line(*back, **back_style)
+                            back = []
+                    else:
+                        if hidden:
+                            if not back and front:
+                                back += front[-2:]
+                            back += (px, py)
+                        if len(front) >= 4:
+                            create_line(*front, **style)
+                        front = []
+                if len(front) >= 4:
+                    create_line(*front, **style)
+                if hidden and len(back) >= 4:
+                    create_line(*back, **back_style)
+
+        def band(li):
+            # A 90° wind covers the straight section up to the dome.
+            color, _ = theme.layup_style(pal, li)
+            rt = job.tank_diameter / 2
+            c.create_rectangle(jx, cy - rt * scale, c.winfo_width() + 2, cy + rt * scale, fill=color, outline="",
+                               tags="bulk_strand")
+
+        if self.partial_point is not None:
+            if self._progress is None or self._progress[0] != self._progress_key():
+                return
+            progress = self._progress[1]
+            if isinstance(progress, Exception):
+                return
+            for li in range(progress.location.point.layup + 1):
+                if li in progress.covered and self._bulk_outline:
+                    color, _ = theme.layup_style(pal, li)
+                    c.create_polygon(self._bulk_outline, fill=color, outline=pal["tank_outline"], width=2,
+                                     tags="bulk_strand")
+                    continue
+                if job.layups[li].hoop:
+                    band(li)
+                if li in progress.runs:
+                    draw(li, progress.runs[li][2])
+        else:
+            runs = None
+            if self._result is not None and self._result[0] == job:
+                runs = self._runs
+            elif self._partial is not None and self._partial[0] == job:
+                runs = self._partial[1]
+            if runs is None:
+                return
+            indices = range(len(job.layups)) if self.show_all_var.get() else [self.app.active_layup]
+            for li in indices:
+                if li not in runs:
+                    continue
+                if job.layups[li].hoop:
+                    band(li)
+                draw(li, runs[li][3] if single else runs[li][2], hidden=single)
+        # The Bulkhead Angle's construction (its line and arc, the turning
+        # circle, the opening's angle, the eye's ▼) goes over every circuit --
+        # and away for a single one, which it would only clutter.
+        c.itemconfigure("bulk_overlay", state="hidden" if single else "normal")
+        c.tag_raise("bulk_overlay")
+        c.tag_raise("bulk_caption")
+        c.tag_raise("turn_arrows")
 
     def _update_indicator(self):
         self.canvas.delete("calc_indicator")

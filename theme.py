@@ -5,10 +5,23 @@ ttkbootstrap doesn't reach, since they're not ttk widgets).
 Kept separate from main.py/plan_tab.py/view_tab.py so the winding-generation
 logic in those files never has to be touched to change how the app looks.
 """
+import os
+import sys
+import tempfile
+import tkinter
+from functools import lru_cache
+
 import ttkbootstrap as tb
 
 LIGHT_THEME = "minty-light"
 DARK_THEME = "minty-dark"
+
+# The ASTRA student club's logo (black on white): the mountain-and-rocket mark
+# above the ASTRA lettering. The app shows it in the club's purple -- the mark
+# as the window icon (white on a purple tile), the mark and the name side by
+# side in the status bar's corner -- colored from this one file at startup.
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "astra_logo.png")
+ASTRA_PURPLE = {"light": "#5b2a86", "dark": "#b48ce6"}  # the club's purple; lightened to read on the dark theme
 
 # Colors for the custom-drawn Settings Preview canvases (the 3D tank view and the
 # thin end-view). These react to the light/dark toggle. The G-Code Preview's
@@ -159,6 +172,105 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     # button -- so they look the same from startup, not just after a switch.
     style.configure("warning.TLabel")
     style.configure("success.TButton")
+
+
+@lru_cache(maxsize=1)
+def _logo_parts():
+    """(mark, name): the logo's two parts as alpha masks (Pillow "L" images,
+    ink opaque, cropped to it), or None if the file can't be read. The parts
+    are told apart by the widest band of empty rows between them."""
+    from PIL import Image, ImageOps
+    try:
+        ink = ImageOps.invert(Image.open(LOGO_PATH).convert("L"))
+    except OSError:
+        return None
+    w, h = ink.size
+    profile = ink.resize((1, h), Image.Resampling.BOX).tobytes()  # each row's mean ink
+    rows = [y for y, v in enumerate(profile) if v > 0]
+    if len(rows) < 2:
+        return None
+    _, split = max((b - a, (a + b) // 2) for a, b in zip(rows, rows[1:]))
+    parts = []
+    for box in ((0, 0, w, split), (0, split, w, h)):
+        part = ink.crop(box)
+        bbox = part.getbbox()
+        if bbox is None:
+            return None
+        parts.append(part.crop(bbox))
+    return tuple(parts)
+
+
+def _ink(mask, color):
+    # The mask's shape filled with `color`, on transparent.
+    from PIL import Image
+    img = Image.new("RGBA", mask.size, color)
+    img.putalpha(mask)
+    return img
+
+
+def logo_lockup(height, color):
+    """The logo for small spaces: the mark with the ASTRA name beside it,
+    `height` px tall, in `color` -- a Pillow image, or None without the file."""
+    from PIL import Image
+    parts = _logo_parts()
+    if parts is None:
+        return None
+    mark, name = parts
+    lanczos = Image.Resampling.LANCZOS
+    m = mark.resize((max(1, round(mark.width * height / mark.height)), height), lanczos)
+    name_h = max(1, round(height * 0.44))
+    n = name.resize((max(1, round(name.width * name_h / name.height)), name_h), lanczos)
+    gap = max(2, round(height * 0.3))
+    mask = Image.new("L", (m.width + gap + n.width, height), 0)
+    mask.paste(m, (0, 0))
+    mask.paste(n, (m.width + gap, (height - name_h) // 2))
+    return _ink(mask, color)
+
+
+def _logo_icon(size, tile, ink="#ffffff"):
+    # The window icon: the mark in `ink` on a rounded square of `tile`, drawn
+    # four times as large and scaled down, so its edges come out smooth.
+    from PIL import Image, ImageDraw
+    big = size * 4
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    ImageDraw.Draw(img).rounded_rectangle((0, 0, big - 1, big - 1), radius=round(big * 0.22), fill=tile)
+    mark = _logo_parts()[0]
+    fit = big * 0.8 / max(mark.width, mark.height)
+    m = mark.resize((round(mark.width * fit), round(mark.height * fit)), Image.Resampling.LANCZOS)
+    img.alpha_composite(_ink(m, ink), ((big - m.width) // 2, (big - m.height) // 2))
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def build_icons(primary_hex):
+    """The window icon, as PhotoImages in a few sizes for root.iconphoto(): the
+    ASTRA mark on a purple tile -- or, without the logo file, a small "wound
+    coil" badge in the theme's primary color."""
+    from PIL import ImageTk
+    if _logo_parts() is not None:
+        return [ImageTk.PhotoImage(_logo_icon(size, ASTRA_PURPLE["light"])) for size in (16, 32, 48, 64)]
+    return [build_icon(primary_hex)]
+
+
+def apply_icon(root, primary_hex):
+    """Gives every window of the app its icon (see build_icons). Returns the
+    PhotoImages to keep referenced (none where they aren't used). On Windows
+    the icon goes over as a multi-size .ico written to the temp folder, the way
+    ttkbootstrap sets its own default: there, a photo icon doesn't take (the
+    title bar shows a blank one), and the .ico also gives the taskbar a large
+    one. It's set for the main window and as every other window's default."""
+    if sys.platform == "win32" and _logo_parts() is not None:
+        path = os.path.join(tempfile.gettempdir(), "cfrp_winder_astra.ico")
+        try:
+            _logo_icon(256, ASTRA_PURPLE["light"]).save(
+                path, format="ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
+            root.wm_iconbitmap(path)
+            root.wm_iconbitmap(default=path)
+            return []
+        except (OSError, tkinter.TclError):
+            pass  # fall back to the photo icon
+    images = build_icons(primary_hex)
+    root.iconphoto(True, *images)
+    return images
 
 
 def build_icon(primary_hex, size=64):

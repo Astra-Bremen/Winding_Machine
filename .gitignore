@@ -11,3 +11,6 @@
 # The application
 !*.py
 !requirements.txt
+# Its images (the ASTRA logo)
+!assets/
+!assets/*.png

@@ -71,11 +71,25 @@ MULTI = WindingJob(layups=(
     Layup(passes=2, pattern_number=1, wind_angle=20.0, turnaround_angle=180.0),
 ))
 
+# A layup setting: wind over the whole dome, turning at the tank's very ends.
+FULL_DOME = dict(bulkhead_auto=False, bulkhead_angle=0.0)
+
+
+def legacy_job(tank_length, layups=(Layup(),), **settings):
+    """The job a file from before the straight length and the bulkhead angle
+    restores to: its end-to-end `tank_length`, every layup over the whole dome."""
+    header = {"tank_length": str(tank_length), "end_cap_type": settings.get("end_cap_type", "Round"),
+              "tank_diameter": str(settings.get("tank_diameter", 200.0)),
+              "end_cap_diameter": str(settings.get("end_cap_diameter", 50.0))}
+    return WindingJob(straight_length=winding.LEGACY_VALUES["straight_length"](header),
+                      layups=tuple(replace(layup, **FULL_DOME) for layup in layups), **settings)
+
+
 # The Excel generator's "Transcendence Model Tank PN0003" helical layers, on its
 # 250 mm tank with a 7 mm tow: 1480 mm helical traverse and the sheet's minimum
 # turnaround of 2 x (90 - angle) at each end.
 def excel_layer(angle, pattern, cycles, zone=0.0):
-    return WindingJob(tank_length=1480.0, tank_diameter=250.0, end_cap_type="Flat", bandwidth=7.0,
+    return WindingJob(straight_length=1480.0, tank_diameter=250.0, end_cap_type="Flat", bandwidth=7.0,
                       turnaround_zone=zone, turnaround_zone_auto=False,
                       layups=(Layup(passes=cycles, pattern_number=pattern, wind_angle=angle,
                                     turnaround_angle=2 * (90 - angle)),))
@@ -85,41 +99,62 @@ class GoldenMaster(unittest.TestCase):
     """Pins the exact G-code body (everything after the settings header) so an
     unintended change to the motion shows up. Regenerate these deliberately,
     and only together with a change that is meant to alter the output. (Last
-    regenerated for the Additional X-Axis Travel, 30 mm by default: with it
-    at 0, every body is exactly the one before -- "no_x_extension" pins the
-    former default.)"""
+    regenerated for the Additional X-Axis Travel's default of 0. Restored the
+    way a file from before the straight length and the Bulkhead Angle is --
+    over the whole dome -- every body is exactly the one before; the
+    "legacy_*" cases pin that.)"""
     CASES = {
-        "default": (WindingJob(), 22933, "1e1b0a6609df329f3fa76f4c1246653f474facd0aa27b186d38cff97df83d10a"),
-        "no_x_extension": (WindingJob(layups=(Layup(x_extension=0.0),)), 19244,
-                           "cf1cabb300f9de26e94f909550379ffc041e9838582a8e2a193aa7a97588a2fb"),
+        "default": (WindingJob(), 20354, "54ac4292e760f9c3fda3d900b86bb0e51f79378a92f4bc1b99ab7ce24d1d58ac"),
+        "legacy_default": (legacy_job(1000.0, layups=(Layup(x_extension=30.0),)), 22933,
+                           "1e1b0a6609df329f3fa76f4c1246653f474facd0aa27b186d38cff97df83d10a"),
+        "legacy_no_x_extension": (legacy_job(1000.0, layups=(Layup(x_extension=0.0),)), 19244,
+                                  "cf1cabb300f9de26e94f909550379ffc041e9838582a8e2a193aa7a97588a2fb"),
+        "legacy_hoop_between_helicals": (
+            legacy_job(1200.0, tank_diameter=220.0, bandwidth=6.0, max_move_time=1.0,
+                       layups=(Layup(passes=2, pattern_number=3, wind_angle=40.0, turnaround_angle=200.0,
+                                     x_extension=30.0),
+                               Layup(hoop=True, x_extension=30.0),
+                               Layup(passes=1, pattern_number=5, wind_angle=25.0, turnaround_angle=160.0,
+                                     x_extension=30.0))),
+            11761, "00437c24c90ac8161d34c2644380c55dcb887c198ab4b228bf122d6614418463"),
+        # Flat end caps have no bulkhead: exactly as before the X travel and the bulkhead existed.
         "flat_p1_nohome": (
             WindingJob(end_cap_type="Flat", home_before_wind=False,
                        layups=(Layup(passes=4, pattern_number=1, wind_angle=60.0, turnaround_angle=180.0),)),
-            2263, "79de75a21de1d0c1b3a80847de5d05b4dfb8f59769227db93f6feab78010ba40"),
+            2217, "596e0e10cb90eb4ef9b78768bcf977353269bcbc00b4ba9d826b646e8fb5856b"),
         "round_p5_steep": (
-            WindingJob(bandwidth=8.0,
+            WindingJob(straight_length=800.0, bandwidth=8.0,
                        layups=(Layup(passes=2, pattern_number=5, wind_angle=70.0, turnaround_angle=90.0),)),
-            7129, "0bd1b8e7cc75968f5c2583b5ab3523676dd4c13fe1f95c6d77168b01949aafed"),
+            4604, "b14c7176c7586d47577b5d06458816c8f67987496cb3a12ff86e4832abb4d3ca"),
         "round_small_dwell": (
-            WindingJob(tank_length=640.0, tank_diameter=160.0, end_cap_diameter=40.0, eye_width=35.0,
+            WindingJob(straight_length=480.0, tank_diameter=160.0, end_cap_diameter=40.0, eye_width=35.0,
                        min_spacing=6.0, max_surface_speed=150.0,
                        layups=(Layup(passes=3, pattern_number=2, wind_angle=30.0, turnaround_angle=10.0),)),
-            3790, "75eadf1e81ec393f67f65353c542918af6f5acbf2b166e031b7f0eebdbdc0078"),
+            3341, "ffbc189f48536f2ab82d8cf1784e129ed9d6a7587f1516474c53dddcc104053b"),
         "excel_style_zone": (
-            WindingJob(tank_length=1640.0, tank_diameter=250.0, bandwidth=7.0, turnaround_zone=80.0,
+            WindingJob(straight_length=1400.0, tank_diameter=250.0, bandwidth=7.0, turnaround_zone=80.0,
                        turnaround_zone_auto=False,
                        layups=(Layup(passes=3, pattern_number=5, wind_angle=12.0, turnaround_angle=156.0),
                                Layup(passes=2, pattern_number=7, wind_angle=54.0, turnaround_angle=72.0))),
-            32699, "d7bb0cc3bec84eecb4b2d7f968d8510ace34e5a81bc43fc99bae41f11aa7d342"),
+            27450, "d2fe19dfd2ad50f4331a5cdeab05a6a218b317925b138bdedae4b792b00fefd9"),
         # A 90° wind between two helical layups: the first layup's last
         # turnaround running on to the hoop's start, the hoop pass, and the
         # next layup turning around at the far end first.
         "hoop_between_helicals": (
-            WindingJob(tank_length=1200.0, tank_diameter=220.0, bandwidth=6.0, max_move_time=1.0,
+            WindingJob(straight_length=1000.0, tank_diameter=220.0, bandwidth=6.0, max_move_time=1.0,
                        layups=(Layup(passes=2, pattern_number=3, wind_angle=40.0, turnaround_angle=200.0),
                                Layup(hoop=True),
                                Layup(passes=1, pattern_number=5, wind_angle=25.0, turnaround_angle=160.0))),
-            11761, "00437c24c90ac8161d34c2644380c55dcb887c198ab4b228bf122d6614418463"),
+            9285, "daaedf5115a7ba14e2ae39b45c987549c87a8115bbfe57b2f205770927e43c0b"),
+        # A double 90° wind (there, a pause, and back), and a layup turning at
+        # a Bulkhead Angle of its own.
+        "double_hoop_custom_bulkhead": (
+            WindingJob(straight_length=700.0, max_move_time=1.0,
+                       layups=(Layup(passes=1, pattern_number=3, wind_angle=40.0, bulkhead_auto=False,
+                                     bulkhead_angle=60.0),
+                               Layup(hoop=True, double=True),
+                               Layup(passes=1, pattern_number=2, wind_angle=25.0))),
+            4330, "ea15927bf7c547cc0f61a6cd8bfdc9898995ff80faa28fd0103b36febe95b87b"),
     }
 
     def test_output_unchanged(self):
@@ -248,7 +283,7 @@ class AutoCycles(unittest.TestCase):
         # A layup line from before the flag existed keeps its cycle count as
         # written (and, older than the Additional X-Axis Travel, turned at the ends).
         old = {"layups": "1", "layup_1": "passes=12 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0"}
-        self.assertEqual(winding.layups_from_header(old), [Layup(passes=12, x_extension=0.0)])
+        self.assertEqual(winding.layups_from_header(old), [Layup(passes=12, x_extension=0.0, **FULL_DOME)])
 
 
 def gcode_moves(lines):
@@ -495,7 +530,7 @@ class WindStart(unittest.TestCase):
     def test_start_is_validated_only_when_homing(self):
         message = "Start Wind at X must be between"
         self.assertTrue(any(message in e for e in winding.geometry_errors(WindingJob(start_x_auto=False, start_x=10.0))))
-        self.assertTrue(any(message in e for e in winding.geometry_errors(WindingJob(start_x_auto=False, start_x=1000.0))))
+        self.assertTrue(any(message in e for e in winding.geometry_errors(WindingJob(start_x_auto=False, start_x=1200.0))))
         self.assertFalse(winding.geometry_errors(WindingJob(home_before_wind=False, start_x_auto=False, start_x=10.0)))
 
     def test_later_start_keeps_the_pattern(self):
@@ -684,7 +719,8 @@ class SmoothTurnaround(unittest.TestCase):
         self.assertAlmostEqual(job.turnaround_zone, job.dome_length)
         self.assertEqual(WindingJob(end_cap_type="Flat").turnaround_zone, winding.FLAT_TURNAROUND_ZONE)
         self.assertEqual(WindingJob(turnaround_zone=30.0, turnaround_zone_auto=False).turnaround_zone, 30.0)
-        self.assertEqual(WindingJob(tank_length=150.0).turnaround_zone, 75.0)  # at most half the tank
+        # At most half the tank (only flat end caps can be that short: a dome is at most half).
+        self.assertEqual(WindingJob(end_cap_type="Flat", straight_length=80.0).turnaround_zone, 40.0)
         self.assertIs(winding.LEGACY_VALUES["turnaround_zone_auto"], False)  # older files keep their zone
 
     def test_klipper_takes_every_turnaround_at_speed(self):
@@ -697,12 +733,15 @@ class SmoothTurnaround(unittest.TestCase):
             with self.subTest(layups=len(job.layups), zone=job.turnaround_zone):
                 junctions = klipper_junctions(job)
                 self.assertLess(max(d for *_, d in junctions), winding.TURN_MAX_DEFLECTION + 0.2)
-                self.assertGreater(min(v / commanded for v, commanded, _ in junctions), 0.99)
+                # (A pass's last, shorter step can land right where a turnaround
+                # begins: Klipper takes a bend after a very short move a little
+                # slower -- MULTI's 20° layup has one such junction at 96 %.)
+                self.assertGreater(min(v / commanded for v, commanded, _ in junctions), 0.95)
         # Without a zone it's the pure rotation at the end: the old full stop.
         self.assertLess(min(v / c for v, c, _ in klipper_junctions(excel_layer(12, 5, 2))), 0.1)
 
     def test_reversal_at_the_tank_end_inside_the_zone(self):
-        job = WindingJob(layups=(Layup(passes=2, x_extension=0.0),))
+        job = WindingJob(layups=(Layup(passes=2, x_extension=0.0, **FULL_DOME),))
         x_start, x_end = job.chuck_offset, job.chuck_offset + job.tank_length
         moves = [ev for ev in winding.iter_program(job) if type(ev) is Move]
         xs = [m.x for m in moves]
@@ -734,7 +773,7 @@ class SmoothTurnaround(unittest.TestCase):
 
     def test_zone_validation(self):
         self.assertEqual(winding.geometry_errors(excel_layer(20, 7, 4, zone=740.0)), [])
-        self.assertIn("Turnaround Zone must be at most half the Tank Length.",
+        self.assertIn("Turnaround Zone must be at most half the tank's whole length.",
                       winding.geometry_errors(excel_layer(20, 7, 4, zone=745.0)))
         self.assertIn("Turnaround Zone can't be negative.", winding.geometry_errors(excel_layer(20, 7, 4, zone=-1.0)))
 
@@ -753,16 +792,20 @@ class AdditionalXTravel(unittest.TestCase):
             return sum(1 for i, v in enumerate(xs) if abs(v - x) < 1e-9 and (i == 0 or abs(xs[i - 1] - x) >= 1e-9))
         for extension in (0.0, 30.0, 47.3):
             for zone in (None, 0.0):  # auto (the dome), and turning on the spot
-                job = WindingJob(**({} if zone is None else dict(turnaround_zone=zone, turnaround_zone_auto=False)),
-                                 layups=(Layup(passes=2, x_extension=extension),))
-                with self.subTest(extension=extension, zone=job.turnaround_zone):
-                    xs = [ev.x for ev in winding.iter_program(job) if type(ev) is Move]
-                    x_lo, x_hi = job.chuck_offset - extension, job.chuck_offset + job.tank_length + extension
-                    self.assertAlmostEqual(min(xs), x_lo)
-                    self.assertAlmostEqual(max(xs), x_hi)
-                    circuits = winding.plan_layup(job, job.layups[0]).total_circuits
-                    self.assertEqual(visits(xs, x_hi), circuits)
-                    self.assertEqual(visits(xs, x_lo), circuits)
+                for bulkhead in (FULL_DOME, {}):  # the whole dome, and the auto Bulkhead Angle
+                    job = WindingJob(**({} if zone is None else dict(turnaround_zone=zone, turnaround_zone_auto=False)),
+                                     layups=(Layup(passes=2, x_extension=extension, **bulkhead),))
+                    with self.subTest(extension=extension, zone=job.turnaround_zone, full_dome=bool(bulkhead)):
+                        xs = [ev.x for ev in winding.iter_program(job) if type(ev) is Move]
+                        turn_lo, turn_hi = winding.turn_points(job, job.layups[0])
+                        if bulkhead:
+                            self.assertEqual((turn_lo, turn_hi), (job.chuck_offset, job.chuck_offset + job.tank_length))
+                        x_lo, x_hi = turn_lo - extension, turn_hi + extension
+                        self.assertAlmostEqual(min(xs), x_lo)
+                        self.assertAlmostEqual(max(xs), x_hi)
+                        circuits = winding.plan_layup(job, job.layups[0]).total_circuits
+                        self.assertEqual(visits(xs, x_hi), circuits)
+                        self.assertEqual(visits(xs, x_lo), circuits)
 
     def test_the_pattern_still_closes_exactly(self):
         for extension in (12.5, 47.3):
@@ -829,10 +872,17 @@ class AdditionalXTravel(unittest.TestCase):
     def test_validation_and_machine_limits(self):
         self.assertIn("Additional X-Axis Travel can't be negative.",
                       winding.geometry_errors(WindingJob(layups=(Layup(x_extension=-1.0),))))
+        whole_dome = (Layup(x_extension=30.0, **FULL_DOME),)
         self.assertIn("Additional X-Axis Travel would take the carriage to X -10mm, below X0. Reduce it or "
-                      "increase Chuck X-Offset.", winding.validate(WindingJob(chuck_offset=20.0)))
-        self.assertEqual(winding.validate(WindingJob(chuck_offset=30.0)), [])
-        long_tank = WindingJob(chuck_offset=50.0, tank_length=winding.MAX_X - 60.0)
+                      "increase Chuck X-Offset.", winding.validate(WindingJob(chuck_offset=20.0, layups=whole_dome)))
+        self.assertEqual(winding.validate(WindingJob(chuck_offset=30.0, layups=whole_dome)), [])
+        # Turning part-way onto the dome, it reaches less far.
+        self.assertEqual(winding.validate(WindingJob(chuck_offset=20.0)), [])
+        partway = WindingJob(layups=(Layup(x_extension=30.0),))
+        turn_lo = winding.turn_points(partway, partway.layups[0])[0]
+        self.assertAlmostEqual(winding.x_travel(partway)[0], min(50.0, turn_lo - 30.0))
+        long_tank = legacy_job(winding.MAX_X - 60.0, chuck_offset=50.0,  # turning at the very ends
+                               layups=(Layup(x_extension=30.0),))
         self.assertIn("X-Axis would reach 5270mm", winding.validate(long_tank)[0])
         # A 90° wind never leaves the straight section: its own setting doesn't count.
         self.assertEqual(winding.validate(WindingJob(chuck_offset=20.0, layups=(Layup(hoop=True),))), [])
@@ -841,11 +891,120 @@ class AdditionalXTravel(unittest.TestCase):
     def test_settings_header_and_old_files(self):
         job = WindingJob(layups=(Layup(x_extension=12.5), Layup(passes=3, wind_angle=60.0)))
         restored = winding.layups_from_header(parse_header(gcode(job)))
-        self.assertEqual([l.x_extension for l in restored], [12.5, 30.0])
+        self.assertEqual([l.x_extension for l in restored], [12.5, 0.0])  # (0: the default)
         # A file from before the setting was wound with its turnarounds at the ends.
         old = {"layups": "1", "layup_1": "passes=12 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 "
                                           "auto_cycles=False hoop=False"}
         self.assertEqual(winding.layups_from_header(old)[0].x_extension, 0.0)
+
+
+class StraightLength(unittest.TestCase):
+    """The tank's length is its straight section's; the domes come on top."""
+
+    def test_the_whole_tank_is_the_straight_section_and_both_domes(self):
+        job = WindingJob(straight_length=800.0)
+        self.assertAlmostEqual(job.dome_length, math.sqrt(100.0 ** 2 - 25.0 ** 2))
+        self.assertAlmostEqual(job.tank_length, 800.0 + 2 * job.dome_length)
+        self.assertEqual(WindingJob(end_cap_type="Flat", straight_length=800.0).tank_length, 800.0)
+        # A 90° wind covers exactly the straight section.
+        first, last = job.hoop_span
+        self.assertAlmostEqual(last - first + job.bandwidth, 800.0)
+        self.assertAlmostEqual(first - job.bandwidth / 2, job.chuck_offset + job.dome_length)
+
+    def test_the_file_records_both_lengths(self):
+        job = WindingJob(straight_length=640.0)
+        settings = parse_header(gcode(job))
+        self.assertEqual(float(settings["straight_length"]), 640.0)
+        self.assertAlmostEqual(float(settings["tank_length"]), job.tank_length, places=3)
+        self.assertEqual(winding.job_from_header(settings), job)
+
+    def test_an_old_file_gave_the_whole_length(self):
+        # Before 2026-10-21 a file's tank_length was end to end, and every layup
+        # wound the whole dome without going on beyond it.
+        old = {"chuck_offset": "50.0", "tank_length": "1000.0", "tank_diameter": "200.0", "end_cap_diameter": "50.0",
+               "end_cap_type": "Round", "layups": "1",
+               "layup_1": "passes=12 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0"}
+        job = winding.job_from_header(old)
+        self.assertAlmostEqual(job.tank_length, 1000.0)
+        self.assertAlmostEqual(job.straight_length, 1000.0 - 2 * job.dome_length)
+        layup = job.layups[0]
+        self.assertEqual((layup.bulkhead_auto, layup.x_extension), (False, 0.0))
+        self.assertEqual(winding.turn_points(job, layup), (50.0, 50.0 + job.tank_length))
+
+
+class BulkheadAngle(unittest.TestCase):
+    """How far onto the domes a layup winds: the angle at a dome's center from
+    the axis to where the layup turns around."""
+    OPENING = math.degrees(math.asin(25.0 / 100.0))  # the default tank's polar opening (end cap 50, diameter 200)
+
+    def test_auto_is_the_geodesic_turning_point(self):
+        for angle in (12.0, 30.0, 45.0, 70.0, 85.0):
+            job = WindingJob(layups=(Layup(passes=1, wind_angle=angle),))
+            layup = job.layups[0]
+            with self.subTest(angle=angle):
+                self.assertAlmostEqual(layup.bulkhead_angle, max(angle, self.OPENING))
+                # It turns where the tank's radius is R * sin(winding angle) --
+                # Clairaut's turning point -- or at the polar opening.
+                x_turn = winding.turn_points(job, layup)[1]
+                r_turn = winding._tank_geometry(job).radius(x_turn)
+                self.assertAlmostEqual(r_turn, max(100.0 * math.sin(math.radians(angle)), 25.0), places=6)
+        self.assertAlmostEqual(winding.opening_angle(WindingJob()), self.OPENING)
+
+    def test_a_set_angle_and_its_limits(self):
+        def cover(**layup):
+            job = WindingJob(layups=(Layup(passes=1, bulkhead_auto=False, **layup),))
+            return winding.bulkhead_cover(job, job.layups[0]), job
+        self.assertAlmostEqual(cover(bulkhead_angle=60.0)[0], 100.0 * math.cos(math.radians(60.0)))
+        full, job = cover(bulkhead_angle=5.0)  # below the opening: the whole dome
+        self.assertEqual(full, job.dome_length)
+        self.assertEqual(cover(bulkhead_angle=90.0)[0], 0.0)  # the straight section only
+        self.assertIn("Bulkhead Angle must be between 0° and 90°.",
+                      winding.geometry_errors(WindingJob(layups=(Layup(bulkhead_auto=False, bulkhead_angle=95.0),))))
+        # A 90° wind and flat end caps have no bulkhead to set.
+        self.assertEqual(winding.geometry_errors(WindingJob(layups=(Layup(hoop=True, bulkhead_angle=-5.0),))), [])
+        flat = WindingJob(end_cap_type="Flat", layups=(Layup(bulkhead_auto=False, bulkhead_angle=60.0),))
+        self.assertEqual(winding.turn_points(flat, flat.layups[0]), (flat.chuck_offset, flat.chuck_offset + flat.tank_length))
+
+    def test_the_turnaround_stays_off_the_straight_section(self):
+        # On auto, the zone is the part of the dome the layup covers: on the
+        # straight section every pass is the plain helix.
+        for layup in (Layup(passes=2, wind_angle=30.0), Layup(passes=2, wind_angle=70.0),
+                      Layup(passes=2, wind_angle=45.0, bulkhead_auto=False, bulkhead_angle=80.0)):
+            job = WindingJob(layups=(layup,))
+            layup = job.layups[0]
+            with self.subTest(bulkhead=layup.bulkhead_angle):
+                self.assertAlmostEqual(winding.layup_zone(job, layup), winding.bulkhead_cover(job, layup))
+                lo, hi = job.chuck_offset + job.dome_length, job.chuck_offset + job.tank_length - job.dome_length
+                moves = [ev for ev in winding.iter_program(job) if type(ev) is Move]
+                k = 360.0 / winding.plan_layup(job, layup).pitch
+                for p, q in zip(moves, moves[1:]):
+                    if lo - 1e-9 <= min(p.x, q.x) and max(p.x, q.x) <= hi + 1e-9 and p.x != q.x:
+                        self.assertAlmostEqual((q.a - p.a) / abs(q.x - p.x), k, places=6)
+
+    def test_the_pattern_closes_at_any_bulkhead_angle(self):
+        for bulkhead in (FULL_DOME, {}, dict(bulkhead_auto=False, bulkhead_angle=62.5)):
+            job = WindingJob(layups=tuple(replace(layup, **bulkhead) for layup in MULTI.layups))
+            fwd, ret = crossings(job)
+            for li, layup in enumerate(job.layups):
+                n = layup.passes * layup.pattern_number
+                with self.subTest(bulkhead=bulkhead, layup=li + 1):
+                    assert_perfect_grid(self, [a for k, a in fwd.items() if k[0] == li], n, "forward")
+                    assert_perfect_grid(self, [a for k, a in ret.items() if k[0] == li], n, "return")
+
+    def test_klipper_still_takes_the_turnarounds_at_speed(self):
+        for layup in (Layup(passes=1, wind_angle=20.0), Layup(passes=1, pattern_number=2, wind_angle=60.0),
+                      Layup(passes=1, wind_angle=45.0, bulkhead_auto=False, bulkhead_angle=75.0)):
+            job = WindingJob(layups=(layup,))
+            with self.subTest(bulkhead=job.layups[0].bulkhead_angle):
+                junctions = klipper_junctions(job)
+                self.assertLess(max(d for *_, d in junctions), winding.TURN_MAX_DEFLECTION + 0.2)
+                self.assertGreater(min(v / commanded for v, commanded, _ in junctions), 0.99)
+
+    def test_settings_header_round_trip(self):
+        job = WindingJob(layups=(Layup(), Layup(wind_angle=30.0, bulkhead_auto=False, bulkhead_angle=55.0)))
+        restored = winding.layups_from_header(parse_header(gcode(job)))
+        self.assertEqual([(l.bulkhead_auto, l.bulkhead_angle) for l in restored], [(True, 45.0), (False, 55.0)])
+        self.assertEqual(WindingJob(layups=tuple(restored)).layups, job.layups)
 
 
 class MultiLayupProgram(unittest.TestCase):
@@ -897,7 +1056,7 @@ class MultiLayupProgram(unittest.TestCase):
         # Files written before multi-layup support stored one pattern as top-level keys.
         legacy = {"passes": "10", "pattern_number": "3", "wind_angle": "45.0", "turnaround_angle": "270.0",
                   "bandwidth": "5.0"}
-        self.assertEqual(winding.layups_from_header(legacy), [Layup(10, 3, 45.0, 270.0, x_extension=0.0)])
+        self.assertEqual(winding.layups_from_header(legacy), [Layup(10, 3, 45.0, 270.0, x_extension=0.0, **FULL_DOME)])
         self.assertIsNone(winding.layups_from_header({"bandwidth": "5.0"}))
 
 
@@ -952,7 +1111,8 @@ class NinetyDegreeWind(unittest.TestCase):
         self.assertAlmostEqual(moves[2][-1].x, last)    # and, flipped, ends at the far end (at hoop 2's start)
         self.assertAlmostEqual(moves[3][-1].x, first)   # hoop 2 runs back to the chuck side
         self.assertLess(moves[4][0].x, first)           # so the last layup turns around there
-        self.assertAlmostEqual(moves[4][-1].x, x_start - HOOPS.layups[4].x_extension)
+        self.assertAlmostEqual(moves[4][-1].x, winding.turn_points(HOOPS, HOOPS.layups[4])[0]
+                               - HOOPS.layups[4].x_extension)
 
     def test_the_layup_before_runs_on_to_the_hoops_start(self):
         # Its last turnaround is a whole one, like every other (no dwell cut
@@ -967,13 +1127,14 @@ class NinetyDegreeWind(unittest.TestCase):
             with self.subTest(hoop=hoop + 1):
                 self.assertAlmostEqual(before[-1].x, start)
                 self.assertFalse(any(m.dwell for m in before))
-                # The last reversal is beyond the tank's end (by the layup's
+                # The last reversal is beyond where the layup turns (by its
                 # Additional X-Axis Travel); from there on the eye heads the
                 # hoop's way, on its own helix once off the dome.
                 xs = [m.x for m in before]
                 turn = max(i for i in range(1, len(xs) - 1) if (xs[i] - xs[i - 1]) * (xs[i + 1] - xs[i]) < 0)
                 extension = HOOPS.layups[hoop - 1].x_extension
-                self.assertAlmostEqual(xs[turn], x_start - extension if direction == 1 else x_end + extension)
+                turn_lo, turn_hi = winding.turn_points(HOOPS, HOOPS.layups[hoop - 1])
+                self.assertAlmostEqual(xs[turn], turn_lo - extension if direction == 1 else turn_hi + extension)
                 out = before[turn:]
                 self.assertTrue(all((q.x - p.x) * direction > 0 for p, q in zip(out, out[1:])))
                 dome_end = start - direction * HOOPS.bandwidth / 2
@@ -988,12 +1149,12 @@ class NinetyDegreeWind(unittest.TestCase):
     def test_the_layup_after_turns_around_at_the_tank_end(self):
         # Out of a hoop, the next layup doesn't wind back from the straight
         # section (pulling the fiber back over the hoop): it goes on the same
-        # way, over the dome at its own angle, and turns around at the tank's
-        # end (beyond it by its Additional X-Axis Travel) with its own dwell --
-        # the helix there and back plus the dwell.
+        # way, over the dome at its own angle, and turns around where its
+        # Bulkhead Angle takes it (beyond by its Additional X-Axis Travel)
+        # with its own dwell -- the helix there and back plus the dwell.
         moves = layup_moves(HOOPS)
-        x_start, x_end = HOOPS.chuck_offset, HOOPS.chuck_offset + HOOPS.tank_length
-        for after, x_turn in ((2, x_end), (4, x_start)):
+        for after, side in ((2, 1), (4, 0)):
+            x_turn = winding.turn_points(HOOPS, HOOPS.layups[after])[side]
             layup = HOOPS.layups[after]
             hoop_end = moves[after - 1][-1]
             direction = 1 if x_turn > hoop_end.x else -1
@@ -1049,8 +1210,8 @@ class NinetyDegreeWind(unittest.TestCase):
             with self.subTest(cap=job.end_cap_type, zone=job.turnaround_zone):
                 moves = layup_moves(job)
                 first, last = job.hoop_span
-                x_start, x_end = job.chuck_offset, job.chuck_offset + job.tank_length
-                x_lo, x_hi = x_start - job.layups[0].x_extension, x_end + job.layups[2].x_extension
+                x_lo = winding.turn_points(job, job.layups[0])[0] - job.layups[0].x_extension
+                x_hi = winding.turn_points(job, job.layups[2])[1] + job.layups[2].x_extension
                 # Into the hoop: from the last reversal at the chuck end, only ever toward it.
                 into = moves[0][max(i for i, m in enumerate(moves[0]) if abs(m.x - x_lo) < 1e-6):]
                 self.assertTrue(all(b.x > a.x for a, b in zip(into, into[1:])))
@@ -1060,6 +1221,50 @@ class NinetyDegreeWind(unittest.TestCase):
                 out = out[:next(i for i, m in enumerate(out) if abs(m.x - x_hi) < 1e-6) + 1]
                 self.assertTrue(all(b.x > a.x for a, b in zip(out, out[1:])))
                 self.assertAlmostEqual(out[0].x, last)
+
+    def test_a_double_one_winds_there_and_back(self):
+        job = WindingJob(layups=(Layup(passes=2), Layup(hoop=True, double=True), Layup(passes=2, wind_angle=30.0)))
+        first, last = job.hoop_span
+        self.assertEqual(job.layups[1].passes, 2)  # one cycle each way
+        self.assertEqual(winding.start_sides(job), [1, 1, 1])  # back where it began
+        moves = layup_moves(job)[1]
+        there = [m for m in moves if m.circuit == 0]
+        back = [m for m in moves if m.circuit == 1]
+        self.assertAlmostEqual(there[-1].x, last)
+        self.assertAlmostEqual(back[-1].x, first)
+        self.assertTrue(all(b.x <= a.x for a, b in zip(back, back[1:])))
+        self.assertEqual([ev.layup for ev in winding.iter_program(job) if type(ev) is CycleComplete].count(1), 2)
+
+    def test_a_double_one_moves_exactly_like_two_hoop_layups(self):
+        double = WindingJob(layups=(Layup(passes=2), Layup(hoop=True, double=True), Layup(passes=2, wind_angle=30.0)))
+        two = WindingJob(layups=(Layup(passes=2), Layup(hoop=True), Layup(hoop=True), Layup(passes=2, wind_angle=30.0)))
+        path = lambda job: [(m.x, m.y, m.a) for m in winding.iter_program(job) if type(m) is Move]
+        self.assertEqual(path(double), path(two))
+        # ...and pauses where they would: at each end of the straight section.
+        def pauses(job):
+            lines, x, at = gcode(job), None, []
+            for ln in lines:
+                if ln.startswith("G1") and " X" in ln:
+                    x = float(ln.split(" X", 1)[1].split()[0])
+                elif ln == "PAUSE" and x is not None:
+                    at.append(x)
+            return at
+        self.assertEqual(pauses(double), pauses(two))
+        first, last = double.hoop_span
+        self.assertEqual(len(pauses(double)), 4)  # attaching the fiber, then first, last, first
+        self.assertEqual(pauses(double)[1:], [round(first, 3), round(last, 3), round(first, 3)])
+        no_pauses = replace(double, pause_after_layup=False)
+        self.assertEqual(sum(ln == "PAUSE" for ln in gcode(no_pauses)), 1)
+
+    def test_continuing_inside_a_double_ones_way_back(self):
+        job = WindingJob(layups=(Layup(passes=1), Layup(hoop=True, double=True), Layup(passes=1, wind_angle=30.0)))
+        first, last = job.hoop_span
+        location = winding.locate(job, winding.ProgramPoint(1, 1, 7200.0))  # 20 turns into the way back
+        self.assertAlmostEqual(location.x, last - 20 * job.bandwidth, places=6)
+        full = without_angle_updates(gcode(job))
+        rest = without_angle_updates(after_first_move(partial(job, winding.ProgramPoint(1, 1, 7200.0)),
+                                                      "; LAYUP_START:2"))
+        self.assertEqual(full[full.index(rest[0]):], rest)
 
     def test_a_flipped_layup_keeps_its_pattern(self):
         # Started from the far end, the helical layup is simply mirrored: its
@@ -1090,8 +1295,8 @@ class NinetyDegreeWind(unittest.TestCase):
         self.assertEqual(winding.geometry_errors(WindingJob(layups=(Layup(hoop=True, wind_angle=95.0, passes=0),))), [])
 
     def test_straight_section_too_short(self):
-        # Round caps on a 200 mm tank: domes of ~97 mm each leave 6 mm straight.
-        job = WindingJob(tank_length=200.0, bandwidth=8.0, layups=(Layup(), Layup(hoop=True)))
+        # 6 mm of straight section for an 8 mm band.
+        job = WindingJob(straight_length=6.0, bandwidth=8.0, layups=(Layup(), Layup(hoop=True)))
         self.assertIn("Layup 2: The straight section is too short for a 90° wind (it must be longer than the band "
                       "is wide).", winding.geometry_errors(job))
 
@@ -1267,13 +1472,13 @@ class Validation(unittest.TestCase):
         self.assertEqual(errors, ["Number of Cycles and Pattern Number must both be at least 1."])
 
     def test_machine_limits_block_generation_only(self):
-        job = WindingJob(tank_length=winding.MAX_X)
+        job = WindingJob(straight_length=winding.MAX_X)
         self.assertEqual(winding.geometry_errors(job), [])
         self.assertEqual(len(winding.validate(job)), 1)
 
     def test_values_are_normalized(self):
         self.assertEqual(Layup(passes=4.0, wind_angle=45), Layup(passes=4, wind_angle=45.0))
-        self.assertIsInstance(WindingJob(tank_length=1000).tank_length, float)
+        self.assertIsInstance(WindingJob(straight_length=1000).straight_length, float)
 
 
 class Simulation(unittest.TestCase):
@@ -1344,7 +1549,7 @@ class ResumedSimulation(unittest.TestCase):
         self.assert_resumes(more, HOOPS, 4)
 
     def test_global_change_runs_everything(self):
-        self.assert_resumes(HOOPS, replace(HOOPS, tank_length=210.0), 0)
+        self.assert_resumes(HOOPS, replace(HOOPS, straight_length=210.0), 0)
         self.assert_resumes(HOOPS, replace(HOOPS, max_filament_speed=200.0), 0)
 
     def test_unchanged(self):
@@ -1397,7 +1602,7 @@ class JobFromHeader(unittest.TestCase):
     def test_not_a_job(self):
         self.assertIsNone(winding.job_from_header({}))
         settings = parse_header(gcode(MULTI))
-        settings["tank_length"] = "long"
+        settings["straight_length"] = "long"
         self.assertIsNone(winding.job_from_header(settings))
 
 

@@ -68,8 +68,8 @@ class CFRPWinderApp:
         style = theme.apply(self.root, self.theme_mode)
         theme.setup_compact_styles(style)
         self.canvas_palette = theme.PALETTES[self.theme_mode]
-        self._icon_image = theme.build_icon(style.colors.primary)
-        self.root.iconphoto(True, self._icon_image)
+        # The window icon (every window's): the ASTRA mark, in a few sizes.
+        self._icon_images = theme.apply_icon(self.root, style.colors.primary)
 
         # Settings are split in two: `params` holds everything shared by the
         # whole winding program (machine, tank, tow width, ...), while each entry
@@ -103,6 +103,12 @@ class CFRPWinderApp:
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="Ready")
+        # The ASTRA logo in the window's bottom-right corner, in the club's
+        # purple (lighter on the dark theme; see _draw_logo).
+        self._logo_label = ttk.Label(status_bar)
+        self._logo_label.pack(side=tk.RIGHT)
+        self._logo_image = None
+        self._draw_logo()
         ttk.Label(status_bar, textvariable=self.status_var).pack(side=tk.LEFT)
 
         # --- MAIN LAYOUT: settings on the left, split previews on the right ---
@@ -198,6 +204,15 @@ class CFRPWinderApp:
         if self.strength_dialog is not None and self.strength_dialog.exists():
             self.strength_dialog.on_theme_changed()
             self.strength_dialog.refresh()
+        self._draw_logo()
+
+    def _draw_logo(self):
+        # The status bar's ASTRA logo, in the purple that reads on this theme
+        # (nothing, if the logo's file is missing).
+        from PIL import ImageTk
+        image = theme.logo_lockup(18, theme.ASTRA_PURPLE[self.theme_mode])
+        self._logo_image = ImageTk.PhotoImage(image) if image is not None else None
+        self._logo_label.configure(image=self._logo_image or "")
 
     def set_status(self, text):
         if hasattr(self, "status_var"): self.status_var.set(text)
@@ -285,8 +300,9 @@ class CFRPWinderApp:
     def add_layup(self):
         # A new layup inherits every setting from the last one, so building up a
         # program usually only means changing the one or two values that differ
-        # -- except its Number of Cycles, which always starts on auto.
-        self.layups.append(self._copy_layup_vars(self.layups[-1], auto_cycles=True))
+        # -- except its Number of Cycles and Bulkhead Angle, which always start
+        # on auto.
+        self.layups.append(self._copy_layup_vars(self.layups[-1], auto_cycles=True, bulkhead_auto=True))
         self.active_layup = len(self.layups) - 1
         self._layups_changed()
 
@@ -444,6 +460,7 @@ class CFRPWinderApp:
 
 
 if __name__ == "__main__":
-    root = tb.Window(themename=theme.LIGHT_THEME)
+    # (No ttkbootstrap default icon: the app sets its own, see theme.apply_icon.)
+    root = tb.Window(themename=theme.LIGHT_THEME, iconphoto=None)
     app = CFRPWinderApp(root)
     root.mainloop()

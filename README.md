@@ -25,8 +25,32 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ## Features
 
 - **Tank geometry:** cylindrical tank with **Round** (spherical-dome) or
-  **Flat** end caps. Set the tank length, the tank diameter and the end-cap
-  (polar opening) diameter.
+  **Flat** end caps. Set the *Straight Length* (the cylindrical section
+  between the domes), the tank diameter and the end-cap (polar opening)
+  diameter. With round end caps the domes come on top of the straight length:
+  each is a hemisphere of the tank's radius, cut off at the polar opening, so
+  the whole tank is the straight length plus a dome at each end. Files written
+  before 2026-10-21 gave the whole length, end to end; they reopen with the
+  straight length worked out from it, and wind exactly as they did.
+- **Bulkhead Angle (per layup):** how far onto each dome a layup winds before
+  it turns around. It's the angle at the dome's center (on the axis, where
+  the straight section ends) from the axis to the turning point on the dome's
+  semicircular profile. 90° winds the straight section only; the lower the
+  angle, the closer to the polar opening the layup turns. At the opening's own
+  angle or below, it winds the whole dome (14.5° for a 200 mm tank with a
+  50 mm opening). The angle starts on **auto** (grey, **AUTO**, like *Number of
+  Cycles*): where the fiber turns by itself at the layup's winding angle. Along
+  a geodesic, r · sin(angle) stays the same (Clairaut), so a fiber leaving the
+  straight section at the winding angle turns around where r = R · sin(winding
+  angle). On a spherical dome that point lies at exactly the winding angle
+  from the axis. So a 45° layup turns at 45°, and a 12° layup winds the whole
+  dome, since it can't turn inside the polar opening. Type a value to fix it;
+  clear the field to go back to auto. A value below the opening's angle is
+  set to it when you leave the field. The turnaround zone (on auto) is the
+  part of the dome the layup covers, so the turnaround stays off the straight
+  section. The pattern math counts exactly the length the layup winds, so
+  every circuit still lands on the pattern. With flat end caps there's no
+  dome, and the field is greyed out.
 - **Helical winding:** set the winding angle, the tow/band width and the
   pattern number (strands per cycle). Each cycle lays `pattern_number` evenly
   spaced circuits around the circumference. After each cycle the pattern moves
@@ -41,16 +65,23 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   program. Each layup keeps its own pattern
   alignment, and two identical layups in a row wind exactly on top of each
   other, like repeated layers.
-- **90° wind (hoop layups):** check *90° Wind (Straight Section Only)* in a
-  layup to wind the straight section only, never the domes. It is a single
+- **90° wind (hoop layups):** check *90° Wind* in a layup to wind the
+  straight section only, never the domes. It is a single
   pass from one end of the straight section to the other. Each turn advances
   exactly one band width, so the bands lie edge to edge at just under 90°
   (89.5° for a 200 mm tank and 5 mm tow). The band's edges are flush with the
   ends of the straight section. There is no pattern and no turnaround, so the
-  layup's cycles, pattern number, winding angle, dwell and additional X-axis
-  travel are greyed out. The
-  fields show what it winds instead: one pass at its actual angle. The layup's
-  helical values are kept, and unchecking the box brings them back.
+  layup's cycles, pattern number, winding angle, bulkhead angle, dwell and
+  additional X-axis travel are greyed out. The fields show what it winds
+  instead: one pass at its actual angle, with a 90° bulkhead angle. The
+  layup's helical values are kept, and unchecking the box brings them back.
+  - **Double:** the checkbox next to *90° Wind* (only available for a 90°
+    wind) winds it a second time, back to where it began. It behaves exactly
+    like a second 90° layup right after the first: the same moves, and with
+    *Pause After Each Layup* a pause at the far end of the straight section.
+    The layups after it start from the same end it did, and a helical layup
+    after it gets on and off the straight section as described below. It is
+    one layup with two cycles, one each way.
   - **Getting on:** the helical layup before it finishes its last turnaround
     like every other one (the full dwell, and the smooth run back out of the
     dome). It then runs on along its own helix to the start of the straight
@@ -63,12 +94,13 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
     and the machine pauses there for the next layup change. A helical layup
     after it doesn't wind back from there, which would pull the fiber back
     over the hoop. It goes on the same way over the dome at its own winding
-    angle, turns around at the tank's end with its own dwell, and winds its
-    circuits from that end. Another 90° wind after it winds straight back
+    angle, turns around where its Bulkhead Angle takes it with its own dwell,
+    and winds its circuits from that end. Another 90° wind after it winds straight back
     along the straight section.
   - **Direction:** since the pass ends at the other end of the tank, the next
     layup starts from there and winds the other way. Each 90° layup flips the
-    direction for everything after it. A helical layup that starts from the
+    direction for everything after it (a double one doesn't: it ends where it
+    began). A helical layup that starts from the
     far end winds its pattern mirrored, exactly as well aligned. The preview
     caption says when a layup starts from the far end.
   - **Automatic switch:** typing a *Winding Angle* above 85° and leaving the
@@ -101,7 +133,8 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   smooth curve, so the machine never brakes for a corner. The turnaround's
   rotation is spread over the zone, so no fiber builds up in a ring at the end
   (the old Excel generator's "bulkhead height compensation").
-  - **Auto** (grey, **AUTO**): the zone is the dome, so the fiber turns around
+  - **Auto** (grey, **AUTO**): the zone is the dome. Each layup turns over the
+    part of it that it winds (its Bulkhead Angle), so the fiber turns around
     beyond the straight section. With flat end caps it is 50 mm. Type a value
     to fix it; clear the field to go back to auto. 0 turns on the spot at the
     end, which stops the machine there.
@@ -124,17 +157,19 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
     large *Additional X-Axis Travel* (60 mm on a 200 mm tank, say) a shallow
     layup also eases off briefly, to about 90 %, where the eye levels off
     beyond the tank's end.
-- **Additional X-Axis Travel (per layup, default 30 mm):** the eye turns
-  around this far beyond each end of the tank. The fiber trails behind the
-  eye, so this lets it reach all the way out to the polar opening before it
-  turns. The turnaround curve starts where the zone does and simply reaches
+- **Additional X-Axis Travel (per layup, default 0 mm):** the eye goes this
+  much further than where the layup turns (its Bulkhead Angle) before it
+  turns back. The fiber trails behind the eye, so this lets it reach all the
+  way out to that point before it turns. A negative value is set to 0 when you
+  leave the field. The turnaround curve starts where the zone does and simply reaches
   further, so it is still one smooth curve. With a zone of 0, the helix runs
   on out to there and the eye turns on the spot. The mandrel turns the helix
   over the extra travel, in and out, on top of the dwell. That rotation is
   counted in the pattern math, so every circuit still lands exactly on the
-  pattern. A 90° wind doesn't use it. With it, the carriage runs from
-  *Chuck X-Offset* − travel to the tank's far end + travel; generating
-  G-code refuses a program that would leave 0 … 5250 mm. Files written before
+  pattern. A 90° wind doesn't use it. With it, the carriage can run beyond
+  the tank's ends (with the whole dome wound, from *Chuck X-Offset* − travel
+  to the far end + travel); generating G-code refuses a program that would
+  leave 0 … 5250 mm. Files written before
   the setting existed reopen with 0, which is how they were wound. The
   previews draw the fiber where it lies: at the tank's end, around the polar
   opening, while the eye is beyond it.
@@ -187,14 +222,33 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   every layup except the last, so the fiber can be checked (for slipping, say)
   after each pattern change. Resume on the machine to continue. Before and
   after a 90° wind, the pause is where it starts and ends on the straight
-  section.
+  section; a double 90° wind also pauses between its two passes, at the far
+  end.
 - **Continuing an interrupted wind (Export Partial G-Code):** if something goes
   wrong, cancel the program on the machine, adjust the settings if needed, and
   export a partial program that continues from where the wind stopped. See
   [Continuing an interrupted wind](#continuing-an-interrupted-wind).
-- **Live Settings Preview:** a pseudo-3D tank view that you can rotate, drawn
-  as large as the preview allows, and an end-on view showing the eye reach. A
-  slim estimates sidebar sits beside them, with two groups:
+- **Live Settings Preview:** a pseudo-3D tank view, drawn as large as the
+  preview allows and centered, with a mounting rod of the same length at each
+  end. Hold the ▲ ▼ arrows inside it, at its left edge, to turn it around the
+  tank's axis. Beside it, a column with an end-on view showing the eye
+  reach, and below it the **Bulkhead** view. That's the selected layup's
+  turnaround up close: the far end's dome in profile (the semicircle the
+  angle is measured on) with the boss and as much of the straight section as
+  fits. The layup's first-cycle strands run over the dome and on along the
+  straight section: every circuit of the cycle, one per strand of the
+  pattern -- or, with **View Single** checked (it's off by default), just its
+  first circuit: one strand coming onto the dome, going around it (thin and
+  dashed where it runs behind) and back off. Over every circuit, the Bulkhead
+  Angle is drawn too: a line from the semicircle's center with its arc, the turning
+  circle (the dashed line through the turning point), the polar opening's
+  angle (faint dotted line; the whole dome from there down) and, with
+  Additional X-Axis Travel, a ▼ where the eye turns back. The angle's value
+  (tagged AUTO while on auto) is always shown above the view. The view has
+  its own ▲ ▼ arrows, inside it at its left edge: hold one to turn it around the tank's
+  axis, independently of the tank view. While continuing a wind it shows
+  what's wound so far, and View Single is greyed out. A slim estimates
+  sidebar sits beside them, with two groups:
   - **Program:** time · total cycles, tow length · dry fiber mass, resin mass,
     top rotation speed, eye reach (orange, like the reach lines in the end
     view) and the safety factor at the operating pressure (orange below 1).
@@ -240,6 +294,11 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   finishes, the window shows where the file was saved. Opening a large file
   (over 1 MB) uses the same window.
 - Light and dark themes (View menu).
+- **ASTRA branding:** the student club's logo (`assets/astra_logo.png`) is
+  the window icon (its mark, white on a purple tile) and sits small in the
+  status bar's right corner (mark and name, in purple; lighter on the dark
+  theme). Both are colored from that one black-on-white file at startup; the
+  purple is `ASTRA_PURPLE` in `theme.py`.
 
 ## Generated G-code
 
@@ -255,11 +314,12 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; turnaround_zone: 96.82458365518542
 ; turnaround_zone_auto: True
 ; layups: 2
-; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False x_extension=30.0
-; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True x_extension=30.0
+; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False x_extension=0.0 bulkhead_angle=45.0 bulkhead_auto=True double=False
+; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True x_extension=0.0 bulkhead_angle=45.0 bulkhead_auto=True double=False
 ; estimate_fiber_strength: 5100.0     <- the Strength & Materials inputs...
 ; ...
 ; estimate_result_safety_factor: 1.203  <- ...and what they gave for this wind
+; tank_length: 1193.649       <- the whole tank, end to end (straight_length + 2 domes)
 ; ld: 96.825                  <- computed dome length
 ; -----------------------
 G28                           <- or just "G92 A0" if "Home Axes Before Winding" is off
@@ -482,9 +542,11 @@ python main.py
    Cycles* starts on auto (grey, tagged **AUTO**), so it covers the tank
    completely. Type a number only if you want a different count. Use **‹ ›**
    to switch between layups and **−** to remove the selected one. The colored
-   swatch next to the title matches that layup's color in the previews. Check
-   **90° Wind (Straight Section Only)** for a hoop layer over the straight
-   section.
+   swatch next to the title matches that layup's color in the previews. Its
+   *Bulkhead Angle* starts on auto too, following the winding angle; the
+   Bulkhead view beside the preview shows where it turns. Check **90° Wind**
+   for a hoop layer over the straight section, and **Double** to wind it there
+   and back.
 3. Check the estimates. *Cycles for Full Coverage* shows how many cycles the
    selected layup needs to cover the tank completely, and *Coverage* shows how
    much its current number of cycles covers. Check **Show All Layups** to see
@@ -511,11 +573,12 @@ python -m unittest -v
 |------|---------|
 | `main.py` | App entry point and `CFRPWinderApp`: window layout and menus, the settings model (global settings plus one set of variables per layup), and G-code file output. |
 | `winding.py` | All winding math, with no GUI dependency: the `WindingJob`/`Layup` settings, validation, geometry, dwell/pattern alignment, the turnaround curves, the motion generator (`iter_program`), the preview simulation (`simulate`), and the G-code writer and header parser. |
-| `plan_tab.py` | `PlanTab`: settings form with the layup switcher, live Settings Preview (3D tank, end view, estimates, Show All Layups legend, the tank's progress while continuing a wind), wind-angle validation and the background calculations. |
+| `plan_tab.py` | `PlanTab`: settings form with the layup switcher, live Settings Preview (3D tank, end view, Bulkhead view, estimates, Show All Layups legend, the tank's progress while continuing a wind), wind-angle validation and the background calculations. |
 | `partial_page.py` | `PartialPage`: the Export Partial G-Code page that replaces the settings while continuing an interrupted wind. |
 | `view_tab.py` | `ViewTab`: G-code parser (`read_gcode`) and playback viewer. |
 | `progress_dialog.py` | `ProgressTask`: runs a long task on a worker thread behind a progress window, with Cancel. |
-| `theme.py` | ttkbootstrap theme setup, canvas color palettes (including the layup colors) and the generated app icon. |
+| `theme.py` | ttkbootstrap theme setup, canvas color palettes (including the layup colors), and the ASTRA logo and window icon, colored from `assets/`. |
+| `assets/astra_logo.png` | The ASTRA student club's logo (black on white), the source of the window icon and the status bar logo. |
 | `strength.py` | The material and strength estimate (after the Excel sheet), its inputs, and their record in the G-code header. |
 | `strength_dialog.py` | `StrengthDialog`: the Strength & Materials window. |
 | `test_winding.py`, `test_strength.py` | Headless tests for `winding.py` and `strength.py`. |
@@ -546,8 +609,19 @@ python -m unittest -v
   straight section. A helical layup that starts from the far end runs its
   circuits the other way round, with the same pattern math. `HOOP_IGNORED` lists the settings a 90°
   wind doesn't use, and `HOOP_ANGLE_THRESHOLD` and `LEAD_IN_ANGLE` are
-  constants at the top of `winding.py`. The `NinetyDegreeWind` tests check it
-  on the generated motion.
+  constants at the top of `winding.py`. A double one (`Layup.double`) is one
+  layup of two cycles, one each way; `_write_events` pauses between them. The
+  `NinetyDegreeWind` tests check it on the generated motion, including that a
+  double one moves exactly like two 90° layups.
+- **Tank length and bulkheads:** `WindingJob.straight_length` is the setting;
+  `tank_length` is a property, the whole tank end to end, so code that needs
+  the tank's ends keeps using it. Where a layup turns comes from the bulkhead
+  helpers in `winding.py`: `opening_angle()`, `auto_bulkhead_angle()`
+  (Clairaut), `bulkhead_cover()`, `turn_points()` and `layup_zone()`.
+  `plan_layup()` counts the span between the turn points in the pattern.
+  `LEGACY_VALUES` / `LAYUP_LEGACY_VALUES` restore older files: the straight
+  length from their end-to-end length, every layup over the whole dome. The
+  `GoldenMaster` "legacy_*" cases pin that such files wind exactly as before.
 - **Adding a setting:** add a field to `WindingJob` (global) or `Layup` (per
   layup) in `winding.py`, then add its entry field to the matching field list
   at the top of `plan_tab.py`. The Tk variables, the settings header and
