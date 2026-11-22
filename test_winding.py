@@ -782,6 +782,173 @@ class SmoothTurnaround(unittest.TestCase):
         self.assertTrue(all(len(runs) == 2 for runs in result.layups[0].strand_runs))
 
 
+def path(job):
+    return [(round(m.x, 9), round(m.y, 9), round(m.a, 6)) for m in winding.iter_program(job) if type(m) is Move]
+
+
+class HarshTurnaround(unittest.TestCase):
+    # Flat end caps, the auto zone (FLAT_TURNAROUND_ZONE), a harsh layup between
+    # a smooth one and a 90° wind -- and a harsh one with Additional X-Axis Travel.
+    FLAT = WindingJob(end_cap_type="Flat", straight_length=900.0, layups=(
+        Layup(passes=2, pattern_number=3, wind_angle=45.0, turnaround_angle=180.0),
+        Layup(passes=2, pattern_number=5, wind_angle=30.0, turnaround_angle=120.0, harsh_turnaround=True),
+        Layup(hoop=True),
+        Layup(passes=1, pattern_number=2, wind_angle=60.0, turnaround_angle=90.0, harsh_turnaround=True,
+              x_extension=20.0),
+    ))
+
+    def smooth(self, job):
+        return replace(job, layups=tuple(replace(l, harsh_turnaround=False) for l in job.layups))
+
+    def test_dwells_only_at_the_very_end(self):
+        job = self.FLAT
+        for li in (1, 3):
+            layup = job.layups[li]
+            lo, hi = winding.turn_points(job, layup)
+            ends = (lo - layup.x_extension, hi + layup.x_extension)
+            moves = [m for m in winding.iter_program(job) if type(m) is Move and m.layup == li]
+            with self.subTest(layup=li + 1):
+                self.assertEqual(winding.layup_zone(job, layup), 0.0)
+                # Every turnaround is a pure rotation right at the end...
+                for m in moves:
+                    if m.dwell:
+                        self.assertTrue(any(abs(m.x - e) < 1e-9 for e in ends), m.x)
+                # ...and everywhere else the carriage keeps moving along the helix.
+                for p, q in zip(moves, moves[1:]):
+                    if not q.dwell:
+                        self.assertNotEqual(p.x, q.x)
+                self.assertTrue(any(m.dwell for m in moves))
+        # The smooth layup before it still turns over its zone.
+        self.assertFalse(any(m.dwell for m in winding.iter_program(job) if type(m) is Move and m.layup == 0))
+
+    def test_pattern_and_rotation_are_unchanged(self):
+        # The mandrel turns exactly as much per circuit as with the smooth curve:
+        # every mid-tank crossing, and so the whole pattern, stays where it was.
+        harsh, smooth = crossings(self.FLAT), crossings(self.smooth(self.FLAT))
+        for h, s in zip(harsh, smooth):
+            self.assertEqual(h.keys(), s.keys())
+            for key in h:
+                self.assertAlmostEqual(h[key], s[key], places=6)
+        last = lambda job: [ev for ev in winding.iter_program(job) if type(ev) is Move][-1].a
+        self.assertAlmostEqual(last(self.FLAT), last(self.smooth(self.FLAT)), places=6)
+        fwd, ret = harsh
+        for li in (1, 3):
+            layup = self.FLAT.layups[li]
+            n = layup.passes * layup.pattern_number
+            assert_perfect_grid(self, [a for k, a in fwd.items() if k[0] == li], n, "forward")
+            assert_perfect_grid(self, [a for k, a in ret.items() if k[0] == li], n, "return")
+
+    def test_off_by_default_and_old_files_stay_smooth(self):
+        self.assertFalse(Layup().harsh_turnaround)
+        old = {"layups": "1", "layup_1": "passes=12 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0"}
+        self.assertFalse(winding.layups_from_header(old)[0].harsh_turnaround)
+
+    def test_round_trips_through_the_header(self):
+        restored = winding.job_from_header(parse_header(gcode(self.FLAT)))
+        self.assertEqual([l.harsh_turnaround for l in restored.layups], [False, True, False, True])
+        self.assertEqual(restored, self.FLAT)
+
+    def test_dwell_is_split_by_max_move_time(self):
+        # A long dwell is one pure rotation, cut into pieces like any move, so a
+        # PAUSE still stops the machine promptly.
+        job = replace(self.FLAT, max_surface_speed=60.0)
+        dwells = [m for m in winding.iter_program(job) if type(m) is Move and m.dwell]
+        self.assertTrue(dwells)
+        self.assertLessEqual(max(m.duration for m in dwells), job.max_move_time + 1e-9)
+
+    def test_a_90_degree_wind_ignores_it(self):
+        job = WindingJob(layups=(Layup(passes=1), Layup(hoop=True, harsh_turnaround=True), Layup(passes=1)))
+        self.assertEqual(path(job), path(self.smooth(job)))
+        self.assertIn("harsh_turnaround", winding.HOOP_IGNORED)
+
+    def written_dwells(self, job):
+        # Each dwell as the machine gets it: the F (deg/min, A alone moving) and
+        # the rotation of every pure-rotation G1 in a row.
+        dwells, run, pos = [], [], None
+        for ln in gcode(job):
+            if ln.startswith("G92"):
+                pos = pos and (pos[0], pos[1], float(ln.split("A", 1)[1]))
+                continue
+            if not ln.startswith("G1"):
+                continue
+            w = {tok[0]: float(tok[1:]) for tok in ln.split()[1:]}
+            new = (w.get("X", pos and pos[0]), w.get("Y", pos and pos[1]), w.get("A", pos and pos[2]))
+            if pos is not None and new[:2] == pos[:2] and new[2] != pos[2]:
+                run.append((w["F"], new[2] - pos[2]))
+            elif run:
+                dwells.append(run)
+                run = []
+            pos = new
+        return dwells + ([run] if run else [])
+
+    def test_dwell_starts_and_ends_slowly(self):
+        for job in (self.FLAT, replace(self.FLAT, harsh_accel=60.0), replace(self.FLAT, harsh_accel=2000.0)):
+            accel = job.harsh_a_accel * 60.0  # deg/min per s
+            step = accel * winding.HARSH_RAMP_STEP  # the most F may change between two moves
+            dwells = self.written_dwells(job)
+            with self.subTest(accel=job.harsh_accel):
+                # Every turnaround of layups 2 and 4 (10 and 2 circuits), and
+                # layup 4's first one, out of the 90° wind.
+                self.assertEqual(len(dwells), 2 * 10 + 2 * 2 + 1)
+                for run in dwells:
+                    feeds = [f for f, _ in run]
+                    self.assertLessEqual(feeds[0], step / 2 + 1)  # from a stand: half a step on average
+                    self.assertLessEqual(feeds[-1], step / 2 + 1)
+                    self.assertLessEqual(max(b - a for a, b in zip(feeds, feeds[1:])), step + 1)
+                    self.assertLessEqual(max(a - b for a, b in zip(feeds, feeds[1:])), step + 1)
+                    self.assertLessEqual(max(feeds), job.max_a_speed)
+                    # As long as the ideal ramp takes (F rounded down: a hair longer).
+                    total = sum(da for _, da in run)
+                    v, a = job.max_a_speed / 60.0, job.harsh_a_accel
+                    ramp = min(v * v / (2 * a), total / 2)
+                    ideal = 2 * math.sqrt(2 * ramp / a) + (total - 2 * ramp) / v
+                    took = sum(da / f * 60.0 for f, da in run)
+                    self.assertGreaterEqual(took, ideal - 1e-3)
+                    self.assertLess(took, ideal * 1.03 + 0.01)
+
+    def test_the_ramp_never_changes_the_path(self):
+        # Only the dwell's speed: the same angles, every pass crossing where it did.
+        gentle, quick = (replace(self.FLAT, harsh_accel=accel) for accel in (60.0, 1e6))
+        for c1, c2 in zip(crossings(gentle), crossings(quick)):
+            self.assertEqual(c1.keys(), c2.keys())
+            for key in c1:
+                self.assertAlmostEqual(c1[key], c2[key], places=6)
+        ends = lambda job: [m.a for m in winding.iter_program(job) if type(m) is CycleComplete]
+        self.assertEqual(ends(gentle), ends(quick))
+
+    def test_estimate_includes_the_ramp(self):
+        slow, fast = (winding.simulate(replace(self.FLAT, harsh_accel=accel)).total_time for accel in (60.0, 600.0))
+        self.assertGreater(slow, fast)
+
+    def test_continuing_inside_a_ramp(self):
+        job = self.FLAT
+        a_cycle, point = 0.0, None
+        for ev in winding.iter_program(job):
+            if type(ev) is CycleComplete:
+                a_cycle = ev.a
+            elif type(ev) is Move and ev.layup == 1 and ev.feed_cap < math.inf:
+                point = winding.ProgramPoint(1, 0, ev.a - a_cycle - 0.001)
+                break
+        part = partial(job, point)
+        body = part[part.index("; -----------------------") + 2:]
+        cut = next(ln for ln in after_first_move(body, "; LAYUP_START:2") if ln.startswith("G1"))
+        self.assertIn(cut, gcode(job))  # the slow step after it, exactly as in the whole program
+        full = without_angle_updates(gcode(job))
+        rest = without_angle_updates(after_first_move(body, "; LAYUP_START:2"))
+        self.assertEqual(full[full.index(rest[0]):], rest)
+
+    def test_accel_must_be_positive(self):
+        self.assertIn("Harsh Turnaround Accel must be greater than 0.",
+                      winding.geometry_errors(replace(self.FLAT, harsh_accel=0.0)))
+
+    def test_works_with_round_end_caps_too(self):
+        job = WindingJob(layups=(Layup(passes=2, harsh_turnaround=True),))
+        self.assertEqual(winding.validate(job), [])
+        lo, hi = winding.turn_points(job, job.layups[0])
+        dwells = {round(m.x, 6) for m in winding.iter_program(job) if type(m) is Move and m.dwell}
+        self.assertEqual(dwells, {round(lo, 6), round(hi, 6)})
+
+
 class AdditionalXTravel(unittest.TestCase):
     """A layup's Additional X-Axis Travel: the eye turns around beyond the
     tank's ends, and the pattern still closes exactly."""

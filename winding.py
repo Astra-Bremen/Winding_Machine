@@ -35,6 +35,10 @@ FLAT_TURNAROUND_ZONE = 50.0  # Auto turnaround zone with flat end caps (no dome 
 # in (X, Y, A) space (deg). Klipper takes such a junction at full speed: at its
 # default square_corner_velocity (5 mm/s) it allows about 350 mm/s.
 TURN_MAX_DEFLECTION = 1.5
+# A harsh turnaround's dwell ramps its speed up (and back down) in steps of
+# this long (s) each, every one a G1 move of its own speed (see soft_dwell
+# in iter_program): Klipper only ever has to change speed by a small step.
+HARSH_RAMP_STEP = 0.05
 
 # --- VISUALIZATION-ONLY RENDERING RESOLUTION ---
 # Caps how many degrees of rotation may separate two consecutive strand-path
@@ -98,6 +102,15 @@ class Layup:
     # second 90° layup (with the pause between them), so the layups after it
     # start from the same end it did.
     double: bool = False
+    # Harsh turnaround: the helix runs straight on to the very end (where the
+    # layup turns, plus its Additional X-Axis Travel) and the whole dwell is
+    # turned there, as a pure rotation -- no Turnaround Zone to spread it over
+    # (see layup_zone). The fiber comes into the end as straight as it can;
+    # meant for flat end caps with catchers holding it, as nothing else stops
+    # it slipping. The carriage stops there, and the dwell is ramped gently up
+    # and down (WindingJob.harsh_accel). The pattern is unchanged: the
+    # mandrel turns exactly as much per circuit either way.
+    harsh_turnaround: bool = False
 
     def __post_init__(self):
         _coerce_fields(self)
@@ -145,6 +158,12 @@ class WindingJob:
     # section (FLAT_TURNAROUND_ZONE with flat end caps). 0 = turn on the spot.
     turnaround_zone: float = 0.0
     turnaround_zone_auto: bool = True
+    # How fast a harsh turnaround's dwell speeds the mandrel up from a stand
+    # and slows it down again (mm/s^2, at the tank's surface, like Max
+    # Rotation Speed): far gentler than the machine's own acceleration, so
+    # the tank doesn't slip in the chuck. Only the dwell's speed follows it,
+    # never the path (see soft_dwell in iter_program).
+    harsh_accel: float = 150.0
     # PAUSE between layups, so the fiber can be checked after every pattern change.
     pause_after_layup: bool = True
     layups: tuple = field(default=(Layup(),))
@@ -238,6 +257,11 @@ class WindingJob:
         return surface_speed_to_deg_per_min(self.max_surface_speed, self.tank_diameter)
 
     @property
+    def harsh_a_accel(self):
+        # Harsh Turnaround Accel as an A-axis rate (deg/s^2) for this tank diameter.
+        return surface_speed_to_deg_per_min(self.harsh_accel, self.tank_diameter) / 60.0
+
+    @property
     def total_cycles(self):
         return sum(layup.passes for layup in self.layups)
 
@@ -247,7 +271,8 @@ GLOBAL_KEYS = tuple(f.name for f in fields(WindingJob) if f.name != "layups")
 LAYUP_KEYS = tuple(f.name for f in fields(Layup))
 # The layup settings a 90° wind doesn't use (it always winds exactly one pass
 # -- or two, double -- on the straight section).
-HOOP_IGNORED = ("passes", "pattern_number", "wind_angle", "turnaround_angle", "x_extension", "bulkhead_angle")
+HOOP_IGNORED = ("passes", "pattern_number", "wind_angle", "turnaround_angle", "x_extension", "bulkhead_angle",
+                "harsh_turnaround")
 
 # Settings the WindingJob can compute itself: value key -> the flag that, while
 # set, makes it do so (the value given is then ignored).
@@ -326,6 +351,8 @@ def geometry_errors(job):
         if not lo - 1e-9 <= job.start_x <= hi + 1e-9:
             errors.append(f"Start Wind at X must be between {lo:.1f} and {hi:.1f} mm "
                           "(on the tank, clear of the far end's turnaround).")
+    if job.harsh_accel <= 0:
+        errors.append("Harsh Turnaround Accel must be greater than 0.")
     if job.turnaround_zone < 0:
         errors.append("Turnaround Zone can't be negative.")
     elif job.tank_length > 0 and 2 * job.turnaround_zone > job.tank_length + 1e-9:
@@ -784,7 +811,10 @@ def turn_points(job, layup):
 def layup_zone(job, layup):
     """The turnaround zone the layup turns over: on auto, the part of the dome
     it covers -- so it turns around beyond the straight section -- or the set
-    zone; at most half the way between where it turns."""
+    zone; at most half the way between where it turns. 0 for a harsh
+    turnaround: it dwells right at the end."""
+    if layup.harsh_turnaround:
+        return 0.0
     zone = job.turnaround_zone
     if job.turnaround_zone_auto and job.end_cap_type == "Round":
         zone = min(zone, bulkhead_cover(job, layup))
@@ -890,6 +920,10 @@ class Move(NamedTuple):
     layup: int        # index into job.layups
     circuit: int      # circuit index within its layup
     dwell: bool       # True for a pure-rotation turnaround move (none with a turnaround zone)
+    # The highest F the move may be written with: a harsh turnaround's ramp
+    # runs slower than its limits allow (the writer works F out again from
+    # the written coordinates, see _write_events). inf: no such cap.
+    feed_cap: float = math.inf
 
 
 class CycleComplete(NamedTuple):
@@ -1075,6 +1109,39 @@ def iter_program(job, resume_at=None, checkpoints=None):
                 yield from m
             x, y, a = qx, qy, a0 + qa
 
+    harsh_accel = job.harsh_a_accel
+
+    def soft_dwell(x, y, a, a_next, layup_index, circuit):
+        # A harsh turnaround's dwell: a pure rotation from a stand, ramped up
+        # at Harsh Turnaround Accel to Max Rotation Speed, run at that, and
+        # ramped back down before the next helix starts from a stand again --
+        # instead of Klipper's own (much harder) acceleration either way. The
+        # ramps are steps of HARSH_RAMP_STEP each, every step capped at the
+        # ramp's average speed over it, so it takes just as long as the ramp
+        # would; a dwell too short for both ramps peaks lower, half way.
+        total = a_next - a
+        v_top = max_a_speed / 60.0  # deg/s
+        ramp = min(v_top * v_top / (2.0 * harsh_accel), total / 2.0)
+        t_ramp = math.sqrt(2.0 * ramp / harsh_accel)
+        n = max(1, math.ceil(t_ramp / HARSH_RAMP_STEP - 1e-9))
+        # The angle turned after each step, from the stand.
+        ups = [0.5 * harsh_accel * (t_ramp * k / n) ** 2 for k in range(n + 1)]
+        r = radius(x)
+
+        def step(a0, a1):
+            feed, duration, tow = calc_move(x, y, a0, x, y, a1, max_a_speed, r, max_filament)
+            cap = 60.0 * (a1 - a0) / (t_ramp / n)
+            if cap < feed:
+                feed, duration = cap, t_ramp / n
+            return Move(x, y, a1, feed, duration, tow, r, layup_index, circuit, True, cap)
+        for k in range(1, n + 1):
+            yield step(a + ups[k - 1], a + ups[k])
+        a_down = a_next - ramp
+        if a_down > a + ramp + 1e-9:
+            yield from moves(x, y, a + ramp, x, y, a_down, layup_index, circuit, True)
+        for k in range(n, 0, -1):
+            yield step(a_next - ups[k], a_next - ups[k - 1] if k > 1 else a_next)
+
     def slope(layup):
         return 360.0 / plan_layup(job, layup).pitch  # deg of rotation per mm of X
 
@@ -1203,9 +1270,13 @@ def iter_program(job, resume_at=None, checkpoints=None):
                 k_out = (k_next if last_pass else k) if reach > 0 else None
                 tail, head = turnaround(x_back, direction, reach, k, k_out if k_out is not None else k, dwell_amount)
                 if reach <= 0:
-                    # No zone: the whole turnaround is one rotation at the end.
+                    # No zone: the whole turnaround is one rotation at the end
+                    # (a harsh one's ramped gently up and down).
                     a_next = a + tail[0][2]
-                    yield from moves(x, y, a, x, y, a_next, li, i, True)
+                    if layup.harsh_turnaround and a_next > a:
+                        yield from soft_dwell(x, y, a, a_next, li, i)
+                    else:
+                        yield from moves(x, y, a, x, y, a_next, li, i, True)
                     a = a_next
                 else:
                     for ev in curve(x, y, a, tail, li, i):
@@ -1552,10 +1623,12 @@ def _walk_to(job, point, on_move=None):
             x, y, a = px + (ev.x - px) * f, py + (ev.y - py) * f, pa + (ev.a - pa) * f
             r = geom.radius(x)
             if on_move is not None and f > 0:
-                on_move(Move(x, y, a, ev.feed, ev.duration * f, ev.tow * f, r, ev.layup, ev.circuit, ev.dwell), (px, pr, pa))
+                on_move(Move(x, y, a, ev.feed, ev.duration * f, ev.tow * f, r, ev.layup, ev.circuit, ev.dwell, ev.feed_cap),
+                        (px, pr, pa))
             location = Location(point, x, y, r, a, a_offset, elapsed + ev.duration * f, tow + ev.tow * f, cycle_number)
             rest = [] if f >= 1 - 1e-12 else [
-                Move(ev.x, ev.y, ev.a, ev.feed, ev.duration * (1 - f), ev.tow * (1 - f), ev.r, ev.layup, ev.circuit, ev.dwell)]
+                Move(ev.x, ev.y, ev.a, ev.feed, ev.duration * (1 - f), ev.tow * (1 - f), ev.r, ev.layup, ev.circuit, ev.dwell,
+                     ev.feed_cap)]
             return location, itertools.chain(rest, events)
         if on_move is not None:
             on_move(ev, (px, pr, pa))
@@ -1840,7 +1913,7 @@ def _write_events(out, job, events, x, y, angle, a_offset, on_progress=None, fir
             tow = sqrt(dx * dx + (radius(nx) * radians(da)) ** 2)
             if tow > 0:
                 feed = min(feed, max_filament * length / tow)
-            feed = max(1, floor(min(feed, max_feed)))
+            feed = max(1, floor(min(feed, max_feed, ev.feed_cap)))
             line = f"G1 X{gx} Y{gy} A{ga} F{feed}\n"
             if cycle is None:
                 out.write(line)

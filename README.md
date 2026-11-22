@@ -173,6 +173,29 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
   the setting existed reopen with 0, which is how they were wound. The
   previews draw the fiber where it lies: at the tank's end, around the polar
   opening, while the eye is beyond it.
+- **Harsh Turnaround (Dwell at End Only) (per layup checkbox, default off):**
+  the layup ignores the Turnaround Zone. The helix runs straight on to where
+  the layup turns (plus its Additional X-Axis Travel), and the whole dwell is
+  turned there as a pure rotation while the carriage stands still, so the
+  fiber comes into the end as straight as possible. It's meant for flat end
+  caps with catchers on the tank, because nothing else stops the fiber from
+  slipping there. The carriage comes to a full stop at each end. The rotation
+  per circuit is exactly the same as with the smooth curve, so the pattern
+  doesn't change. A 90° wind doesn't use it. Files written before the setting
+  existed reopen with it off, which is how they were wound.
+- **Harsh Turnaround Accel (default 150 mm/s², at the tank's surface):** a
+  harsh turnaround's dwell starts from a stand, so leaving it to Klipper's own
+  `max_accel` would jerk the mandrel up to speed (and down again before the
+  next pass), and a heavy tank can slip in the chuck. Instead, the dwell is
+  written as a ramp: steps of `HARSH_RAMP_STEP` (0.05 s) each, every one a
+  G1 with its own, slightly higher F, up to *Max Rotation Speed*, then the
+  rest at that speed, then the same steps back down. Klipper then only ever
+  changes speed by one small step at a time, averaging this acceleration. On
+  a 200 mm tank the default is about 86°/s² (against `max_accel: 750`), and
+  reaches full speed after about 1.5 s and 92°. A dwell too short for both
+  ramps peaks lower, half way. Only the speed changes, never the path or the
+  pattern; the time estimate includes the ramps. Every pure-rotation move
+  stays within *Max Move Time*.
 - **Eye clearance:** the Y position follows the tank profile plus a safety
   gap. It uses the largest radius under the full width of the eye, so the eye
   cannot hit the tank at the domes. Beyond the tank's ends (with *Additional
@@ -313,9 +336,10 @@ arm length. The eye tip can therefore sit between `550 − arm − 180` and
 ; max_move_time: 0.5
 ; turnaround_zone: 96.82458365518542
 ; turnaround_zone_auto: True
+; harsh_accel: 150.0
 ; layups: 2
-; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False x_extension=0.0 bulkhead_angle=45.0 bulkhead_auto=True double=False
-; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True x_extension=0.0 bulkhead_angle=45.0 bulkhead_auto=True double=False
+; layup_1: passes=30 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=False x_extension=0.0 bulkhead_angle=45.0 bulkhead_auto=True double=False harsh_turnaround=False
+; layup_2: passes=1 pattern_number=3 wind_angle=45.0 turnaround_angle=270.0 auto_cycles=True hoop=True x_extension=0.0 bulkhead_angle=45.0 bulkhead_auto=True double=False harsh_turnaround=False
 ; estimate_fiber_strength: 5100.0     <- the Strength & Materials inputs...
 ; ...
 ; estimate_result_safety_factor: 1.203  <- ...and what they gave for this wind

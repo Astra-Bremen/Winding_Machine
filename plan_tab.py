@@ -24,7 +24,8 @@ MACHINE_FIELDS = [
     ("Max Move Time (s)", "max_move_time"),
 ]
 TANK_FIELDS = [("Straight Length (mm)", "straight_length"), ("Tank Diameter (mm)", "tank_diameter"), ("End Cap Diameter (mm)", "end_cap_diameter")]
-WINDING_FIELDS = [("Bandwidth / Tow Width (mm)", "bandwidth"), ("Turnaround Zone (mm)", "turnaround_zone")]
+WINDING_FIELDS = [("Bandwidth / Tow Width (mm)", "bandwidth"), ("Turnaround Zone (mm)", "turnaround_zone"),
+                  ("Harsh Turnaround Accel (mm/s²)", "harsh_accel")]
 LAYUP_FIELDS = [
     ("Number of Cycles", "passes"),
     ("Pattern Number (Strands per Cycle)", "pattern_number"),
@@ -88,6 +89,12 @@ FIELD_TIPS = {
                        "the fiber turns around beyond the straight section "
                        f"({winding.FLAT_TURNAROUND_ZONE:g} mm with flat end caps). Type a value to fix it; clear the "
                        "field to go back to auto. 0 = turn on the spot (the machine stops there).",
+    "harsh_accel": "How quickly a Harsh Turnaround's dwell speeds the mandrel up from a stand, and slows it down "
+                   "again before the next pass (mm/s², at the tank's surface). The dwell starts slow and ramps up "
+                   "to Max Rotation Speed in small steps, each its own G-code move, instead of leaving it to the "
+                   "machine's own, much harder acceleration -- so a heavy tank doesn't slip in the chuck. Lower is "
+                   "gentler but takes longer. Only the dwell's speed changes, never the path or the pattern. Used "
+                   "only by layups with Harsh Turnaround on.",
     "pause_after_layup": "Pauses (PAUSE) after every layup but the last, so the fiber can be checked, e.g. for "
                          "slipping, before the pattern changes. Resume on the machine to continue. Around a 90° "
                          "wind it pauses where the wind starts and ends, on the straight section.",
@@ -126,6 +133,14 @@ FIELD_TIPS = {
                    "rotation is counted in the pattern, so every circuit still lands exactly on it. Beyond the "
                    "tank's ends the eye keeps closing in smoothly until it's Min Spacing from the End Cap Diameter: "
                    "check that the chuck has room there. 0 = turn around right there; a negative value is set to 0.",
+    "harsh_turnaround": "Dwells only at the very end: the helix runs straight on to where the layup turns (plus "
+                        "its Additional X-Axis Travel), and the whole Turnaround / Dwell Angle is turned right there, "
+                        "the carriage standing still -- the Turnaround Zone isn't used for this layup. The fiber comes "
+                        "into the end as straight as it can. Meant for flat end caps with catchers on the tank: "
+                        "nothing else stops the fiber slipping there. The carriage stops at each end, and the "
+                        "dwell starts and ends slowly (Harsh Turnaround Accel, in Winding Settings). The "
+                        "pattern and the rotation per circuit stay exactly the same. Off: the dwell is spread over "
+                        "the Turnaround Zone in one smooth curve.",
     # Preview
     "show_all": "Draws the first cycle of every layup on the tank at once, each in its own color, with a legend "
                 "below; click a legend entry to select that layup. Off: only the selected layup.",
@@ -718,6 +733,12 @@ class PlanTab:
         self._double_check.pack(side=tk.LEFT, padx=(18, 0))
         self._add_tip("double", self._double_check)
         add_fields(layup_frame, LAYUP_FIELDS, first_row=1, store=self.layup_entries)
+        # Below the turnaround's own settings: dwell right at the end instead
+        # of over the zone (a helical layup's; bound in _apply_layup_mode).
+        self._harsh_check = ttk.Checkbutton(layup_frame, text="Harsh Turnaround (Dwell at End Only)",
+                                            style="Settings.TCheckbutton", command=self._on_harsh_toggled)
+        self._harsh_check.grid(row=1 + len(LAYUP_FIELDS), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._add_tip("harsh_turnaround", self._harsh_check)
         # What a 90° wind's greyed-out fields show instead of its (unused)
         # helical settings: its pass(es), its actual angle, the straight
         # section only (90°), no pattern, dwell or travel beyond. A field that
@@ -941,6 +962,16 @@ class PlanTab:
                 notes["turnaround_zone"] = f"Auto now: up to {job.turnaround_zone:.1f} mm ({where})."
             notes["turnaround_zone"] = ((notes["turnaround_zone"] + " " if notes["turnaround_zone"] else "")
                                         + f"At most {job.tank_length / 2:g} mm on this tank (half its whole length).")
+            harsh = [i + 1 for i, l in enumerate(job.layups) if l.harsh_turnaround and not l.hoop]
+            if not harsh:
+                notes["harsh_accel"] = "Not used now: no layup has Harsh Turnaround on."
+            elif job.harsh_accel > 0 and job.max_a_speed > 0:
+                v = job.max_a_speed / 60.0
+                accel = job.harsh_a_accel
+                notes["harsh_accel"] = (f"Each dwell reaches Max Rotation Speed after {v / accel:.2f} s and "
+                                        f"{v * v / (2 * accel):.0f}° (and slows down the same way), at "
+                                        f"{accel:.0f}°/s² on this tank. Used by layup"
+                                        f"{'s' if len(harsh) > 1 else ''} {', '.join(map(str, harsh))}.")
             if len(job.layups) == 1:
                 notes["pause_after_layup"] = "With a single layup there's nothing to pause between."
             if layup.hoop:
@@ -950,8 +981,16 @@ class PlanTab:
                 notes["wind_angle"] = f"Not used by a 90° wind: it winds at {job.hoop_angle:.1f}°."
                 notes["x_extension"] = "Not used by a 90° wind: it stays on the straight section."
                 notes["bulkhead_angle"] = "A 90° wind stays on the straight section: 90°."
+                notes["harsh_turnaround"] = "Not used by a 90° wind: it has no turnarounds."
             else:
                 notes["double"] = "Only for a 90° wind."
+                if layup.harsh_turnaround:
+                    turn_lo, turn_hi = winding.turn_points(job, layup)
+                    notes["harsh_turnaround"] = (
+                        f"On: this layup dwells at X {turn_lo - layup.x_extension:.1f} and "
+                        f"X {turn_hi + layup.x_extension:.1f}, at least {layup.turnaround_angle:g}° each."
+                        + (" With round end caps it dwells on the dome, where the fiber can slip." if round_caps
+                           else ""))
                 turn_lo, turn_hi = winding.turn_points(job, layup)
                 notes["x_extension"] = (f"This layup's eye turns at X {turn_lo - layup.x_extension:.1f} and "
                                         f"X {turn_hi + layup.x_extension:.1f} (the tank spans {x_start:g}–{x_end:.1f}).")
@@ -1119,6 +1158,9 @@ class PlanTab:
         hoop = self._is_hoop(layup_vars)
         # "Double" is a 90° wind's own setting.
         self._double_check.state(["!disabled"] if hoop else ["disabled"])
+        # A 90° wind has no turnarounds.
+        self._harsh_check.configure(variable=layup_vars["harsh_turnaround"])
+        self._harsh_check.state(["disabled"] if hoop else ["!disabled"])
         self._hoop_display["passes"].set("2" if hoop and self._is_set(layup_vars["double"]) else "1")
         # Without a dome there's no Bulkhead Angle to set.
         flat = self.app.params["end_cap_type"].get() == "Flat"
@@ -1160,6 +1202,17 @@ class PlanTab:
                 text += f" The layup{'s' if i < n - 2 else ''} after it now start{'' if i < n - 2 else 's'} from the other end."
         self.app.set_status(prefix + text)
         self._apply_layup_mode()
+        self._redraw_now()
+
+    def _on_harsh_toggled(self):
+        layup_vars = self.app.layups[self.app.active_layup]
+        i, n = self.app.active_layup, len(self.app.layups)
+        prefix = f"Layup {i + 1}: " if n > 1 else ""
+        if self._is_set(layup_vars["harsh_turnaround"]):
+            text = "dwells only at the very ends, the carriage standing still there."
+        else:
+            text = "spreads its dwell over the Turnaround Zone again."
+        self.app.set_status(prefix + text if prefix else text[0].upper() + text[1:])
         self._redraw_now()
 
     def _on_hoop_toggled(self):
