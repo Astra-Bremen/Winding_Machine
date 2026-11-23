@@ -97,6 +97,20 @@ VIEWPORT_PALETTE = {
     "eye_marker": "#e5533d",
 }
 
+# The Control tab: the LIVE marker (where the machine is) and the E-STOP button.
+LIVE_RED = "#e5533d"
+ESTOP_RED = "#c62828"
+ESTOP_RED_ACTIVE = "#a31f1f"
+# A settings field the machine has measured (the Control tab's tank
+# calibration): its frame and its value in cyan, a shade off the theme's own
+# mint -- 4.9:1 on the white field, 7.6:1 on the dark one.
+CALIBRATED_COLOR = {"light": "#0a7c8c", "dark": "#5fd3e4"}
+CALIBRATED_STYLE = "Calibrated.Settings.TEntry"
+# (background, text) of a plain-Tk toggle button that's off -- the 3D view,
+# the jog step, the laser, LIVE -- and of the Control tab's timeline track:
+# the theme's "light" grey is near-white in the dark mode, too bright there.
+OFF_TOGGLE = {"light": ("#eceeed", "#404542"), "dark": ("#2f423e", "#c8e6da")}
+
 # Dash patterns for layups beyond the palette's color count: the 7th layup
 # reuses color 1 dashed, the 13th dash-dotted, and so on. Only patterns that
 # Tk's Windows canvas renders reliably on thick lines are used.
@@ -148,9 +162,9 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     # fit a maximized window with room to spare. The combobox matches them; the
     # spinbox (partial-export page) gets the same padding, though its arrow
     # images keep it a couple of pixels taller.
-    style.configure("Settings.TEntry", font=("TkDefaultFont", body_size), padding=(6, 4))
-    style.configure("Settings.TCombobox", padding=(6, 5, 9, 3))
-    style.configure("Settings.TSpinbox", padding=(13, 4))
+    style.configure("Settings.TEntry", font=("TkDefaultFont", body_size), padding=(6, 2))
+    style.configure("Settings.TCombobox", padding=(6, 3, 9, 1))
+    style.configure("Settings.TSpinbox", padding=(13, 2))
     style.configure("Settings.TLabelframe.Label", font=("TkDefaultFont", header_size, "bold"))
     # The layup switcher's title ("Layup 2 of 3", sized like the other section
     # headers) and its small square previous/next/add/remove buttons. The buttons
@@ -172,6 +186,20 @@ def setup_compact_styles(style, body_size=8, header_size=9):
     # button -- so they look the same from startup, not just after a switch.
     style.configure("warning.TLabel")
     style.configure("success.TButton")
+    # The Control tab's: Pause, Cancel Wind, Calibrate Tank and the job's bar.
+    for name in ("warning.TButton", "danger.TButton", "danger.Outline.TButton", "info.TButton",
+                 "success.Horizontal.TProgressbar"):
+        style.configure(name)
+
+
+def style_calibrated(style, mode):
+    """(Re)colors the calibrated-field style for the light/dark mode: a
+    Settings entry with a cyan frame and value -- also while it has focus,
+    where a plain field's frame turns mint."""
+    cyan = CALIBRATED_COLOR[mode]
+    style.configure(CALIBRATED_STYLE, foreground=cyan, bordercolor=cyan, lightcolor=cyan, darkcolor=cyan)
+    style.map(CALIBRATED_STYLE, bordercolor=[("!disabled", cyan)], lightcolor=[("!disabled", cyan)],
+              darkcolor=[("!disabled", cyan)])
 
 
 @lru_cache(maxsize=1)

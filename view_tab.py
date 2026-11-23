@@ -353,8 +353,7 @@ class ViewTab:
     def _update_3d_button(self):
         colors = self.app.root.style.colors
         on = self.auto_rotate_var.get()
-        bg = colors.success if on else colors.light
-        fg = "white" if on else colors.fg
+        bg, fg = (colors.success, "white") if on else theme.OFF_TOGGLE[self.app.theme_mode]
         self.rotate_toggle_btn.configure(bg=bg, fg=fg, activebackground=bg, activeforeground=fg)
 
     def open_gcode_view(self, filepath=None):

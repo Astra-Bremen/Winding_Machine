@@ -620,7 +620,7 @@ class PlanTab:
         LBL, ENT, CMB, FRM = "Settings.TLabel", "Settings.TEntry", "Settings.TCombobox", "Settings.TLabelframe"
         # Section padding (horizontal, vertical) and the gap below each section,
         # kept tight so the whole panel fits a maximized window without scrolling.
-        FRAME_PAD, FRAME_GAP = (8, 4), (0, 6)
+        FRAME_PAD, FRAME_GAP = (8, 3), (0, 4)
 
         def add_fields(frame, fields, first_row=0, store=None):
             for i, (label_text, key) in enumerate(fields):
@@ -778,9 +778,17 @@ class PlanTab:
         self.generate_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3), ipady=4)
         ttk.Button(actions, text="Open G-Code", command=lambda: self.app.view_tab.open_gcode_view(),
                    style="primary.Outline.TButton").grid(row=0, column=1, sticky="ew", padx=(3, 0), ipady=4)
+        # Generates the program and hands it to the machine (see ControlTab.send_file).
+        send_btn = ttk.Button(actions, text="Send & Wind  ▶", command=self.app.send_and_wind,
+                              style="success.TButton")
+        send_btn.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(6, 0), ipady=1)
+        ToolTip(send_btn, text="Generates the G-code (saved where you choose, as with Generate), uploads it to the "
+                               "machine connected on the Control tab and, once you confirm, starts the wind there. "
+                               "From then on the machine runs its own copy: this PC can disconnect at any time.",
+                wraplength=300, delay=400)
         # Opens the page for continuing an interrupted wind (see partial_page).
         ttk.Button(actions, text="Export Partial G-Code…", command=self.app.show_partial_page,
-                   style="primary.Outline.TButton").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0), ipady=1)
+                   style="primary.Outline.TButton").grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(6, 0), ipady=1)
 
         # Visualization Section, a grid: on top, left to right, the main
         # (pseudo-3D) tank canvas, a column with the end-on view keeping the
@@ -1014,6 +1022,11 @@ class PlanTab:
                     lo, hi = winding.compute_wind_angle_bounds(job.tank_length, job.tank_diameter, job.bandwidth)
                     hi = min(hi, winding.HOOP_ANGLE_THRESHOLD)
                     notes["wind_angle"] = f"Possible on this tank with this tow: {lo:.1f}° to {hi:.1f}°."
+        calibration = getattr(self.app, "calibration", None)
+        if calibration is not None:
+            note = f"Calibrated on the machine: the straight section runs from X {calibration[0]:.2f} to X {calibration[1]:.2f}."
+            for key in ("chuck_offset", "straight_length"):
+                notes[key] = f"{note} {notes[key]}" if notes[key] else note
         for key, note in notes.items():
             if key not in SPEED_LIMIT_KEYS:  # those are _update_speed_limit's
                 self._set_note(key, note)
@@ -1379,6 +1392,19 @@ class PlanTab:
     def on_theme_changed(self):
         self._draw_layup_swatch()
         self.draw_visualization()
+        self.set_calibrated(getattr(self.app, "calibration", None) is not None)
+
+    def set_calibrated(self, calibrated):
+        """Marks Chuck X-Offset and Straight Length as measured on the machine
+        (the Control tab's tank calibration) -- frame and value in cyan -- or
+        back to plain. The frame comes from the style; the value's color is
+        set on the field itself, as the AUTO fields' grey is (a ttk entry
+        doesn't take it from its style here)."""
+        style = theme.CALIBRATED_STYLE if calibrated else "Settings.TEntry"
+        color = theme.CALIBRATED_COLOR[self.app.theme_mode] if calibrated else ""
+        for entry in (self.machine_entries["chuck_offset"], self.tank_entries["straight_length"]):
+            entry.configure(style=style, foreground=color)
+        self.schedule_redraw()
 
     def estimated_total_time(self):
         """Total program time (s) from the latest finished simulation, or None."""

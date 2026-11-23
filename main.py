@@ -4,6 +4,7 @@ import dataclasses
 import datetime
 import os
 import ttkbootstrap as tb
+import machine_link
 import strength
 import theme
 import winding
@@ -94,8 +95,13 @@ class CFRPWinderApp:
         for var in self.material_vars.values():
             var.trace_add("write", self._on_material_changed)
         self.strength_dialog = None
-
-        self._build_menu()
+        # The Control tab's tank calibration: (start, end), machine X of the
+        # straight section as measured, while Chuck X-Offset and Straight
+        # Length still hold what it worked out (see apply_calibration).
+        self.calibration = None
+        self._calibrated_values = {}
+        self._writing_calibration = False
+        theme.style_calibrated(style, self.theme_mode)
 
         # Status bar first, packed to the bottom, so it claims a slim strip there
         # before the main content below claims everything else.
@@ -111,8 +117,16 @@ class CFRPWinderApp:
         self._draw_logo()
         ttk.Label(status_bar, textvariable=self.status_var).pack(side=tk.LEFT)
 
-        # --- MAIN LAYOUT: settings on the left, split previews on the right ---
-        main_frame = ttk.Frame(root, padding="10")
+        # The two tabs, Plan and Control, in a strip along the top; each is a
+        # page of its own, and only the selected one is shown.
+        self._build_tab_bar()
+        self.plan_page = ttk.Frame(root)
+        self.control_page = ttk.Frame(root, padding="10")
+        self.plan_page.pack(fill=tk.BOTH, expand=True)
+        self.current_tab = "plan"
+
+        # --- PLAN: settings on the left, split previews on the right ---
+        main_frame = ttk.Frame(self.plan_page, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # Left settings panel: wrapped in a canvas + scrollbar so all controls stay
@@ -133,6 +147,10 @@ class CFRPWinderApp:
         left_canvas_window = left_canvas.create_window((0, 0), window=settings_inner, anchor="nw")
         settings_inner.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
         left_canvas.bind("<Configure>", lambda e: left_canvas.itemconfig(left_canvas_window, width=e.width))
+        self._left_scrollbar = left_scrollbar
+        # The scrollbar only shows while the page doesn't fit (a small window).
+        settings_inner.bind("<Configure>", lambda e: self._fit_left_scrollbar(), add="+")
+        left_canvas.bind("<Configure>", lambda e: self._fit_left_scrollbar(), add="+")
         self._settings_page, self._left_window = settings_inner, left_canvas_window
 
         def _on_mousewheel(event):
@@ -153,37 +171,125 @@ class CFRPWinderApp:
         self.partial_page = PartialPage(left_canvas, self)
         self.partial_page.frame.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")),
                                      add="+")
+        self.partial_page.frame.bind("<Configure>", lambda e: self._fit_left_scrollbar(), add="+")
         self._partial_shown = False
 
+        # --- CONTROL: the machine, live (see control_tab) ---
+        from control_tab import ControlTab
+        self.control_tab = ControlTab(self.control_page, self)
+
+        # A calibrated Chuck X-Offset / Straight Length stays marked until
+        # it's changed by anything but the calibration (typing, opening a
+        # file); a new tank diameter or end cap moves the tank's start
+        # against the measured straight section, so the offset follows.
+        for key in ("chuck_offset", "straight_length"):
+            self.params[key].trace_add("write", self._on_calibrated_edited)
+        for key in ("tank_diameter", "end_cap_diameter", "end_cap_type"):
+            self.params[key].trace_add("write", self._on_dome_changed)
+
+        root.bind("<Control-Key-1>", lambda e: self.show_tab("plan"))
+        root.bind("<Control-Key-2>", lambda e: self.show_tab("control"))
         root.update_idletasks()
         left_canvas.configure(width=settings_inner.winfo_reqwidth())
 
-    def _build_menu(self):
-        menubar = tk.Menu(self.root, tearoff=False)
-        self.root.config(menu=menubar)
+    def _fit_left_scrollbar(self):
+        if not hasattr(self, "partial_page"):
+            return
+        page = self.partial_page.frame if self._partial_shown else self._settings_page
+        needed = page.winfo_reqheight() > self._left_canvas.winfo_height() > 1
+        shown = bool(self._left_scrollbar.winfo_manager())
+        if needed and not shown:
+            self._left_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, before=self._left_canvas)
+        elif not needed and shown:
+            self._left_scrollbar.pack_forget()
+            self._left_canvas.yview_moveto(0)
 
-        file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Generate G-Code...", command=self.generate)
-        file_menu.add_command(label="Open G-Code...", command=lambda: self.view_tab.open_gcode_view())
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.destroy)
-        menubar.add_cascade(label="File", menu=file_menu)
+    # --- Tabs ---
 
-        self.theme_mode_var = tk.StringVar(value=self.theme_mode)
-        view_menu = tk.Menu(menubar, tearoff=False)
-        view_menu.add_radiobutton(label="Light Mode", value="light", variable=self.theme_mode_var, command=lambda: self.set_theme_mode("light"))
-        view_menu.add_radiobutton(label="Dark Mode", value="dark", variable=self.theme_mode_var, command=lambda: self.set_theme_mode("dark"))
-        menubar.add_cascade(label="View", menu=view_menu)
+    TABS = (("plan", "Plan", "Plan the wind: settings, previews, G-code (Ctrl+1)."),
+            ("control", "Control", "The machine, live: connection, jogging, calibration and the wind running "
+                                   "on it (Ctrl+2)."))
 
-        help_menu = tk.Menu(menubar, tearoff=False)
-        help_menu.add_command(label="About", command=self._show_about)
-        menubar.add_cascade(label="Help", menu=help_menu)
+    def _build_tab_bar(self):
+        # Plain Tk labels with directly set colors (restyled with the theme in
+        # _style_tab_bar): the selected tab in the theme's mint, underlined.
+        from ttkbootstrap.widgets.tooltip import ToolTip
+        bar = tk.Frame(self.root)
+        bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
+        self._tab_bar, self._tabs = bar, {}
+        for i, (key, text, tip) in enumerate(self.TABS):
+            cell = tk.Frame(bar)
+            cell.pack(side=tk.LEFT, padx=(8 if i == 0 else 0, 0))
+            label = tk.Label(cell, text=text, font=("TkDefaultFont", 10, "bold"), padx=14, pady=3, cursor="hand2")
+            label.grid(row=0, column=0)
+            badge = tk.Label(cell, text="", font=("TkDefaultFont", 8, "bold"), padx=0, pady=0, cursor="hand2")
+            badge.grid(row=0, column=1, padx=(0, 10))
+            badge.grid_remove()
+            line = tk.Frame(cell, height=3)
+            line.grid(row=1, column=0, columnspan=2, sticky="ew")
+            for widget in (label, badge):
+                widget.bind("<Button-1>", lambda e, k=key: self.show_tab(k))
+                widget.bind("<Enter>", lambda e, k=key: self._style_tab_bar(hover=k))
+                widget.bind("<Leave>", lambda e: self._style_tab_bar())
+            ToolTip(label, text=tip, wraplength=300, delay=400)
+            self._tabs[key] = (cell, label, badge, line)
+        self._badge_color = None
+        self._theme_btn = tk.Label(bar, font=("TkDefaultFont", 9), padx=10, pady=5, cursor="hand2")
+        self._theme_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self._theme_btn.bind("<Button-1>", lambda e: self.set_theme_mode("dark" if self.theme_mode == "light" else "light"))
+        ToolTip(self._theme_btn, text="Switches between the light and the dark look.", wraplength=300, delay=400)
+        about = tk.Label(bar, text="About", font=("TkDefaultFont", 9), padx=10, pady=3, cursor="hand2")
+        about.pack(side=tk.RIGHT)
+        about.bind("<Button-1>", lambda e: self._show_about())
+        self._bar_links = (self._theme_btn, about)
+        self._style_tab_bar()
+
+    def _style_tab_bar(self, hover=None):
+        colors = self.root.style.colors
+        self._tab_bar.configure(bg=colors.bg)
+        for key, (cell, label, badge, line) in self._tabs.items():
+            selected = key == getattr(self, "current_tab", "plan")
+            fg = colors.primary if selected else (colors.fg if key == hover else self.canvas_palette["muted"])
+            for widget in (cell, label, badge):
+                widget.configure(bg=colors.bg)
+            label.configure(fg=fg)
+            badge.configure(fg=self._badge_color or fg)
+            line.configure(bg=colors.primary if selected else colors.bg)
+        self._theme_btn.configure(text="☾  Dark" if self.theme_mode == "light" else "☀  Light")
+        for link in self._bar_links:
+            link.configure(bg=colors.bg, fg=self.canvas_palette["muted"])
+
+    def show_tab(self, key):
+        if key == self.current_tab:
+            return
+        self.current_tab = key
+        if key == "control":
+            self.plan_page.pack_forget()
+            self.control_page.pack(fill=tk.BOTH, expand=True)
+            self.control_tab.on_show()
+        else:
+            self.control_tab.on_hide()
+            self.control_page.pack_forget()
+            self.plan_page.pack(fill=tk.BOTH, expand=True)
+        self._style_tab_bar()
+
+    def set_control_badge(self, color, text):
+        """The machine's state next to the Control tab's name: a dot in
+        `color` (none while offline) and a few words."""
+        _, _, badge, _ = self._tabs["control"]
+        self._badge_color = color
+        if color is None:
+            badge.grid_remove()
+        else:
+            badge.configure(text=f"●  {text}" if text else "●", fg=color)
+            badge.grid()
 
     def _show_about(self):
         messagebox.showinfo("About CFRP Winder",
                              "CFRP Winder\n\n"
-                             "Klipper G-code generator and visualizer for composite\n"
-                             "filament winding on a 3-axis (X, Y, A) winder.")
+                             "Klipper G-code generator, visualizer and machine control\n"
+                             "for composite filament winding on a 3-axis (X, Y, A) winder.")
 
     def set_theme_mode(self, mode):
         if mode not in theme.PALETTES or mode == self.theme_mode:
@@ -204,6 +310,9 @@ class CFRPWinderApp:
         if self.strength_dialog is not None and self.strength_dialog.exists():
             self.strength_dialog.on_theme_changed()
             self.strength_dialog.refresh()
+        theme.style_calibrated(style, mode)
+        if hasattr(self, "control_tab"): self.control_tab.on_theme_changed()
+        if hasattr(self, "_tab_bar"): self._style_tab_bar()
         self._draw_logo()
 
     def _draw_logo(self):
@@ -241,6 +350,51 @@ class CFRPWinderApp:
     def _layups_changed(self):
         if hasattr(self, "plan_tab"): self.plan_tab.on_layups_changed()
         if getattr(self, "_partial_shown", False): self.partial_page.refresh()
+
+    # --- Tank calibration (from the Control tab) ---
+
+    def apply_calibration(self, start, end):
+        """Enters the Chuck X-Offset and Straight Length that put the straight
+        section from machine X `start` to `end`, marked as calibrated."""
+        self.calibration = (start, end)
+        self._write_calibration()
+        self.plan_tab.set_calibrated(True)
+
+    def _write_calibration(self):
+        try:
+            # Only the tank's shape matters here (its domes): not the whole job,
+            # so a half-typed layup field doesn't hold it up.
+            tank = winding.WindingJob(**{k: self.params[k].get() for k in ("end_cap_type", "tank_diameter",
+                                                                               "end_cap_diameter")})
+            values = machine_link.calibrated_settings(tank, *self.calibration)
+        except (tk.TclError, ValueError, TypeError):
+            return
+        self._calibrated_values = {key: round(value, 2) for key, value in values.items()}
+        self._writing_calibration = True
+        try:
+            for key, value in self._calibrated_values.items():
+                self.params[key].set(value)
+        finally:
+            self._writing_calibration = False
+
+    def _on_calibrated_edited(self, *args):
+        # Only a different value ends it: generating reloads the file just
+        # written into the G-Code Preview, which sets the same values again.
+        if self.calibration is None or self._writing_calibration:
+            return
+        for key, value in self._calibrated_values.items():
+            try:
+                same = abs(float(self.params[key].get()) - value) < 1e-6
+            except (tk.TclError, ValueError):
+                same = False
+            if not same:
+                self.calibration = None
+                self.plan_tab.set_calibrated(False)
+                return
+
+    def _on_dome_changed(self, *args):
+        if self.calibration is not None and not self._writing_calibration:
+            self._write_calibration()
 
     # --- Material / strength estimate ---
 
@@ -360,9 +514,21 @@ class CFRPWinderApp:
     # --- G-code generation ---
 
 
-    def generate(self, resume=None):
+    def send_and_wind(self):
+        """Generates the program like Generate does, then sends it to the
+        machine connected on the Control tab and (once confirmed) starts it."""
+        blocker = self.control_tab.send_blocker()
+        if blocker:
+            messagebox.showwarning("Send & Wind", blocker)
+            if self.control_tab.status() is None:
+                self.show_tab("control")
+            return
+        self.generate(send=True)
+
+    def generate(self, resume=None, send=False):
         """Writes the program to a file the user picks. With a winding.Resume,
-        writes a partial program that continues an interrupted wind instead."""
+        writes a partial program that continues an interrupted wind instead.
+        `send`: then hands the file to the machine (see send_and_wind)."""
         try:
             job = self.build_job()
         except winding.SettingsError as e:
@@ -450,6 +616,10 @@ class CFRPWinderApp:
             else:
                 layup_note = f" ({len(job.layups)} layups, {job.total_cycles} cycles)" if len(job.layups) > 1 else ""
                 self.set_status(f"G-code generated{layup_note}: {filepath}")
+            if send:
+                # Straight on to the upload: no "saved" window in between.
+                self.root.after(10, lambda: self.control_tab.send_file(filepath))
+                return None
             note = "" if data is not None else "\n(Not loaded into the G-Code Preview -- use Open G-Code.)"
             # The file's name, then its folder: a path has no spaces to wrap at.
             return f"{kind} saved", f"{os.path.basename(filepath)}\nin {os.path.dirname(filepath)}{note}"

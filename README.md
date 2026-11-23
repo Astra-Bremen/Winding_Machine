@@ -5,7 +5,9 @@
 machine, tank and winding parameters, and build up the wind as one or more
 **layups**. The app shows a live preview of the winding pattern with time and
 material estimates, writes a `.gcode` file, and can play that file back as a
-simulation.
+simulation. The **Control** tab connects to the machine itself: it sends and
+starts winds, shows the running wind live, jogs and homes the axes, and
+measures where the tank sits on the mandrel with a laser.
 
 ## Machine model
 
@@ -425,6 +427,123 @@ each cycle's lines until it's complete, then writes them after its status.
   readout.
 - The app's own G-Code Preview ignores these lines.
 
+## Machine control (Control tab)
+
+The app has two tabs along the top: **Plan** (everything above) and
+**Control** (Ctrl+1 / Ctrl+2). The Control tab talks to the machine through
+Moonraker, the API server Mainsail runs on, over plain HTTP. It works the same
+with Klipper and Kalico.
+
+**A running wind never depends on the PC.** Once a file is started, Klipper
+reads it from the machine's own storage. The app only watches. It can
+disconnect, lose the network, crash or be closed, and other PCs (or Mainsail)
+can watch at the same time, without the wind noticing. To keep it that way:
+
+- Connecting, reconnecting and watching only *read* from the machine. A lost
+  connection is retried on its own, and nothing is ever sent because of it.
+- Every command is sent once, because someone clicked it. Nothing is queued up
+  and replayed after a reconnect.
+- Jogging, homing, the laser and calibration are locked while a file is
+  winding: Klipper would run them in between the file's own moves. While the
+  wind is paused, X and Y can be jogged (Resume returns the carriage to where
+  it paused); A stays locked, since the fiber is attached.
+
+The tab has:
+
+- **Machine Connection:** the address (default `192.168.0.199`, through the
+  web server on port 80, else Moonraker's port 7125; a port can be typed).
+- **Manual Control:** X, Y and A in steps of 0.1 / 1 / 10 / 100 (mm or
+  degrees), Home X / Y / All, Retract Y fully (Y0), and the laser on the X
+  carriage on/off (`LASER_ON` / `LASER_OFF`, see below), **Motors Off (All)**
+  (`M84`) and **X/Y Off (keep A)** (`SET_STEPPER_ENABLE ... ENABLE=0` for
+  `stepper_x` and `stepper_y`; the names are `XY_STEPPERS` in
+  `machine_link.py`). Home X pulls Y back first when Y is homed. A move
+  Klipper refuses (out of range, not homed) is reported in the status bar.
+  All of it is locked while a calibration or a rotation runs.
+- **Rotate:** turns the mandrel on and on at a set feed (default F5500 °/min,
+  15.3 rpm) and direction (A+ / A−, flipped while stopped), until **Stop
+  Rotation**. A is declared 0 first with `G92 A0`, as every wind file does.
+  `SET_KINEMATIC_POSITION` is a diagnostic command for X/Y/Z and would
+  redefine the other axes' positions as well. The rotation is a file the
+  machine runs, like a wind (`cfrp_rotate_Apos_F5500.gcode`: `G92 A0`, then
+  absolute 0.5 s `G1 A…` moves for up to 24 h). That way the usual print
+  controls work on it: **Pause / Resume** on the Control tab, in Mainsail or
+  with the machine's own buttons. **Stop Rotation** (or Cancel) cancels the
+  file. The tab follows the machine's state, so a rotation paused or started
+  elsewhere shows as such. Like a wind, it pauses and stops within a couple
+  of seconds (what Klipper reads ahead), and it doesn't depend on the PC: it
+  keeps turning if this PC drops out, until it's stopped from anywhere or
+  E-stopped. The tab shows "Stopping…" until the machine has stopped.
+  Everything else is locked while it turns, paused or not.
+- **Calibration:** **Start Tank Calibration**, then X buttons (±0.1 / 1 / 10
+  mm, only active while calibrating), then **Confirm Point** and **Abort**:
+  1. The machine homes X and Y if they aren't homed, pulls Y fully back (Y0)
+     and moves the carriage (at 300 mm/s, `TRAVEL_FEED_X`) so the dot lands
+     where the Plan expects the straight section to begin. The laser stays
+     off on the way and turns on once the carriage is there. The laser sits
+     *Laser Offset* (295 mm) toward -X from the eye, so the carriage goes to
+     that X plus 295.
+  2. Move X with the panel's buttons until the dot sits exactly on the edge,
+     then **Confirm Point**.
+  3. The machine moves to where the straight section should end, shifted by
+     how far off the first end was. Move and confirm the same way.
+  4. *Straight Length* becomes the distance between the two points, and
+     *Chuck X-Offset* becomes the first point minus a dome length (where the
+     tank itself begins). Both are entered on the Plan tab, marked as
+     calibrated with a cyan frame and cyan value. They stay marked until changed by hand or by
+     opening a different file. A new tank diameter or end cap moves *Chuck
+     X-Offset* along with it, since the straight section measured stays
+     where it is. The laser turns off at the end.
+- **Live View:** the state (WINDING, PAUSED, IDLE, ...), the file, the
+  machine's status line (layup and cycle), the time wound and left, and
+  **Pause / Resume**, **Cancel Wind** (asks first) and **E-STOP**. E-STOP is
+  Moonraker's emergency stop: it is not queued behind other commands, and
+  Klipper then needs a **Firmware Restart** (the button appears) and
+  rehoming. It is no substitute for the machine's own E-stop switch.
+  Below is the G-Code Preview of the file the machine is running. It is
+  downloaded from the machine if this PC didn't send it, so it also works
+  after reconnecting or from another PC. The bar under it is the whole
+  program: filled up to where the machine is, with a red **LIVE** line
+  there. Click or drag the bar (or use Play, Line, Cycle) to look at the
+  program anywhere, past or future. **LIVE** greys out meanwhile; click it
+  to follow the machine again.
+
+**Send & Wind** on the Plan tab generates the program like *Generate G-Code*
+(you still choose where to save it), uploads it to the machine and, once
+confirmed, starts it. It refuses while the machine already runs a file.
+
+Where the machine is: Klipper reports how many bytes of the file it has read
+(`virtual_sdcard.file_position`). It reads up to ~2 s ahead of the motion, so
+the app looks among the moves read in the last few seconds for the one whose
+X/Y path passes through the carriage's measured position
+(`motion_report.live_position`).
+
+**On the machine**, the Control tab needs:
+
+```ini
+# printer.cfg -- the calibration laser. Use whatever switches it on your board
+# (output_pin shown; adjust the pin).
+[output_pin calibration_laser]
+pin: PA1
+
+[gcode_macro LASER_ON]
+gcode: SET_PIN PIN=calibration_laser VALUE=1
+
+[gcode_macro LASER_OFF]
+gcode: SET_PIN PIN=calibration_laser VALUE=0
+```
+
+- Moonraker must trust the PC: its network in `trusted_clients` under
+  `[authorization]` in `moonraker.conf` (Mainsail's default install already
+  trusts the local network). Otherwise connecting fails with a message
+  saying so.
+- Worth raising `[idle_timeout] timeout` in `printer.cfg`: during the PAUSE for
+  attaching the fiber, Klipper turns the motors off after 10 minutes by
+  default, and the axes lose their position.
+- `fake_moonraker.py` stands in for the machine, to try the tab without it:
+  `python fake_moonraker.py`, then connect to `127.0.0.1:7125`. It runs a
+  started file 20x faster than real.
+
 ## Strength and material estimate
 
 The estimate follows the original Excel sheet's "Rough Strength assumption
@@ -577,15 +696,18 @@ python main.py
    every layup on the tank at once.
 4. Click **Generate G-Code** and choose where to save the file. A progress
    window shows how far it has got, and the file then opens in the G-Code
-   Preview automatically.
+   Preview automatically. Or click **Send & Wind** to also upload it to the
+   machine and start it (connect on the **Control** tab first).
 5. Run it on the machine. With homing on, it homes, moves the eye to the wind
-   start and pauses: attach the fiber there, then resume on the machine.
+   start and pauses: attach the fiber there, then resume on the machine (or
+   with **Resume** on the Control tab).
 6. Use **Open G-Code** to inspect a file generated earlier, and **Export
    Partial G-Code…** to continue a wind that was interrupted.
 
 ## Tests
 
-The winding math and the strength estimate have headless tests (no GUI needed):
+The winding math, the strength estimate and the machine connection (against
+`fake_moonraker.py`) have headless tests (no GUI needed):
 
 ```powershell
 python -m unittest -v
@@ -595,17 +717,20 @@ python -m unittest -v
 
 | File | Purpose |
 |------|---------|
-| `main.py` | App entry point and `CFRPWinderApp`: window layout and menus, the settings model (global settings plus one set of variables per layup), and G-code file output. |
+| `main.py` | App entry point and `CFRPWinderApp`: window layout and the Plan / Control tabs, the settings model (global settings plus one set of variables per layup), and G-code file output. |
 | `winding.py` | All winding math, with no GUI dependency: the `WindingJob`/`Layup` settings, validation, geometry, dwell/pattern alignment, the turnaround curves, the motion generator (`iter_program`), the preview simulation (`simulate`), and the G-code writer and header parser. |
 | `plan_tab.py` | `PlanTab`: settings form with the layup switcher, live Settings Preview (3D tank, end view, Bulkhead view, estimates, Show All Layups legend, the tank's progress while continuing a wind), wind-angle validation and the background calculations. |
 | `partial_page.py` | `PartialPage`: the Export Partial G-Code page that replaces the settings while continuing an interrupted wind. |
 | `view_tab.py` | `ViewTab`: G-code parser (`read_gcode`) and playback viewer. |
+| `control_tab.py` | `ControlTab`: the Control tab (connection, jog & home, tank calibration, the job's controls) and `LiveView`, the G-Code Preview following the machine. |
+| `machine_link.py` | Talking to the machine, with no GUI dependency: Moonraker's HTTP API (`MoonrakerClient`), the read-only status poll and command threads (`Link`), where in the file the machine is (`move_offsets`, `live_move`), and the calibration math. |
+| `fake_moonraker.py` | A stand-in Moonraker for trying the Control tab and testing `machine_link` without the machine. |
 | `progress_dialog.py` | `ProgressTask`: runs a long task on a worker thread behind a progress window, with Cancel. |
 | `theme.py` | ttkbootstrap theme setup, canvas color palettes (including the layup colors), and the ASTRA logo and window icon, colored from `assets/`. |
 | `assets/astra_logo.png` | The ASTRA student club's logo (black on white), the source of the window icon and the status bar logo. |
 | `strength.py` | The material and strength estimate (after the Excel sheet), its inputs, and their record in the G-code header. |
 | `strength_dialog.py` | `StrengthDialog`: the Strength & Materials window. |
-| `test_winding.py`, `test_strength.py` | Headless tests for `winding.py` and `strength.py`. |
+| `test_winding.py`, `test_strength.py`, `test_machine_link.py` | Headless tests for `winding.py`, `strength.py` and `machine_link.py`. |
 
 ## Notes for development
 
